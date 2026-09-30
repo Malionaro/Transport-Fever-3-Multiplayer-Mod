@@ -548,7 +548,9 @@ Datagrams carry `Datagram::Cursor`:
   the pointer is lifted);
 - `building`: boolean indicating whether an active build tool preview is
   shown;
-- `label`: optional short tool name or text.
+- `label`: optional short tool name or text;
+- `curves`: list of cubic Hermite curves in millimetres for linear build previews
+  (roads, tracks).
 
 Servers rate-limit incoming datagrams per connection (120/s with a burst of
 240) and immediately relay them to all member connections in the room.

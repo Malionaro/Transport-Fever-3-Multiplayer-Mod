@@ -40,7 +40,7 @@ pub use control::{
     MAX_ROOM_MEMBERS, MemberView, Reject, RejectReason, Request, RequestError, Response, Resume,
     RoomPhase, RoomSettings, RoomView, RulesName, RulesOffer, ServerMessage, Speed, Welcome,
 };
-pub use datagram::{Cursor, DATAGRAM_MAX_FRAME, Datagram};
+pub use datagram::{Cursor, DATAGRAM_MAX_FRAME, Datagram, PreviewCurve};
 pub use diagnostics::{
     DiagnosticBatch, DiagnosticEvent, DiagnosticLevel, DiagnosticTarget, DiagnosticText,
     MAX_DIAGNOSTIC_EVENTS, redact,

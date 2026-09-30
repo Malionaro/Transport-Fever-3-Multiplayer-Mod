@@ -89,7 +89,7 @@ use std::{
 
 use tpf3mp_bridge::{Notice, RoomInfo};
 use tpf3mp_proto::{
-    ChatText, Cursor, FixedBytes, Payload, PlayerId,
+    ChatText, Cursor, FixedBytes, Payload, PlayerId, PreviewCurve,
     action::Pos2,
     lua::{LuaValue, MAX_DEPTH, MAX_NODES, action_from_lua, action_to_lua},
 };
@@ -1255,7 +1255,94 @@ unsafe extern "C-unwind" fn native_say(l: State) -> c_int {
     }
 }
 
-/// `cursor(x, y, building, label)` or `cursor(nil)`.
+fn parse_preview_curves(tree: &LuaValue) -> Vec<PreviewCurve> {
+    let LuaValue::Table(entries) = tree else {
+        return Vec::new();
+    };
+    let mut curves = Vec::new();
+    for (_, curve_val) in entries {
+        if curves.len() >= 16 {
+            break;
+        }
+        let LuaValue::Table(curve_fields) = curve_val else {
+            continue;
+        };
+        let mut x0 = None;
+        let mut y0 = None;
+        let mut x1 = None;
+        let mut y1 = None;
+        let mut tx0 = None;
+        let mut ty0 = None;
+        let mut tx1 = None;
+        let mut ty1 = None;
+        for (k, v) in curve_fields {
+            let num = match v {
+                LuaValue::Number(n) => *n,
+                _ => continue,
+            };
+            match k {
+                #[allow(clippy::cast_possible_truncation)]
+                LuaValue::Number(idx) => match *idx as usize {
+                    1 => x0 = Some(num),
+                    2 => y0 = Some(num),
+                    3 => x1 = Some(num),
+                    4 => y1 = Some(num),
+                    5 => tx0 = Some(num),
+                    6 => ty0 = Some(num),
+                    7 => tx1 = Some(num),
+                    8 => ty1 = Some(num),
+                    _ => {}
+                },
+                LuaValue::String(s) => match s.as_slice() {
+                    b"x0" => x0 = Some(num),
+                    b"y0" => y0 = Some(num),
+                    b"x1" => x1 = Some(num),
+                    b"y1" => y1 = Some(num),
+                    b"tx0" => tx0 = Some(num),
+                    b"ty0" => ty0 = Some(num),
+                    b"tx1" => tx1 = Some(num),
+                    b"ty1" => ty1 = Some(num),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if let (
+            Some(x0),
+            Some(y0),
+            Some(x1),
+            Some(y1),
+            Some(tx0),
+            Some(ty0),
+            Some(tx1),
+            Some(ty1),
+        ) = (x0, y0, x1, y1, tx0, ty0, tx1, ty1)
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            curves.push(PreviewCurve {
+                p0: Pos2 {
+                    x: (x0 * 1000.0).round() as i32,
+                    y: (y0 * 1000.0).round() as i32,
+                },
+                p1: Pos2 {
+                    x: (x1 * 1000.0).round() as i32,
+                    y: (y1 * 1000.0).round() as i32,
+                },
+                t0: Pos2 {
+                    x: (tx0 * 1000.0).round() as i32,
+                    y: (ty0 * 1000.0).round() as i32,
+                },
+                t1: Pos2 {
+                    x: (tx1 * 1000.0).round() as i32,
+                    y: (ty1 * 1000.0).round() as i32,
+                },
+            });
+        }
+    }
+    curves
+}
+
+/// `cursor(x, y, building, label, curves)` or `cursor(nil)`.
 ///
 /// Sets the local player's pointer or build preview position, in metres on the
 /// ground plane. `nil` or no coordinates clears the pointer.
@@ -1265,7 +1352,7 @@ unsafe extern "C-unwind" fn native_cursor(l: State) -> c_int {
     };
     // SAFETY: Lua calls this with its own state on its thread.
     let top = unsafe { (api.gettop)(l) };
-    let (at, building, label) = if top >= 2
+    let (at, building, label, curves) = if top >= 2
         && unsafe { (api.type_of)(l, 1) == TNUMBER && (api.type_of)(l, 2) == TNUMBER }
     {
         let x = unsafe { (api.tonumberx)(l, 1, std::ptr::null_mut()) };
@@ -1277,9 +1364,19 @@ unsafe extern "C-unwind" fn native_cursor(l: State) -> c_int {
             x: (x * 1000.0).round() as i32,
             y: (y * 1000.0).round() as i32,
         });
-        (at, building, label)
+        let curves = if top >= 5 && unsafe { (api.type_of)(l, 5) == TTABLE } {
+            let mut nodes = 0;
+            if let Ok(tree) = unsafe { read(api, l, 5, 0, &mut nodes) } {
+                parse_preview_curves(&tree)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        (at, building, label, curves)
     } else {
-        (None, false, None)
+        (None, false, None, Vec::new())
     };
     let mut shared = shared();
     let player = shared.room.me.unwrap_or(PlayerId(FixedBytes([0u8; 32])));
@@ -1288,12 +1385,13 @@ unsafe extern "C-unwind" fn native_cursor(l: State) -> c_int {
         at,
         building,
         label,
+        curves,
     });
     0
 }
 
 /// `cursors()`: other players' pointers and build previews:
-/// `{ [player_hex] = { x =, y =, building =, label = } }`
+/// `{ [player_hex] = { x =, y =, building =, label =, curves = } }`
 unsafe extern "C-unwind" fn native_cursors(l: State) -> c_int {
     let Some(api) = API.get() else {
         return 0;
@@ -1325,6 +1423,55 @@ unsafe extern "C-unwind" fn native_cursors(l: State) -> c_int {
                 ];
                 if let Some(label) = &cursor.label {
                     fields.push((LuaValue::string("label"), LuaValue::string(label.as_str())));
+                }
+                if !cursor.curves.is_empty() {
+                    let curve_values: Vec<(LuaValue, LuaValue)> = cursor
+                        .curves
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let curve_elems = vec![
+                                (
+                                    LuaValue::Number(1.0),
+                                    LuaValue::Number(f64::from(c.p0.x) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(2.0),
+                                    LuaValue::Number(f64::from(c.p0.y) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(3.0),
+                                    LuaValue::Number(f64::from(c.p1.x) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(4.0),
+                                    LuaValue::Number(f64::from(c.p1.y) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(5.0),
+                                    LuaValue::Number(f64::from(c.t0.x) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(6.0),
+                                    LuaValue::Number(f64::from(c.t0.y) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(7.0),
+                                    LuaValue::Number(f64::from(c.t1.x) / 1000.0),
+                                ),
+                                (
+                                    LuaValue::Number(8.0),
+                                    LuaValue::Number(f64::from(c.t1.y) / 1000.0),
+                                ),
+                            ];
+                            #[allow(clippy::cast_precision_loss)]
+                            (
+                                LuaValue::Number((i + 1) as f64),
+                                LuaValue::Table(curve_elems),
+                            )
+                        })
+                        .collect();
+                    fields.push((LuaValue::string("curves"), LuaValue::Table(curve_values)));
                 }
                 Some((
                     LuaValue::string(&crate::lobby::hex(player)),
@@ -2719,5 +2866,59 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(take_world_up(), Some(first + 2));
         assert_eq!(take_world_up(), None);
+    }
+
+    #[test]
+    fn cursor_and_cursors_round_trip_with_preview_curves() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        let lua = Lua::new();
+        lua.register();
+
+        // 1. Local cursor with curves:
+        lua.run(
+            "tpf3mp_native.cursor(10.5, 20.25, true, 'streetBuilder', { \
+                { 1.0, 2.0, 3.0, 4.0, 0.5, 0.5, 0.5, 0.5 } \
+             })",
+        )
+        .unwrap();
+        let outbound = take_cursor().expect("outbound cursor set");
+        assert_eq!(outbound.at, Some(Pos2 { x: 10500, y: 20250 }));
+        assert!(outbound.building);
+        assert_eq!(
+            outbound.label.as_ref().map(ChatText::as_str),
+            Some("streetBuilder")
+        );
+        assert_eq!(outbound.curves.len(), 1);
+        assert_eq!(outbound.curves[0].p0, Pos2 { x: 1000, y: 2000 });
+        assert_eq!(outbound.curves[0].p1, Pos2 { x: 3000, y: 4000 });
+
+        // 2. Remote cursor with curves:
+        let other = player(7);
+        let remote_cursor = Cursor {
+            player: other,
+            at: Some(Pos2 { x: 50000, y: 60000 }),
+            building: true,
+            label: Some(ChatText::new("trackBuilder").unwrap()),
+            curves: vec![PreviewCurve {
+                p0: Pos2 { x: 50000, y: 60000 },
+                p1: Pos2 { x: 70000, y: 80000 },
+                t0: Pos2 { x: 10000, y: 10000 },
+                t1: Pos2 { x: 10000, y: 10000 },
+            }],
+        };
+        shared().room.cursors.insert(other, remote_cursor);
+
+        let res = lua
+            .run(
+                "local cs = tpf3mp_native.cursors() \
+                 local hex = string.rep('07', 32) \
+                 local c = cs[hex] \
+                 if not c or not c.curves or #c.curves ~= 1 then return 'fail' end \
+                 local crv = c.curves[1] \
+                 return string.format('ok:%.1f,%.1f->%.1f,%.1f', crv[1], crv[2], crv[3], crv[4])",
+            )
+            .unwrap();
+        assert_eq!(res, "ok:50.0,60.0->70.0,80.0");
     }
 }

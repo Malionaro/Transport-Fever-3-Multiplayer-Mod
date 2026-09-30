@@ -490,8 +490,8 @@ tpf3mp_native = {
         HOOK.dumped[#HOOK.dumped + 1] = 'lane ' .. lane .. ' step ' .. order.step .. ' ' .. entry
         return true
     end,
-    cursor = function(x, y, building, label)
-        HOOK.cursor = { x = x, y = y, building = building, label = label }
+    cursor = function(x, y, building, label, curves)
+        HOOK.cursor = { x = x, y = y, building = building, label = label, curves = curves }
     end,
     cursors = function()
         return HOOK.cursors or {}
@@ -4741,12 +4741,15 @@ fn bridge_syncs_pointer_and_build_preview_cursors() {
     lua.load(
         r#"
         local link = assert(BRIDGE.attach(tpf3mp_native))
-        link:cursor(123.5, 456.25, true, "streetTerminalBuilder")
+        local testCurves = { { 10.0, 20.0, 30.0, 40.0, 5.0, 5.0, 5.0, 5.0 } }
+        link:cursor(123.5, 456.25, true, "streetTerminalBuilder", testCurves)
         assert(HOOK.cursor ~= nil)
         assert(HOOK.cursor.x == 123.5)
         assert(HOOK.cursor.y == 456.25)
         assert(HOOK.cursor.building == true)
         assert(HOOK.cursor.label == "streetTerminalBuilder")
+        assert(type(HOOK.cursor.curves) == "table")
+        assert(#HOOK.cursor.curves == 1)
 
         HOOK.cursors = {
             ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] = {
@@ -4754,6 +4757,7 @@ fn bridge_syncs_pointer_and_build_preview_cursors() {
                 y = 200.0,
                 building = true,
                 label = "trackBuilder",
+                curves = testCurves,
             }
         }
         local cursors = link:cursors()
@@ -4763,9 +4767,69 @@ fn bridge_syncs_pointer_and_build_preview_cursors() {
         assert(remote.y == 200.0)
         assert(remote.building == true)
         assert(remote.label == "trackBuilder")
+        assert(type(remote.curves) == "table")
+        assert(#remote.curves == 1)
 
         link:cursor(nil)
         assert(HOOK.cursor.x == nil)
+        "#,
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn sim_gui_draws_and_cleans_up_holograms_for_remote_cursors() {
+    let (lua, _script) = engine();
+    lua.load(
+        r#"
+        HOOK.room = true
+        local zones = {}
+        local removed = {}
+        api = api or {}
+        api.gui = {
+            mission = {
+                setZone = function(key, poly, draw, color, prohibit, anim, zOffset)
+                    zones[key] = { poly = poly, color = color }
+                end,
+                setZoneCircle = function(key, center, radius, draw, color, prohibit, anim, zOffset)
+                    zones[key] = { center = center, radius = radius, color = color }
+                end,
+                removeZone = function(key)
+                    zones[key] = nil
+                    removed[#removed + 1] = key
+                end,
+            }
+        }
+        api.type = {
+            Vec2f = { new = function(x, y) return { x = x, y = y } end },
+            Vec4f = { new = function(r, g, b, a) return { r = r, g = g, b = b, a = a } end },
+        }
+
+        local remoteHex = string.rep("ab", 32)
+        HOOK.cursors = {
+            [remoteHex] = {
+                x = 100.0,
+                y = 200.0,
+                building = true,
+                label = "streetBuilder",
+                curves = {
+                    { 0.0, 0.0, 100.0, 200.0, 10.0, 20.0, 10.0, 20.0 }
+                }
+            }
+        }
+
+        -- Run guiUpdate
+        SCRIPT.guiUpdate(nil, nil, nil)
+        assert(zones["tpf3mp_holo_" .. remoteHex .. "_c1"] ~= nil, "road curve ribbon zone drawn")
+        assert(zones["tpf3mp_holo_" .. remoteHex .. "_ptr"] ~= nil, "cursor pointer circle drawn")
+
+        -- Now remote player stops building:
+        HOOK.cursors[remoteHex].building = false
+        SCRIPT.guiUpdate(nil, nil, nil)
+        assert(zones["tpf3mp_holo_" .. remoteHex .. "_c1"] == nil, "curve zone cleaned up")
+        assert(zones["tpf3mp_holo_" .. remoteHex .. "_ptr"] == nil, "circle zone cleaned up")
+        assert(#removed >= 2, "removed zones called")
         "#,
     )
     .exec()

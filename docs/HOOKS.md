@@ -738,10 +738,11 @@ for the table (`bridge.find`). Its contract is in
   game script's `postUpdate` at a checkpoint: the lanes the hook wants
   written to its log entry by entry, and each entry ("Lane dumps" below).
   Optional, as `built`.
-- `tpf3mp_native.cursor(x, y, building, label)` and `tpf3mp_native.cursors()`:
-  in the GUI: reports the player's world-plane pointer or active build preview
-  position, and reads other room members' active cursors, carried as advisory
-  datagrams. Optional in the contract.
+- `tpf3mp_native.cursor(x, y, building, label, curves)` and `tpf3mp_native.cursors()`:
+  in the GUI: reports the player's world-plane pointer, active build preview
+  position, and optional Hermite curve geometry for linear builds, and reads
+  other room members' active cursors, carried as advisory datagrams. Optional
+  in the contract.
 
 The table's functions run on whichever thread runs their state (the GUI's
 the main thread, the game scripts' a pool of simulation threads) and share

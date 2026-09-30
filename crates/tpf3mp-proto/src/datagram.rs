@@ -27,6 +27,24 @@ pub enum Datagram {
 ///
 /// `None` for [`Cursor::at`] is the player lifting their pointer out of the
 /// world, or closing a tool's preview: the receiver drops the marker.
+/// A cubic Hermite curve segment for build previews (e.g. road or track).
+/// Coordinates are in millimetres on the ground plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewCurve {
+    /// Start position.
+    pub p0: Pos2,
+    /// End position.
+    pub p1: Pos2,
+    /// Tangent at start.
+    pub t0: Pos2,
+    /// Tangent at end.
+    pub t1: Pos2,
+}
+
+/// A player's pointer, in millimetres on the ground plane.
+///
+/// `None` for [`Cursor::at`] is the player lifting their pointer out of the
+/// world, or closing a tool's preview: the receiver drops the marker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     /// The player whose pointer this is. The server fills it in, so a client
@@ -42,4 +60,45 @@ pub struct Cursor {
     /// What the player says on the marker, at most a short word: their
     /// company colour's name, or the tool they hold.
     pub label: Option<ChatText>,
+    /// Preview curves for linear infrastructure (roads, tracks) currently being
+    /// drawn by the build tool. Empty when not building or for point builds.
+    #[serde(default)]
+    pub curves: Vec<PreviewCurve>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FixedBytes;
+
+    #[test]
+    fn cursor_round_trip_with_preview_curves_fits_frame() {
+        let curve = PreviewCurve {
+            p0: Pos2 {
+                x: 10_000,
+                y: 20_000,
+            },
+            p1: Pos2 {
+                x: 30_000,
+                y: 40_000,
+            },
+            t0: Pos2 { x: 5_000, y: 5_000 },
+            t1: Pos2 { x: 5_000, y: 5_000 },
+        };
+        let cursor = Cursor {
+            player: PlayerId(FixedBytes([42u8; 32])),
+            at: Some(Pos2 {
+                x: 10_000,
+                y: 20_000,
+            }),
+            building: true,
+            label: Some(ChatText::new("streetBuilder").unwrap()),
+            curves: vec![curve; 8],
+        };
+        let datagram = Datagram::Cursor(cursor.clone());
+        let encoded = postcard::to_allocvec(&datagram).unwrap();
+        assert!(encoded.len() <= DATAGRAM_MAX_FRAME);
+        let decoded: Datagram = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, datagram);
+    }
 }
