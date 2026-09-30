@@ -674,6 +674,9 @@ end
 -- point of that centreline, rounded to the millimetre.
 local STOP_TOLERANCE = 0.5
 
+-- The entity a proposal gives its first new edge object (build 40408).
+local NEW_EDGE_OBJECT = -400000000
+
 function HANDLERS.PlaceStop(stop)
 	local network = stop.edge.network
 	local e = stopEdge(stop.edge)
@@ -684,27 +687,42 @@ function HANDLERS.PlaceStop(stop)
 	local t, d = geom.hermiteTangent(e.a, e.ta, e.b, e.tb, u), stop.direction
 	if t[1] * d.x + t[2] * d.y + t[3] * d.z < 0 then left = not left end
 	local types = enum("EdgeObjectType")
-	local side = left and types.STOP_LEFT or types.STOP_RIGHT
+	-- The sides it takes: one, or both for a two-sided stop, the
+	-- originator's first side first, as its tool added them.
+	local sides = { left }
+	if stop.two_sided == true then sides[2] = not left end
 	-- One stop a side: a second is a fatal assert in the game's lane
 	-- creation (TPF2, docs/BUILDING.md).
 	local objects = {}
 	for i, o in ipairs(e.comp.objects or {}) do
-		if o[2] == side then error("the edge has a stop on that side already", 0) end
+		for _, l in ipairs(sides) do
+			if o[2] == (l and types.STOP_LEFT or types.STOP_RIGHT) then
+				error("the edge has a stop on that side already", 0)
+			end
+		end
 		objects[i] = { o[1], o[2] }
 	end
-	objects[#objects + 1] = { -1, side }
+	local added = {}
+	for k, l in ipairs(sides) do
+		-- A new edge object is named by its place in edgeObjectsToAdd,
+		-- from -400000000 down (build 40408: con_util_entity_index.h
+		-- asserts the range, a fatal error; game_mechanics/towns/
+		-- town_util.tl; the stop tool's own proposals).
+		objects[#objects + 1] = { NEW_EDGE_OBJECT - (k - 1), l and types.STOP_LEFT or types.STOP_RIGHT }
+		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
+		eo.edgeEntity = -1
+		eo.param = u
+		eo.left = l
+		eo.oneWay = false
+		eo.model = stop.model
+		eo.playerEntity = company()
+		eo.name = ""
+		added[k] = eo
+	end
 	local proposal = rebuildWith(e, network, objects)
-	local eo = api.type.SimpleStreetProposal.EdgeObject.new()
-	eo.edgeEntity = -1
-	eo.param = u
-	eo.left = left
-	eo.oneWay = false
-	eo.model = stop.model
-	eo.playerEntity = company()
-	eo.name = ""
-	proposal.streetProposal.edgeObjectsToAdd = { eo }
+	proposal.streetProposal.edgeObjectsToAdd = added
 	log(string.format("placing %s on %s edge %d at %.4f, %s", tostring(stop.model), network, e.id, u,
-		left and "left" or "right"))
+		stop.two_sided == true and "both sides" or (left and "left" or "right")))
 	-- Paid by the player, as the tool builds.
 	local context = api.type.Context.new()
 	context.player = company()
@@ -1040,6 +1058,16 @@ function HANDLERS.Loan(op, ctx)
 		return run(api.cmd.makeScriptingSendEventCmd("", "Loan", "Repay", param))
 	end
 	return false, "a loan is taken or paid back"
+end
+
+-- A notification's popup played its first sound: the game's Notifications
+-- script's own event marks it (game_mechanics/notifications/
+-- notifications.script.tl, "initialSound"), in every game, so no game
+-- plays it again.
+function HANDLERS.NotificationSeen(n)
+	if type(n.notification) ~= "number" then error("a notification by its id", 0) end
+	return run(api.cmd.makeScriptingSendEventCmd("", "Notifications", "initialSound",
+		{ notificationId = n.notification }))
 end
 
 -- Prospecting goes through the company script's own event, with the

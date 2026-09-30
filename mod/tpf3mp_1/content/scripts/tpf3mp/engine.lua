@@ -396,11 +396,16 @@ end
 
 -- A stop placed with the stop tool, as a PlaceStop action (tpf3mp_proto
 -- action::PlaceStop): the edge by its ends, the place on its centreline,
--- the engine's `left`, the edge's direction there and the stop's model
--- (api.res.modelRep.getName of its model instance, as the game's guide
--- names a stop: "::/stations/street/small_stops/small_new.con"). false for a
--- proposal of nothing; nil and why the room cannot carry it.
-function engine.placeStop(proposal)
+-- the engine's `left`, the edge's direction there and the stop's
+-- construction. Transport Fever 3 builds a stop as a construction
+-- ("stations/street/small_stops/small_new.con") and its tool's proposal
+-- does not name it (build 40408: the edge objects have no model), so
+-- `noted` is the one the construction menu gave the tool
+-- (tpf3mp/capture.lua, capture.stop); a proposal whose edge object has a
+-- model names it itself. A two-sided stop is one click that adds an object
+-- on each side. false for a proposal of nothing; nil and why the room
+-- cannot carry it.
+function engine.placeStop(proposal, noted)
 	local ok, action = pcall(function()
 		local street = get(proposal, "proposal")
 		if street == nil then error("a proposal with no street proposal", 0) end
@@ -420,33 +425,57 @@ function engine.placeStop(proposal)
 		for entity in pairs(had) do
 			if has[entity] == nil then error("a stop that replaces another", 0) end
 		end
-		local index
+		local added = {}
 		for k, o in ipairs(now) do
-			if had[o[1]] == nil then
-				if index ~= nil then error("more than one stop at once (a two-sided stop)", 0) end
-				index = k
+			if had[o[1]] == nil then added[#added + 1] = k end
+		end
+		if #added == 0 then return false end
+		if #added > 2 then error("more than two stops at once", 0) end
+		local types = enum("EdgeObjectType")
+		for _, k in ipairs(added) do
+			local eo = toAdd[k]
+			if get(eo, "category") ~= 0 then error("a signal or waypoint", 0) end
+			-- INFERRED: the engine lists a stop it calls left as STOP_LEFT.
+			if now[k][2] ~= (get(eo, "left") == true and types.STOP_LEFT or types.STOP_RIGHT) then
+				error("a stop whose side the room cannot say", 0)
 			end
 		end
-		if index == nil then return false end
-		local eo = toAdd[index]
-		if get(eo, "category") ~= 0 then error("a signal or waypoint", 0) end
-		local types = enum("EdgeObjectType")
-		local left = get(eo, "left") == true
-		-- INFERRED: the engine lists a stop it calls left as STOP_LEFT.
-		if now[index][2] ~= (left and types.STOP_LEFT or types.STOP_RIGHT) then
-			error("a stop whose side the room cannot say", 0)
+		local twoSided = #added == 2
+		if twoSided and (get(toAdd[added[1]], "left") == true) == (get(toAdd[added[2]], "left") == true) then
+			error("two stops on one side", 0)
 		end
-		local instance = get(eo, "modelInstance")
+		local index = added[1]
+		local eo = toAdd[index]
+		local left = get(eo, "left") == true
+		-- The model and place of the first of its objects that has them.
+		local instance
+		for _, k in ipairs(added) do
+			instance = instance or get(toAdd[k], "modelInstance")
+		end
 		local model
-		pcall(function() model = api.res.modelRep.getName(get(instance, "modelId")) end)
-		model = resName(model, "the stop's model")
+		if instance ~= nil then
+			pcall(function() model = api.res.modelRep.getName(get(instance, "modelId")) end)
+		end
+		if type(model) ~= "string" or model == "" then model = noted end
+		model = resName(model, "the stop's construction (the stop tool's, noted by the GUI)")
 		local ref, curve = edgeRef(old, network)
 		-- Where along the edge: the proposal's own parameter where it has
-		-- one, else the point of the centreline nearest the stop's model.
+		-- one, else the point of the centreline nearest the stop's model,
+		-- else nearest the ground under the cursor, where the tool puts the
+		-- stop (build 40408's proposal has neither). Every game builds it
+		-- where this one says.
 		local u = get(eo, "param")
 		if type(u) ~= "number" or u < 0 or u > 1 then
-			local t = get(instance, "transf")
-			local x, y = get(t, 13), get(t, 14)
+			local t = instance and get(instance, "transf")
+			local x, y = t and get(t, 13), t and get(t, 14)
+			if type(x) ~= "number" or type(y) ~= "number" then
+				pcall(function()
+					if api.gui.mouse.hasTerrainPosition() then
+						local p = api.gui.mouse.getTerrainPosition()
+						x, y = p.x, p.y
+					end
+				end)
+			end
 			if type(x) ~= "number" or type(y) ~= "number" then error("a stop with no place", 0) end
 			u = geom.parameterAt(curve.a, curve.ta, curve.b, curve.tb, x, y)
 		end
@@ -460,6 +489,7 @@ function engine.placeStop(proposal)
 			left = left,
 			direction = { x = d[1] / len, y = d[2] / len, z = d[3] / len },
 			model = model,
+			two_sided = twoSided,
 		} }
 	end)
 	if not ok then return nil, tostring(action) end

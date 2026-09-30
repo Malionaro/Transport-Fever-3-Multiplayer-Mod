@@ -225,7 +225,9 @@ protected folder such as Program Files.
   street, track and construction tools: every player's game builds them
   together, a moment after your click, and your company pays as usual. A
   station or depot placed by a road is joined to it, as in single player.
-  Remove them, and roads and tracks, with the bulldozer.
+  Street stops, on one side or both, go on with the stop tool; the stop
+  goes where your cursor is on the road. Remove them, and roads and
+  tracks, with the bulldozer.
 - **Vehicles and lines.** Buy vehicles in a depot's store, make and change
   lines in the line manager, and send vehicles out, stop them or sell
   them, as usual: every player's game does it together, and your window
@@ -250,7 +252,7 @@ protected folder such as Program Files.
 - **Not in multiplayer yet.** What the room cannot share with everyone yet
   does not happen in your game either. The game bar says "Not in
   multiplayer yet: …" for what the game's windows do that the room does
-  not carry yet. The stop, upgrade, bus lane and tram track tools show
+  not carry yet. The upgrade, bus lane and tram track tools show
   "Not in multiplayer yet: building with this tool" and build nothing, and
   so does a road or track that would move a stop or signal, or a bulldozer
   click on a stop or signal: the tool says why.

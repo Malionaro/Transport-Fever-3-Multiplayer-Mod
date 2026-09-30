@@ -300,8 +300,43 @@ end
 -- A stop placed on a street or track with the stop tool (tpf3mp_proto
 -- action::PlaceStop), read off its proposal by tpf3mp/engine.lua. Returns
 -- the action table; false for a proposal of nothing; or nil and why.
-function capture.stop(proposal)
-	return module("engine").placeStop(proposal)
+--
+-- Transport Fever 3's proposal does not name the stop (build 40408: its
+-- edge objects carry no model), which is a construction the construction
+-- menu gave the tool; the GUI notes it (capture.STOP_NOTE,
+-- gui/tpf3mp/gui_state.script.lua) and `link` reads the note.
+capture.STOP_NOTE = "stop-tool"
+
+-- In a GUI Lua state: notes the stop the construction menu gives the stop
+-- tool, for capture.stop, which runs in another. The menu makes the tool's
+-- action with construction_react_util.getActionParams (`util`), whose
+-- EdgeObjectBuilder names the stop's construction (resName; build 40408,
+-- gui/construction/construction_react_util.tl); each call is noted through
+-- `link` (tpf3mp/bridge.lua). Once a state. Returns whether it watches.
+function capture.watchStopTool(util, link)
+	if type(package) == "table" and type(package.loaded) == "table" then
+		if package.loaded["tpf3mp.stopToolWatched"] then return true end
+	end
+	if type(util) ~= "table" or type(util.getActionParams) ~= "function" or link == nil then return false end
+	local original = util.getActionParams
+	util.getActionParams = function(...)
+		local result = original(...)
+		pcall(function()
+			local builder = result.constructionActionParams.edgeObjectBuilder
+			local name = builder and builder.resName
+			if type(name) == "string" and name ~= "" then link:note(capture.STOP_NOTE, name) end
+		end)
+		return result
+	end
+	if type(package) == "table" and type(package.loaded) == "table" then
+		package.loaded["tpf3mp.stopToolWatched"] = true
+	end
+	return true
+end
+
+function capture.stop(proposal, link)
+	local noted = link and link.note and link:note(capture.STOP_NOTE) or nil
+	return module("engine").placeStop(proposal, noted)
 end
 
 -- The bulldozer's removal (tpf3mp_proto action::Bulldoze), read off its

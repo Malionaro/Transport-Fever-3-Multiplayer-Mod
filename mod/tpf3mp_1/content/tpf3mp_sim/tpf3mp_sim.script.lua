@@ -384,7 +384,8 @@ function data()
 			local kind = CAPTURE[id]
 			if kind == nil then note(l, id, name) end
 			if clicks ~= nil and kind ~= nil and type(param) == "table" then
-				local ok, action, why = pcall(capture[kind], param[1])
+				-- The link, for what the GUI's windows noted (the stop tool's stop).
+				local ok, action, why = pcall(capture[kind], param[1], l)
 				if not ok then action, why = nil, tostring(action) end
 				if action == false then
 					-- Nothing proposed yet: nothing to refuse, nothing to hand on.

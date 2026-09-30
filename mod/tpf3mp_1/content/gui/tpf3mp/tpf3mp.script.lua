@@ -39,7 +39,7 @@
 function data()
 	local MOD = "tpf3mp_1"
 	-- Every module, in an order where each needs only those before it.
-	local MODULES = { "geom", "roads", "engine", "registry", "companies", "capture", "bridge", "guard" }
+	local MODULES = { "geom", "roads", "engine", "registry", "companies", "follow", "capture", "bridge", "guard" }
 	-- Frames a refusal's notice stays in the game bar.
 	local NOTICE_FRAMES = 360
 
@@ -214,49 +214,15 @@ function data()
 	-- own player anyway.
 	local function myCompany()
 		local shared = ui()
-		local status, roster = shared.status, shared.companies
-		if not status or not roster or not status.me_id then return nil end
-		for _, m in ipairs(roster.members or {}) do
-			if m.player == status.me_id then
-				for _, c in ipairs(roster.list or {}) do
-					if c.id == m.company then return c.entity end
-				end
-			end
-		end
-		return nil
+		local status = shared.status
+		return require("tpf3mp.follow").companyOf(shared.companies, status and status.me_id)
 	end
 
-	-- The GUI's "my company": TF3's windows ask api.engine.util.getPlayer()
-	-- whose money to show, what is the player's own and what is "Foreign"
-	-- (entity_window/eow_extension_util.tl), and every GUI script looks it up
-	-- when it runs. In this GUI state it answers the company this player
-	-- plays for; the game scripts' states keep the game's own answer, the
-	-- save's player, so the simulation is the same in every game. What the
-	-- player then does goes to the room as ever and is booked to their
-	-- company there (tpf3mp/apply.lua), whatever the GUI named.
+	-- The GUI's "my company" in this Lua state (tpf3mp/follow.lua).
 	local function followMyCompany()
-		local ok, util = pcall(function() return api.engine.util end)
-		if not ok then util = nil end
-		-- A function, or a callable table, as the game's bindings are
-		-- (build 40408: a table with a metatable).
-		local original = ok and util ~= nil and select(2, pcall(function() return util.getPlayer end)) or nil
-		if type(original) ~= "function" and type(original) ~= "table" and type(original) ~= "userdata" then
-			link:log("the GUI's company cannot follow the player's: no api.engine.util.getPlayer ("
-				.. type(util) .. ", " .. type(original) .. ")")
-			return
-		end
-		local replaced, why = pcall(function()
-			util.getPlayer = function(...)
-				local mine = myCompany()
-				if mine then return mine end
-				return original(...)
-			end
-		end)
-		-- A binding may take the assignment and keep its own function.
-		local took = replaced and select(2, pcall(function() return util.getPlayer ~= original end))
-		link:log(took == true and "the GUI's company follows the player's"
-			or ("the GUI's company cannot follow the player's: api.engine.util (" .. type(util)
-				.. ") keeps its getPlayer" .. (why and (": " .. tostring(why)) or "")))
+		local ok, why = require("tpf3mp.follow").install(api, myCompany)
+		link:log(ok and "the GUI's company follows the player's"
+			or ("the GUI's company cannot follow the player's: " .. tostring(why)))
 	end
 
 	local function start()
@@ -280,6 +246,11 @@ function data()
 		say("linked to the hook")
 		guardCommands()
 		followMyCompany()
+		-- The stop the construction menu gives the stop tool, wherever the
+		-- menu runs (gui/tpf3mp/gui_state.script.lua watches the other state).
+		pcall(function()
+			require("tpf3mp.capture").watchStopTool(ug_require "::/gui/construction/construction_react_util.tl", link)
+		end)
 	end
 
 	-- Does what the hook asks: saving the world under the name it gives, or

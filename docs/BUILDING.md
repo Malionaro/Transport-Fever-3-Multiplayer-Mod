@@ -368,8 +368,10 @@ On TF3 the mod carries a stop placed with the stop tool, and a stop the
 bulldozer removes, the same way (HOOKS.md, "The build tools"): a
 `PlaceStop` or `Bulldoze::EdgeObject` read off the tool's proposal, the
 edge named by its ends within 0.5 m, the stop's place by the point of the
-edge's centreline where it stands. A stop that replaces another, a
-two-sided stop, signals and waypoints stay refused.
+edge's centreline where it stands, and the stop's construction, which the
+GUI notes from the construction menu (TF3's proposal does not name it). A
+two-sided stop goes as one `PlaceStop` built on both sides. A stop that
+replaces another, signals and waypoints stay refused.
 
 ## Terrain and the asset brush
 
@@ -408,7 +410,7 @@ two-sided stop, signals and waypoints stay refused.
 ## The action schema
 
 What an intent's payload carries: `tpf3mp_proto::action`, version
-`ACTION_SCHEMA_VERSION` (8; 7 had no company colour (`CompanyOp::Recolor`), 6 had no prospecting, 5 always named a first stop, 4 had no construction connections, 3 TPF2's
+`ACTION_SCHEMA_VERSION` (9; 8 had no two-sided stop (`PlaceStop::two_sided`) and no notification sound (`NotificationSeen`), 7 had no company colour (`CompanyOp::Recolor`), 6 had no prospecting, 5 always named a first stop, 4 had no construction connections, 3 TPF2's
 vehicles and lines, 2 no edge kinds or removed nodes, 1 no road style). The Lua mod builds an action from a captured
 command, the payload travels opaque through the server, and every replica
 resolves it against its own world by the rules above. Everything a TPF2
@@ -447,12 +449,13 @@ appended.
 | `CreateLine` | name, colour, the line as the game keeps it: stops (station group, terminal, other terminals, load mode, waiting times, loading rules per cargo), transport modes, settings |
 | `EditLine` | a line and one change: rename, recolour, the whole line anew, or delete |
 | `AssignLine` | vehicles, the line or none, the first stop or none for the game's choice ("Next Reachable Stop") |
-| `PlaceStop` | the edge (network and ends), the position along it, the engine's `left` flag, the originator's unit direction there, the model |
+| `PlaceStop` | the edge (network and ends), the position along it, the engine's `left` flag, the originator's unit direction there, the stop's construction, and whether it is two-sided |
 | `Terraform` | the grid: corner, cell size, columns, and each cell's target and previous height |
 | `CompanyOp` | create, join, rename or delete a company |
 | `Loan` | take a loan (the offer taken and the offer the game drew to follow it) or pay one back, each on its terms as TF3's loan script keeps them, the interest in millionths |
 | `VehicleOp` | a vehicle and what its window does to it: stop or start, to the depot (sold there or not), reverse, depart |
 | `ReplaceVehicle` | a vehicle and its new consist, as `BuyVehicle` carries one, each part also saying which of the vehicle's own parts it keeps (by index, same model), or none for a part bought new; its groups and multiple units. One vehicle each: a group edit is one action per vehicle, as the game sends it |
+| `NotificationSeen` | a notification's popup played its first sound: every game's Notifications script marks it (its `initialSound` event), so no game plays it again |
 | `Prospect` | prospecting near a town: the town, the cargo, the industry types that may be found in the originator's menu's order, and the company permit it uses. The outcome is not in it: every game's company script draws it from the game time, months later, alike ([investigation](../investigation/TPF3_PROSPECTING_2026-09-30.md)) |
 
 **Polylines.** A road or track build is a polyline: the tool's proposal by

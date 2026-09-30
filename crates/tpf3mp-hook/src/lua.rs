@@ -66,6 +66,8 @@
 //!   `hook.log` as `lane <lane> step <step> <entry>`, up to
 //!   [`MAX_DUMP_LINES`] a checkpoint. Returns `true`, or `false` once no
 //!   more are taken.
+//! - `note(key[, value])`: a short string one Lua state notes for the
+//!   others ([`native_note`]).
 //! - `version`: [`VERSION`].
 //!
 //! Everything reaches Lua through [`LuaApi`]: in the game, the C API
@@ -106,7 +108,7 @@ const TSTRING: c_int = 4;
 const TTABLE: c_int = 5;
 
 /// The contract's version: `bridge.lua`'s `VERSION`.
-pub const VERSION: f64 = 10.0;
+pub const VERSION: f64 = 12.0;
 /// The table's name in each state's globals.
 pub const GLOBAL: &CStr = c"tpf3mp_native";
 
@@ -127,6 +129,10 @@ const MAX_LANE_TEXT: usize = 4096;
 /// Most lines waiting for the hook's log, and the longest kept.
 const MAX_LOG_LINES: usize = 1024;
 const MAX_LOG_LINE: usize = 1000;
+/// Keys `note()` keeps, the longest key and the longest value.
+const MAX_NOTES: usize = 16;
+const MAX_NOTE_KEY: usize = 64;
+const MAX_NOTE_VALUE: usize = 512;
 /// Most entries one checkpoint's lane dump writes, all its lanes together,
 /// and the longest entry kept.
 pub const MAX_DUMP_LINES: usize = 5000;
@@ -263,6 +269,9 @@ struct Shared {
     load_failure: Option<String>,
     /// The room, for the game's Multiplayer window ([`notice`]).
     room: RoomStatus,
+    /// What one of the game's Lua states noted for the others (`note()`),
+    /// by key, at most [`MAX_NOTES`].
+    notes: Vec<(String, String)>,
 }
 
 /// What the Multiplayer window shows of the room: `status()` and `chat()`.
@@ -326,6 +335,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     told: 0,
     menu_load: None,
     load_failure: None,
+    notes: Vec::new(),
 });
 
 fn shared() -> MutexGuard<'static, Shared> {
@@ -632,6 +642,7 @@ pub unsafe fn register(api: &LuaApi, l: State) {
                 (b"say", native_say),
                 (b"dump", native_dump),
                 (b"dumped", native_dumped),
+                (b"note", native_note),
                 (b"cursor", native_cursor),
                 (b"cursors", native_cursors),
             ] {
@@ -1701,6 +1712,42 @@ unsafe extern "C-unwind" fn native_dumped(l: State) -> c_int {
 }
 
 /// `log(line)`.
+/// `note(key)`: what a Lua state last noted under `key`, or nil;
+/// `note(key, value)`: notes `value` (a string; "" forgets it) under `key`
+/// for every other state of the game to read. The game's GUI runs in more
+/// than one Lua state (docs/HOOKS.md, "Markers"), and a game script's GUI
+/// half reads what the GUI's windows know this way.
+unsafe extern "C-unwind" fn native_note(l: State) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    // SAFETY: Lua calls this with its own state, on its thread.
+    let Some(key) = (unsafe { string_arg(api, l, 1, MAX_NOTE_KEY) }) else {
+        return 0;
+    };
+    // SAFETY: as above.
+    if let Some(value) = unsafe { string_arg(api, l, 2, MAX_NOTE_VALUE) } {
+        let mut shared = shared();
+        shared.notes.retain(|(k, _)| *k != key);
+        if !value.is_empty() && shared.notes.len() < MAX_NOTES {
+            shared.notes.push((key, value));
+        }
+        return 0;
+    }
+    let value = shared()
+        .notes
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.clone());
+    match value {
+        // SAFETY: a C function's stack has LUA_MINSTACK free slots.
+        Some(value) => unsafe { push_str(api, l, value.as_bytes()) },
+        // SAFETY: as above.
+        None => unsafe { (api.pushnil)(l) },
+    }
+    1
+}
+
 unsafe extern "C-unwind" fn native_log(l: State) -> c_int {
     let Some(api) = API.get() else {
         return 0;
@@ -1968,6 +2015,39 @@ pub(crate) mod tests {
         }
     }
 
+    /// What one Lua state notes, another reads; "" forgets it; the number
+    /// of keys is bounded.
+    #[test]
+    fn a_note_from_one_lua_state_is_read_in_another() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        let gui = Lua::new();
+        gui.register();
+        let script = Lua::new();
+        script.register();
+        assert_eq!(
+            script.run("return tostring(tpf3mp_native.note('stop'))"),
+            Ok("nil".into())
+        );
+        gui.run("tpf3mp_native.note('stop', 'stations/street/small_stops/small_new.con')")
+            .unwrap();
+        assert_eq!(
+            script.run("return tpf3mp_native.note('stop')"),
+            Ok("stations/street/small_stops/small_new.con".into())
+        );
+        gui.run("tpf3mp_native.note('stop', '')").unwrap();
+        assert_eq!(
+            script.run("return tostring(tpf3mp_native.note('stop'))"),
+            Ok("nil".into())
+        );
+        for i in 0..(MAX_NOTES + 4) {
+            gui.run(&format!("tpf3mp_native.note('k{i}', 'v')"))
+                .unwrap();
+        }
+        assert_eq!(shared().notes.len(), MAX_NOTES);
+        shared().notes.clear();
+    }
+
     #[test]
     fn a_checkpoint_is_due_in_the_last_update_of_its_batch_only() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2205,9 +2285,9 @@ pub(crate) mod tests {
                  type(tpf3mp_native.clicks), type(tpf3mp_native.built), \
                  type(tpf3mp_native.replaying), \
                  type(tpf3mp_native.applied), type(tpf3mp_native.results),                  type(tpf3mp_native.status), type(tpf3mp_native.chat), type(tpf3mp_native.say), \
-                 type(tpf3mp_native.dump), type(tpf3mp_native.dumped)"
+                 type(tpf3mp_native.dump), type(tpf3mp_native.dumped), type(tpf3mp_native.note)"
             ),
-            Ok("10|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
+            Ok("11|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
         );
         // A second print keeps the first table.
         lua.run("rawset(tpf3mp_native, 'mark', true)").unwrap();

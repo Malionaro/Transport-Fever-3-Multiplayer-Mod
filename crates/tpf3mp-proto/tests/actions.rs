@@ -307,7 +307,8 @@ fn samples() -> Vec<Action> {
                 y: 0,
                 z: 0,
             },
-            model: text("station/street/bus_stop.mdl"),
+            model: text("stations/street/small_stops/small_new_twosided.con"),
+            two_sided: true,
         }),
         Action::Terraform(
             Terraform::new(
@@ -387,6 +388,7 @@ fn samples() -> Vec<Action> {
                 "game_mechanics/company/explorations/exploration_coal.res",
             )),
         }),
+        Action::NotificationSeen { notification: 12 },
     ]
 }
 
@@ -443,13 +445,13 @@ fn check(bytes: &[u8]) {
 #[test]
 fn every_variant_round_trips() {
     let samples = samples();
-    // Every top-level variant is sampled: postcard tags them 0..=15.
+    // Every top-level variant is sampled: postcard tags them 0..=16.
     let mut tags: Vec<u8> = samples
         .iter()
         .map(|action| postcard::to_stdvec(action).unwrap()[0])
         .collect();
     tags.dedup();
-    assert_eq!(tags, (0..=15).collect::<Vec<u8>>());
+    assert_eq!(tags, (0..=16).collect::<Vec<u8>>());
 
     for action in samples {
         let bytes = postcard::to_stdvec(&action).unwrap();

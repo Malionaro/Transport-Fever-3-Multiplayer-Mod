@@ -302,6 +302,7 @@ pub fn place_stop(a: Pos, b: Pos, pos: Pos) -> Action {
             z: 0,
         },
         model: text(STREET_STOP),
+        two_sided: false,
     })
 }
 
