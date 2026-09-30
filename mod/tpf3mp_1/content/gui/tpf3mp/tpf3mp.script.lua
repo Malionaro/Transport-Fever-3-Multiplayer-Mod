@@ -416,6 +416,10 @@ function data()
 			if not shared.open and not line.old then shared.unread = shared.unread + 1 end
 			changed = true
 		end
+		local cursors = link:cursors()
+		if type(cursors) == "table" then
+			shared.cursors = cursors
+		end
 		if changed then shared.version = shared.version + 1 end
 	end
 

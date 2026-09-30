@@ -1,7 +1,7 @@
 //! The hook's side of the step gate.
 
 use thiserror::Error;
-use tpf3mp_proto::{ChatText, Event, IntentRejection, Speed, Text};
+use tpf3mp_proto::{ChatText, Cursor, Event, IntentRejection, Speed, Text};
 
 use crate::{LobbyView, MAX_PATH, RoomInfo, ToHook};
 
@@ -58,6 +58,8 @@ pub enum Gated {
     Room(RoomInfo),
     /// Keep the launcher's lobby for the main menu's window.
     Lobby(LobbyView),
+    /// A member's pointer moved or their build tool is previewing.
+    Cursor(Cursor),
     /// Nothing to do but check [`Gate::may_run`] again.
     Nothing,
 }
@@ -186,6 +188,7 @@ impl Gate {
             ToHook::Chat { from, text } => Ok(Gated::Chat { from, text }),
             ToHook::Room(room) => Ok(Gated::Room(room)),
             ToHook::Lobby(view) => Ok(Gated::Lobby(view)),
+            ToHook::Cursor(cursor) => Ok(Gated::Cursor(cursor)),
             ToHook::Hello { .. } => Err(GateError::Unexpected("a hello")),
             ToHook::Begin { .. } => Err(GateError::Unexpected("the start of a game")),
         }

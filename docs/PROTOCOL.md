@@ -522,6 +522,8 @@ players' diagnostics the same way.
     second with a burst of 400 (excess ones are dropped), intents 40 per
     second with a burst of 80. Checkpoints are not limited here: the room
     ignores reports for closed rounds.
+  - Advisory datagrams, per connection: 120 per second with a burst of 240
+    (excess ones are dropped).
   - Requests that change nothing, such as setting ready twice, do not send
     everyone the room again.
 - **Password guessing.** A room takes 10 wrong passwords per minute from
@@ -530,3 +532,23 @@ players' diagnostics the same way.
   rejoining are never held up.
 - **Rejected requests** are answered with a typed error and leave the
   connection open.
+
+## Advisory traffic
+
+Advisory traffic uses unreliable QUIC datagrams outside the turn stream. It is
+fire-and-forget: datagrams are not sequenced, not acknowledged, not buffered
+when queues fill, and do not stall the turn stream or replay on reconnect.
+This keeps pointer movements and build previews responsive and fluid, even
+when the game is paused.
+
+Datagrams carry `Datagram::Cursor`:
+- `player`: authenticated by the server (overwritten with the member's link
+  identity so players cannot impersonate each other);
+- `at`: optional `Pos2` (ground-plane coordinates in millimetres, `None` when
+  the pointer is lifted);
+- `building`: boolean indicating whether an active build tool preview is
+  shown;
+- `label`: optional short tool name or text.
+
+Servers rate-limit incoming datagrams per connection (120/s with a burst of
+240) and immediately relay them to all member connections in the room.

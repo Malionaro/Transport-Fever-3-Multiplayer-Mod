@@ -484,6 +484,12 @@ tpf3mp_native = {
         HOOK.dumped[#HOOK.dumped + 1] = 'lane ' .. lane .. ' step ' .. order.step .. ' ' .. entry
         return true
     end,
+    cursor = function(x, y, building, label)
+        HOOK.cursor = { x = x, y = y, building = building, label = label }
+    end,
+    cursors = function()
+        return HOOK.cursors or {}
+    end,
 }
 "#;
 
@@ -4510,4 +4516,44 @@ fn a_vehicles_marker_wears_its_companys_colour() {
             "{classes}"
         );
     }
+}
+
+#[test]
+fn bridge_syncs_pointer_and_build_preview_cursors() {
+    let lua = gui();
+    lua.load(FAKE_HOOK).exec().unwrap();
+    let bridge = bridge(&lua);
+    lua.globals().set("BRIDGE", bridge).unwrap();
+    lua.load(
+        r#"
+        local link = assert(BRIDGE.attach(tpf3mp_native))
+        link:cursor(123.5, 456.25, true, "streetTerminalBuilder")
+        assert(HOOK.cursor ~= nil)
+        assert(HOOK.cursor.x == 123.5)
+        assert(HOOK.cursor.y == 456.25)
+        assert(HOOK.cursor.building == true)
+        assert(HOOK.cursor.label == "streetTerminalBuilder")
+
+        HOOK.cursors = {
+            ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"] = {
+                x = 100.0,
+                y = 200.0,
+                building = true,
+                label = "trackBuilder",
+            }
+        }
+        local cursors = link:cursors()
+        local remote = cursors["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+        assert(remote ~= nil)
+        assert(remote.x == 100.0)
+        assert(remote.y == 200.0)
+        assert(remote.building == true)
+        assert(remote.label == "trackBuilder")
+
+        link:cursor(nil)
+        assert(HOOK.cursor.x == nil)
+        "#,
+    )
+    .exec()
+    .unwrap();
 }

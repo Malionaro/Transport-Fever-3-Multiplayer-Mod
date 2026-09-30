@@ -28,8 +28,8 @@ mod session;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tpf3mp_proto::{
-    BoundedVec, ChatText, Event, IntentRejection, LaneDigest, MAX_ROOM_MEMBERS, Payload, PlayerId,
-    RulesName, Speed, Text,
+    BoundedVec, ChatText, Cursor, Event, IntentRejection, LaneDigest, MAX_ROOM_MEMBERS, Payload,
+    PlayerId, RulesName, Speed, Text,
 };
 
 pub use gate::{Gate, GateError, Gated};
@@ -38,8 +38,9 @@ pub use session::{Begin, Game, Load, Notice, SaveOrder, Session, SessionError, S
 /// Version of these messages. Both sides send it first and refuse a peer
 /// that speaks another. 7 added [`ToAgent::WorldUp`]; 8 added
 /// [`ToAgent::MenuUp`]; 9 added the main menu's Multiplayer window's
-/// [`ToHook::Lobby`] and [`ToAgent::Lobby`].
-pub const BRIDGE_VERSION: u32 = 9;
+/// [`ToHook::Lobby`] and [`ToAgent::Lobby`]; 10 added advisory [`ToHook::Cursor`]
+/// and [`ToAgent::Cursor`].
+pub const BRIDGE_VERSION: u32 = 10;
 /// The link name the agent creates and the hook opens, unless told
 /// otherwise.
 pub const DEFAULT_LINK: &str = "tpf3mp.default";
@@ -106,6 +107,8 @@ pub enum ToHook {
     /// window (D17): sent whenever it changes, before, during and after a
     /// room's game. Only the latest counts.
     Lobby(LobbyView),
+    /// A member's pointer moved or their build tool is previewing.
+    Cursor(Cursor),
 }
 
 /// Most chat lines a [`LobbyView`] carries: the newest.
@@ -281,6 +284,8 @@ pub enum ToAgent {
     MenuUp { menu: u64 },
     /// The player asked for this in the main menu's Multiplayer window.
     Lobby(LobbyAction),
+    /// The player's pointer moved or their build tool is previewing.
+    Cursor(Cursor),
 }
 
 #[derive(Debug, Error)]

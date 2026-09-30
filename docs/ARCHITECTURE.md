@@ -238,9 +238,11 @@ connection carries:
 | control stream | handshake, rooms and lobby, chat, and the client's game messages: intents, progress, checkpoint and save reports |
 | turn stream | sealed turns, server to client |
 | bulk streams | snapshots, so a 100 MB+ transfer never delays turns |
+| datagrams | advisory traffic: cursors and build previews, unacknowledged |
 
-QUIC datagrams are reserved for advisory traffic such as cursors and build
-previews, which nothing sends yet; the server accepts none.
+QUIC datagrams carry advisory traffic such as pointer movements and build
+previews. They are fire-and-forget, bypassing the turn stream so they remain
+responsive even when the room is paused.
 
 **Fallback:** for networks that block UDP, the same QUIC connection runs
 through a WebSocket over TLS on TCP 443, one datagram per message, usually

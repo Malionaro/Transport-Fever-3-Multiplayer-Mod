@@ -133,6 +133,38 @@ function data()
 		return { action = action, shape = shape }
 	end
 
+	-- Extracts ground-plane position from a build proposal for advisory cursor sync.
+	local function proposalPos(proposal)
+		if type(proposal) ~= "table" and type(proposal) ~= "userdata" then return nil end
+		local ok, px, py = pcall(function()
+			local street = type(proposal.proposal) == "table" and proposal.proposal or nil
+			if street and type(street.addedNodes) == "table" and #street.addedNodes > 0 then
+				local last = street.addedNodes[#street.addedNodes]
+				local pos = last and last.comp and last.comp.position
+				if pos then
+					local x = pos.x or pos[1]
+					local y = pos.y or pos[2]
+					if type(x) == "number" and type(y) == "number" then return x, y end
+				end
+			end
+			local toAdd = type(proposal.toAdd) == "table" and proposal.toAdd or nil
+			if toAdd and #toAdd > 0 then
+				local first = toAdd[1]
+				local transf = first and (first.transf or first.transformation)
+				if type(transf) == "table" and #transf >= 14 then
+					return transf[13], transf[14]
+				end
+			end
+			return nil
+		end)
+		if ok and px and py then return px, py end
+		return nil
+	end
+
+	local activeProposalSeen = false
+	local localCursorActive = false
+	local lastRemoteCursor = {}
+
 	local function linked()
 		if not tried then
 			tried = true
@@ -340,6 +372,14 @@ function data()
 			end
 			local l = linked()
 			if not l or not l:room() then return nil end
+			if type(param) == "table" and param[1] then
+				local px, py = proposalPos(param[1])
+				if px and py then
+					activeProposalSeen = true
+					localCursorActive = true
+					l:cursor(px, py, true, tostring(id))
+				end
+			end
 			local clicks = l:clicks()
 			local kind = CAPTURE[id]
 			if kind == nil then note(l, id, name) end
@@ -385,6 +425,29 @@ function data()
 		guiUpdate = function(_params, _state, _guiState)
 			local l = linked()
 			if not l then return end
+			if l:room() then
+				if activeProposalSeen then
+					activeProposalSeen = false
+				elseif localCursorActive then
+					localCursorActive = false
+					l:cursor(nil)
+				end
+				local cursors = l:cursors()
+				for player, cursor in pairs(cursors) do
+					if cursor.building and cursor.x and cursor.y then
+						local key = tostring(player) .. " " .. tostring(cursor.label or "")
+						if key ~= lastRemoteCursor[player] then
+							lastRemoteCursor[player] = key
+							l:log("player " .. tostring(player):sub(1, 8) .. " previewing build with "
+								.. tostring(cursor.label or "tool") .. " at ("
+								.. string.format("%.1f", cursor.x) .. ", "
+								.. string.format("%.1f", cursor.y) .. ")")
+						end
+					elseif not cursor.building and lastRemoteCursor[player] then
+						lastRemoteCursor[player] = nil
+					end
+				end
+			end
 			local clicks = l:clicks()
 			if clicks == nil then return end
 			if handled == nil then handled = clicks end

@@ -23,9 +23,10 @@ use tpf3mp_net::{
 };
 use tpf3mp_proto::{
     BULK_REQUEST_MAX_FRAME, BULK_RESPONSE_MAX_FRAME, BulkOpen, BulkResponse, CONTROL_MAX_FRAME,
-    ChatText, ClientMessage, Code, GameMessage, Hello, IntentRejection, JoinRoom,
-    MAX_CHECKPOINT_LANES, PROTOCOL_VERSION, PlayerId, Reject, RejectReason, Request, RequestError,
-    Response, RoomView, ServerMessage, SessionId, TURN_MAX_FRAME, TurnMessage, TurnStart, Welcome,
+    ChatText, ClientMessage, Code, DATAGRAM_MAX_FRAME, Datagram, GameMessage, Hello,
+    IntentRejection, JoinRoom, MAX_CHECKPOINT_LANES, PROTOCOL_VERSION, PlayerId, Reject,
+    RejectReason, Request, RequestError, Response, RoomView, ServerMessage, SessionId,
+    TURN_MAX_FRAME, TurnMessage, TurnStart, Welcome, decode_frame, encode_frame,
 };
 use tracing::{debug, info};
 
@@ -46,6 +47,9 @@ const CONTROL_QUEUE: usize = 256;
 /// Turns queued for one client before it counts as too slow: about 100 s of
 /// turns at the default tick.
 const TURN_QUEUE: usize = 1024;
+/// Advisory datagrams queued for one client before it loses them instead:
+/// about two seconds of a hand moving at the rate below.
+const DATAGRAM_QUEUE: usize = 128;
 /// Requests one connection may make per second, and the burst on top. A
 /// client makes a handful per game.
 const REQUESTS_PER_SECOND: u32 = 10;
@@ -70,6 +74,12 @@ const PROGRESS_BURST: u32 = 400;
 /// only keeps a flood out of the room's queue.
 const INTENTS_PER_SECOND: u32 = 40;
 const INTENT_BURST: u32 = 80;
+/// Advisory datagrams one connection may send per second, and the burst on
+/// top. A pointer at 60 Hz needs 60 of these; the rest absorbs a mouse that
+/// reports faster, and the rest of a flood is dropped rather than queued,
+/// since every one of them is replaced by the next.
+const DATAGRAMS_PER_SECOND: u32 = 120;
+const DATAGRAM_BURST: u32 = 240;
 /// Time a client gets to say what a new bulk stream is for.
 const BULK_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -319,6 +329,8 @@ struct Client {
     rooms: watch::Sender<Option<RoomHandle>>,
     control: Option<mpsc::Receiver<ServerMessage>>,
     turns: Option<mpsc::Receiver<TurnFeed>>,
+    /// Where advisory datagrams go, handed to the datagram writer.
+    datagrams: Option<mpsc::Receiver<Datagram>>,
     requests: TokenBucket,
     joins: TokenBucket,
     progress: TokenBucket,
@@ -337,11 +349,17 @@ impl Client {
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
         let (turns_tx, turns_rx) = mpsc::channel(TURN_QUEUE);
+        let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_QUEUE);
+        let rooms = watch::Sender::new(None);
+        let link_rooms = rooms.clone();
         let link = MemberLink {
             id: NEXT_LINK.fetch_add(1, Ordering::Relaxed),
+            player: hello.identity,
             control: control_tx,
             turns: turns_tx,
             connection: connection.clone(),
+            datagrams: datagram_tx,
+            rooms,
         };
         Self {
             origin: shared.origin(connection.remote_address()),
@@ -353,9 +371,10 @@ impl Client {
             link,
             content: None,
             room: None,
-            rooms: watch::Sender::new(None),
+            rooms: link_rooms,
             control: Some(control_rx),
             turns: Some(turns_rx),
+            datagrams: Some(datagram_rx),
             requests: TokenBucket::new(REQUESTS_PER_SECOND, REQUEST_BURST),
             joins: TokenBucket::new(JOINS_PER_SECOND, JOIN_BURST),
             progress: TokenBucket::new(PROGRESS_PER_SECOND, PROGRESS_BURST),
@@ -366,11 +385,17 @@ impl Client {
     }
 
     async fn run(mut self, send: SendStream, mut recv: RecvStream) {
-        let (Some(control), Some(turns)) = (self.control.take(), self.turns.take()) else {
+        let (Some(control), Some(turns), Some(datagrams)) = (
+            self.control.take(),
+            self.turns.take(),
+            self.datagrams.take(),
+        ) else {
             return;
         };
         let control_writer = tokio::spawn(write_control(send, control));
         let turn_writer = tokio::spawn(write_turns(self.connection.clone(), turns));
+        let datagram_writer = tokio::spawn(write_datagrams(self.connection.clone(), datagrams));
+        let advisory = tokio::spawn(read_advisory(self.connection.clone(), self.link.clone()));
         let bulk = tokio::spawn(accept_bulk(BulkPeer {
             connection: self.connection.clone(),
             shared: Arc::clone(&self.shared),
@@ -398,14 +423,27 @@ impl Client {
         turn_writer.abort();
         bulk.abort();
         notices.abort();
+        datagram_writer.abort();
+        advisory.abort();
         // Each holds the connection, and with it the server's socket: the
         // connection's task ends only once they have.
-        let _ = tokio::join!(control_writer, turn_writer, bulk, notices);
+        let _ = tokio::join!(
+            control_writer,
+            turn_writer,
+            bulk,
+            notices,
+            datagram_writer,
+            advisory
+        );
     }
 
     /// Enters or leaves a room, and returns the room left.
+    ///
+    /// The link's room is set here too: advisory traffic is only passed on
+    /// inside a room, and the room is not otherwise known to the link.
     fn set_room(&mut self, room: Option<RoomHandle>) -> Option<RoomHandle> {
         self.rooms.send_replace(room.clone());
+        self.link.rooms.send_replace(room.clone());
         std::mem::replace(&mut self.room, room)
     }
 
@@ -749,6 +787,55 @@ async fn write_control(mut send: SendStream, mut messages: mpsc::Receiver<Server
         {
             return;
         }
+    }
+}
+
+/// Writes advisory datagrams to one client.
+///
+/// A datagram the connection will not take is dropped: there is no queue to
+/// back up behind and nothing to replay, and the next one says where the
+/// pointer is now. The room's relay is the same way round, so a client that
+/// cannot keep up loses its own preview and not the room's others.
+async fn write_datagrams(connection: quinn::Connection, mut receiver: mpsc::Receiver<Datagram>) {
+    while let Some(datagram) = receiver.recv().await {
+        let frame = match encode_frame(&datagram, DATAGRAM_MAX_FRAME) {
+            Ok(frame) => frame,
+            Err(_) => continue,
+        };
+        // `send_datagram` fails once the peer's window is full or the
+        // connection is gone. Either way the datagram is advisory: drop it.
+        if connection.send_datagram(frame.into()).is_err() {
+            return;
+        }
+    }
+}
+
+/// Reads a client's advisory datagrams and hands each to its room.
+///
+/// Unlike the control stream, a datagram that does not decode is dropped and
+/// the read goes on: it is unacknowledged advisory traffic, and closing a
+/// connection over one would make a preview cost a game.
+async fn read_advisory(connection: quinn::Connection, link: MemberLink) {
+    let mut rate_limit = TokenBucket::new(DATAGRAMS_PER_SECOND, DATAGRAM_BURST);
+    loop {
+        let Ok(frame) = connection.read_datagram().await else {
+            return;
+        };
+        if !rate_limit.take(std::time::Instant::now(), 1) {
+            continue;
+        }
+        let Ok(datagram) = decode_frame::<Datagram>(&frame) else {
+            continue;
+        };
+        let Some(room) = link.room() else {
+            continue;
+        };
+        let Datagram::Cursor(mut cursor) = datagram;
+        cursor.player = link.player;
+        room.notify(RoomCommand::Advisory {
+            player: link.player,
+            datagram: Datagram::Cursor(cursor),
+        });
     }
 }
 

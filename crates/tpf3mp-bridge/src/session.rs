@@ -15,8 +15,8 @@ use std::{
 use thiserror::Error;
 use tpf3mp_ipc::{IpcError, Link, Role, SendError};
 use tpf3mp_proto::{
-    ChatText, Event, EventBody, IntentRejection, LaneDigest, Payload, PlayerId, RulesName, Speed,
-    Text,
+    ChatText, Cursor, Event, EventBody, IntentRejection, LaneDigest, Payload, PlayerId, RulesName,
+    Speed, Text,
 };
 
 use crate::{
@@ -70,6 +70,8 @@ pub enum Notice {
     },
     /// The room as it stands: its name, owner and members.
     Room(RoomInfo),
+    /// A member's pointer moved or their build tool is previewing.
+    Cursor(Cursor),
 }
 
 /// What the game does about its next step.
@@ -512,7 +514,8 @@ impl Session {
                 | ToHook::Room(_)
                 | ToHook::Lobby(_)
                 | ToHook::Refused { .. }
-                | ToHook::Diverged { .. } => self.handle(message, game)?,
+                | ToHook::Diverged { .. }
+                | ToHook::Cursor(_) => self.handle(message, game)?,
                 other => {
                     self.peeked = Some(other);
                     return Ok(u32::try_from(steps).unwrap_or(u32::MAX));
@@ -589,6 +592,12 @@ impl Session {
     /// Says something to the room for the player.
     pub fn chat(&mut self, text: ChatText) -> Result<(), SessionError> {
         self.send(&ToAgent::Chat { text })
+    }
+
+    /// Hands the agent the player's pointer or preview position to broadcast
+    /// as an advisory datagram.
+    pub fn cursor(&mut self, cursor: Cursor) -> Result<(), SessionError> {
+        self.send(&ToAgent::Cursor(cursor))
     }
 
     /// Hands the launcher an action the player took in the main menu's
@@ -678,6 +687,7 @@ impl Session {
             Gated::Chat { from, text } => game.notice(Notice::Chat { from, text }),
             Gated::Room(room) => game.notice(Notice::Room(room)),
             Gated::Lobby(view) => self.lobby_view = Some(view),
+            Gated::Cursor(cursor) => game.notice(Notice::Cursor(cursor)),
             Gated::Nothing => {}
         }
         Ok(())

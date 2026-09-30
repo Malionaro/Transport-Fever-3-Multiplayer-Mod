@@ -692,6 +692,9 @@ impl<L: HookLink> Bridge<L> {
                 ToAgent::MenuUp { menu } => self.menu_up(menu, client),
                 ToAgent::Log { message } => info!(hook = %message),
                 ToAgent::Lobby(action) => self.lobby_action(action),
+                ToAgent::Cursor(cursor) => {
+                    let _ = client.send_advisory(&tpf3mp_proto::Datagram::Cursor(cursor));
+                }
             }
         }
         Ok(())
@@ -1039,6 +1042,15 @@ impl<L: HookLink> Bridge<L> {
                 }
                 status.content_diff = diff;
             }),
+            ClientEvent::Advisory(datagram) => match datagram {
+                tpf3mp_proto::Datagram::Cursor(cursor) => {
+                    self.outbox.retain(|message| match message {
+                        ToHook::Cursor(c) => c.player != cursor.player,
+                        _ => true,
+                    });
+                    self.outbox.push_back(ToHook::Cursor(cursor));
+                }
+            },
             ClientEvent::Kicked => return Ok(Some(BridgeEnd::Kicked)),
             ClientEvent::Closed(reason) => return Ok(Some(BridgeEnd::Closed(reason))),
         }
@@ -1450,6 +1462,7 @@ impl Outbox {
             ToHook::Lobby(view) => {
                 view.chat.len() * 320 + view.room.as_ref().map_or(0, |room| room.members.len() * 80)
             }
+            ToHook::Cursor(cursor) => cursor.label.as_ref().map_or(0, |l| l.as_str().len()),
             ToHook::End { reason } => reason.as_str().len(),
             _ => 0,
         };

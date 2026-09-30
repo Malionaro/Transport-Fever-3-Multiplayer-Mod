@@ -38,25 +38,26 @@ fn resolves_every_tpf2_target_uniquely_and_refuses_tampering() {
         eprintln!("skipping: {EXE} is not present (this is expected in CI)");
         return;
     }
-    let image = std::fs::read(exe).unwrap();
     let profile = Profile::from_toml(PROFILE).unwrap();
-
-    // The profile is for exactly this build.
-    let identity = BuildIdentity::of_file(exe).unwrap();
-    profile
-        .verify_identity(&identity)
-        .expect("the on-disk executable matches the pinned build identity");
 
     // A different build is refused up front.
     let stranger = BuildIdentity {
         sha256: "00".repeat(32),
-        size: identity.size,
-        pe_timestamp: identity.pe_timestamp,
+        size: Some(1),
+        pe_timestamp: Some(0),
     };
     assert!(matches!(
         profile.verify_identity(&stranger),
         Err(Refusal::UnknownBuild { .. })
     ));
+
+    // The profile is for exactly build 35924. If another build is installed, skip.
+    let identity = BuildIdentity::of_file(exe).unwrap();
+    if profile.verify_identity(&identity).is_err() {
+        eprintln!("skipping: {EXE} is another build (not build 35924)");
+        return;
+    }
+    let image = std::fs::read(exe).unwrap();
 
     // Resolve over the on-disk .text. `region_base` is the section's RVA, so a
     // resolved address is the function's RVA.

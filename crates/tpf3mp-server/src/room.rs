@@ -13,12 +13,12 @@ use std::{
 use ring::hmac;
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::MissedTickBehavior,
 };
 use tpf3mp_net::{bulk, close};
 use tpf3mp_proto::{
-    ChatText, ContentFingerprint, ContentManifest, Event, EventBody, FRAME_HEADER_LEN,
+    ChatText, ContentFingerprint, ContentManifest, Datagram, Event, EventBody, FRAME_HEADER_LEN,
     IntentRejection, Invite, LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError,
     Resume, RoomId, RoomPhase, RoomSettings, RoomView, RulesName, SavedWorld, ServerMessage,
     SnapshotId, Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, WorldOffer,
@@ -97,9 +97,29 @@ pub(crate) struct MemberLink {
     /// Distinguishes this connection from an earlier or later one of the
     /// same player.
     pub(crate) id: u64,
+    /// The player this connection is. Advisory traffic is stamped with it, so
+    /// a room can tell the members apart, and a client cannot send a cursor
+    /// as someone else.
+    pub(crate) player: PlayerId,
     pub(crate) control: mpsc::Sender<ServerMessage>,
     pub(crate) turns: mpsc::Sender<TurnFeed>,
     pub(crate) connection: quinn::Connection,
+    /// Where this member's advisory datagrams go. Never waited on: a member
+    /// that is behind loses a datagram, since the next says where the
+    /// pointer is now. A member that is gone takes the sender with it, and
+    /// the room skips members with no link.
+    pub(crate) datagrams: mpsc::Sender<Datagram>,
+    /// The room this connection is in, for advisory traffic that only makes
+    /// sense inside one.
+    pub(crate) rooms: watch::Sender<Option<RoomHandle>>,
+}
+
+impl MemberLink {
+    /// The room this member is in, or `None` outside any room: a preview
+    /// belongs to a room and is dropped when the player leaves one.
+    pub(crate) fn room(&self) -> Option<RoomHandle> {
+        self.rooms.borrow().clone()
+    }
 }
 
 /// What a connection's turn-stream writer receives.
@@ -199,6 +219,12 @@ pub(crate) enum RoomCommand {
         player: PlayerId,
         text: ChatText,
         reply: Reply,
+    },
+    /// A member's pointer moved. Advisory: passed to every member, the
+    /// sender too, and never sealed into a turn.
+    Advisory {
+        player: PlayerId,
+        datagram: Datagram,
     },
     Intent {
         player: PlayerId,
@@ -1087,6 +1113,9 @@ impl Room {
             } => {
                 let _ = reply.send(self.chat(player, text));
             }
+            RoomCommand::Advisory { player, datagram } => {
+                self.advisory(player, datagram);
+            }
             RoomCommand::IsMember { player, reply } => {
                 let member = self.members.iter().any(|m| m.player == player);
                 let _ = reply.send(if member {
@@ -1338,6 +1367,22 @@ impl Room {
             );
         }
         Ok(())
+    }
+
+    /// Passes a member's advisory datagram to every member, the sender too.
+    ///
+    /// Advisory traffic is never sealed into a turn, so a paused room still
+    /// passes it on: nothing here waits for a step. A member whose datagram
+    /// writer has gone is skipped, and one that is behind on its queue loses
+    /// this datagram rather than holding the room's others up: the next one
+    /// says where the pointer is now.
+    fn advisory(&mut self, player: PlayerId, datagram: Datagram) {
+        for member in &self.members {
+            if let Some(link) = &member.link {
+                let _ = link.datagrams.try_send(datagram.clone());
+            }
+        }
+        debug!(room = %self.id, player = %player, "passed a datagram on");
     }
 
     /// The owner removes a player for good: the player is told, leaves as if

@@ -4,6 +4,7 @@
 
 # Local runtime output: dev certificates, server data, logs.
 /runtime/
+/server-data/
 *.der
 *.pem
 

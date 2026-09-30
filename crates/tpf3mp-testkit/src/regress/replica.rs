@@ -110,7 +110,11 @@ impl Game for ScriptedGame {
                 .refused
                 .push((self.cursor.refused(command), format!("{reason:?}"))),
             Notice::Diverged { step, lanes } => self.diverged.push((step, lanes)),
-            Notice::Speed(_) | Notice::Ended(_) | Notice::Chat { .. } | Notice::Room(_) => {}
+            Notice::Speed(_)
+            | Notice::Ended(_)
+            | Notice::Chat { .. }
+            | Notice::Room(_)
+            | Notice::Cursor(_) => {}
         }
     }
 }

@@ -98,7 +98,11 @@ impl Game for ToyGame {
         match notice {
             Notice::Refused { .. } => self.refused += 1,
             Notice::Diverged { step, lanes } => self.diverged.push((step, lanes)),
-            Notice::Speed(_) | Notice::Ended(_) | Notice::Chat { .. } | Notice::Room(_) => {}
+            Notice::Speed(_)
+            | Notice::Ended(_)
+            | Notice::Chat { .. }
+            | Notice::Room(_)
+            | Notice::Cursor(_) => {}
         }
     }
 }

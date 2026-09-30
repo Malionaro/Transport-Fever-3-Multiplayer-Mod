@@ -320,7 +320,7 @@ impl Player {
             ClientEvent::Diverged { step, lanes } => self.diverged.push((step, lanes)),
             ClientEvent::Upload { .. } => {}
             ClientEvent::Chat { from, text } => self.chat.push((from, text.as_str().to_owned())),
-            ClientEvent::ContentDiff(_) | ClientEvent::Notice(_) => {}
+            ClientEvent::ContentDiff(_) | ClientEvent::Notice(_) | ClientEvent::Advisory(_) => {}
             ClientEvent::Kicked => self.kicked = true,
             ClientEvent::Closed(_) => self.closed = true,
         }

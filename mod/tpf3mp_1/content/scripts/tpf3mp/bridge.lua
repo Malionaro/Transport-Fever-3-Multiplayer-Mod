@@ -53,6 +53,8 @@
 --     dumped  = function(lane, entry), -- optional; one entry of a lane
 --                                   -- dumped, for hook.log -> true | false
 --                                   -- (no more taken)
+--     cursor  = function(x, y, b, l),  -- optional; reports pointer/build preview
+--     cursors = function(),         -- optional; other players' pointers/previews
 --   }
 --
 -- An action table mirrors tpf3mp_proto::action::Action field for field, in
@@ -173,6 +175,23 @@ function Link:say(text)
 	if not ok then return nil, tostring(said) end
 	if said ~= true then return nil, tostring(why or "the hook did not take it") end
 	return true
+end
+
+-- Reports where the player points over the world plane, or nil when the
+-- pointer is lifted. True for building while dragging a build tool.
+function Link:cursor(x, y, building, label)
+	if self.native.cursor then
+		pcall(self.native.cursor, x, y, building == true, label and tostring(label) or nil)
+	end
+end
+
+-- What other players' pointers are showing:
+-- { [player_id] = { x =, y =, building =, label = } }
+function Link:cursors()
+	if not self.native.cursors then return {} end
+	local ok, cursors = pcall(self.native.cursors)
+	if not ok or type(cursors) ~= "table" then return {} end
+	return cursors
 end
 
 -- The actions the room ordered for this update, as a list, or nil; and who

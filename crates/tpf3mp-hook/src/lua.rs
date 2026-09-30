@@ -76,7 +76,7 @@
 #![allow(unsafe_code)]
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     ffi::{CStr, c_char, c_int, c_void},
     panic::AssertUnwindSafe,
     sync::{
@@ -87,7 +87,8 @@ use std::{
 
 use tpf3mp_bridge::{Notice, RoomInfo};
 use tpf3mp_proto::{
-    ChatText, Payload, PlayerId,
+    ChatText, Cursor, FixedBytes, Payload, PlayerId,
+    action::Pos2,
     lua::{LuaValue, MAX_DEPTH, MAX_NODES, action_from_lua, action_to_lua},
 };
 
@@ -284,6 +285,10 @@ struct RoomStatus {
     replay: bool,
     /// What the player said, for the room.
     said: VecDeque<ChatText>,
+    /// Other players' advisory cursors, by player id.
+    cursors: BTreeMap<PlayerId, Cursor>,
+    /// The player's own outbound cursor, waiting to be sent to the room.
+    outbound_cursor: Option<Cursor>,
 }
 
 static SHARED: Mutex<Shared> = Mutex::new(Shared {
@@ -315,6 +320,8 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
         history: VecDeque::new(),
         replay: false,
         said: VecDeque::new(),
+        cursors: BTreeMap::new(),
+        outbound_cursor: None,
     },
     told: 0,
     menu_load: None,
@@ -625,6 +632,8 @@ pub unsafe fn register(api: &LuaApi, l: State) {
                 (b"say", native_say),
                 (b"dump", native_dump),
                 (b"dumped", native_dumped),
+                (b"cursor", native_cursor),
+                (b"cursors", native_cursors),
             ] {
                 push_str(api, l, name);
                 (api.pushcclosure)(l, function, 0);
@@ -1016,14 +1025,28 @@ pub fn notice(notice: &Notice) {
         Notice::Ended(_) => {
             room.info = None;
             room.diverged = None;
+            room.cursors.clear();
         }
         Notice::Refused { .. } => {}
+        Notice::Cursor(cursor) => {
+            if cursor.at.is_some() {
+                room.cursors.insert(cursor.player, cursor.clone());
+            } else {
+                room.cursors.remove(&cursor.player);
+            }
+        }
     }
 }
 
 /// The local player, as the room's `Begin` names it.
 pub fn set_me(player: PlayerId) {
     shared().room.me = Some(player);
+}
+
+/// What the player's pointer or build preview reported since the last call, for
+/// the room.
+pub fn take_cursor() -> Option<Cursor> {
+    shared().room.outbound_cursor.take()
 }
 
 /// What the player said in the Multiplayer window since the last call, for
@@ -1219,6 +1242,89 @@ unsafe extern "C-unwind" fn native_say(l: State) -> c_int {
             }
         }
     }
+}
+
+/// `cursor(x, y, building, label)` or `cursor(nil)`.
+///
+/// Sets the local player's pointer or build preview position, in metres on the
+/// ground plane. `nil` or no coordinates clears the pointer.
+unsafe extern "C-unwind" fn native_cursor(l: State) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    // SAFETY: Lua calls this with its own state on its thread.
+    let top = unsafe { (api.gettop)(l) };
+    let (at, building, label) = if top >= 2
+        && unsafe { (api.type_of)(l, 1) == TNUMBER && (api.type_of)(l, 2) == TNUMBER }
+    {
+        let x = unsafe { (api.tonumberx)(l, 1, std::ptr::null_mut()) };
+        let y = unsafe { (api.tonumberx)(l, 2, std::ptr::null_mut()) };
+        let building = top >= 3 && unsafe { (api.toboolean)(l, 3) != 0 };
+        let label = unsafe { string_arg(api, l, 4, 32) }.and_then(|s| ChatText::new(&s).ok());
+        #[allow(clippy::cast_possible_truncation)]
+        let at = Some(Pos2 {
+            x: (x * 1000.0).round() as i32,
+            y: (y * 1000.0).round() as i32,
+        });
+        (at, building, label)
+    } else {
+        (None, false, None)
+    };
+    let mut shared = shared();
+    let player = shared.room.me.unwrap_or(PlayerId(FixedBytes([0u8; 32])));
+    shared.room.outbound_cursor = Some(Cursor {
+        player,
+        at,
+        building,
+        label,
+    });
+    0
+}
+
+/// `cursors()`: other players' pointers and build previews:
+/// `{ [player_hex] = { x =, y =, building =, label = } }`
+unsafe extern "C-unwind" fn native_cursors(l: State) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    let cursors = {
+        let shared = shared();
+        let room = &shared.room;
+        let me = room.me;
+        let entries: Vec<(LuaValue, LuaValue)> = room
+            .cursors
+            .iter()
+            .filter(|(player, _)| Some(**player) != me)
+            .filter_map(|(player, cursor)| {
+                let pos = cursor.at?;
+                #[allow(clippy::cast_precision_loss)]
+                let mut fields = vec![
+                    (
+                        LuaValue::string("x"),
+                        LuaValue::Number(f64::from(pos.x) / 1000.0),
+                    ),
+                    (
+                        LuaValue::string("y"),
+                        LuaValue::Number(f64::from(pos.y) / 1000.0),
+                    ),
+                    (
+                        LuaValue::string("building"),
+                        LuaValue::Boolean(cursor.building),
+                    ),
+                ];
+                if let Some(label) = &cursor.label {
+                    fields.push((LuaValue::string("label"), LuaValue::string(label.as_str())));
+                }
+                Some((
+                    LuaValue::string(&crate::lobby::hex(player)),
+                    LuaValue::Table(fields),
+                ))
+            })
+            .collect();
+        LuaValue::Table(entries)
+    };
+    // SAFETY: Lua calls this with its own state on its thread.
+    unsafe { push_or_nil(api, l, Some(&cursors)) }
 }
 
 /// `checkpoint()`: whether the update running is the last of a batch that
@@ -1849,6 +1955,8 @@ pub(crate) mod tests {
             history: VecDeque::new(),
             replay: false,
             said: VecDeque::new(),
+            cursors: BTreeMap::new(),
+            outbound_cursor: None,
         };
     }
 

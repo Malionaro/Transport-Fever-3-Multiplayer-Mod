@@ -17,6 +17,7 @@ mod bounded;
 mod bytes;
 mod content;
 mod control;
+mod datagram;
 mod diagnostics;
 mod ids;
 pub mod lua;
@@ -39,6 +40,7 @@ pub use control::{
     MAX_ROOM_MEMBERS, MemberView, Reject, RejectReason, Request, RequestError, Response, Resume,
     RoomPhase, RoomSettings, RoomView, RulesName, RulesOffer, ServerMessage, Speed, Welcome,
 };
+pub use datagram::{Cursor, DATAGRAM_MAX_FRAME, Datagram};
 pub use diagnostics::{
     DiagnosticBatch, DiagnosticEvent, DiagnosticLevel, DiagnosticTarget, DiagnosticText,
     MAX_DIAGNOSTIC_EVENTS, redact,
@@ -59,8 +61,9 @@ pub use turn::{Event, EventBody, Turn, TurnMessage, TurnStart};
 /// operator's notices; version 5 lets clients send their diagnostics;
 /// version 6 makes invites and session IDs six-character codes; version 7
 /// lets a room's owner hand the room the world it starts from
-/// ([`Request::StartWorld`]).
-pub const PROTOCOL_VERSION: u32 = 7;
+/// ([`Request::StartWorld`]); version 8 carries a player's pointer on datagrams
+/// ([`Datagram::Cursor`]).
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Application protocol name negotiated during the TLS handshake.
 pub const ALPN: &[u8] = b"tpf3mp";
