@@ -2284,10 +2284,11 @@ pub(crate) mod tests {
                  type(tpf3mp_native.checkpoint), type(tpf3mp_native.lanes), \
                  type(tpf3mp_native.clicks), type(tpf3mp_native.built), \
                  type(tpf3mp_native.replaying), \
-                 type(tpf3mp_native.applied), type(tpf3mp_native.results),                  type(tpf3mp_native.status), type(tpf3mp_native.chat), type(tpf3mp_native.say), \
-                 type(tpf3mp_native.dump), type(tpf3mp_native.dumped), type(tpf3mp_native.note)"
+                 type(tpf3mp_native.applied), type(tpf3mp_native.results), type(tpf3mp_native.status), type(tpf3mp_native.chat), type(tpf3mp_native.say), \
+                 type(tpf3mp_native.dump), type(tpf3mp_native.dumped), type(tpf3mp_native.note), \
+                 type(tpf3mp_native.cursor), type(tpf3mp_native.cursors)"
             ),
-            Ok("11|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
+            Ok("12|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
         );
         // A second print keeps the first table.
         lua.run("rawset(tpf3mp_native, 'mark', true)").unwrap();

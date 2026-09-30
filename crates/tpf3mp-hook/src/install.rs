@@ -1057,7 +1057,7 @@ mod tests {
         let results = unsafe { print_detour(state.state()) };
         assert_eq!(results, 0);
         assert_eq!(PRINTED.load(Ordering::SeqCst), 1, "the game's print ran");
-        assert_eq!(state.run("return tpf3mp_native.version"), Ok("11".into()));
+        assert_eq!(state.run("return tpf3mp_native.version"), Ok("12".into()));
         PRINT_ORIGINAL.store(0, Ordering::Release);
     }
 }

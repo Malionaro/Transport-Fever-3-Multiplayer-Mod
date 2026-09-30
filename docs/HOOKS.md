@@ -658,7 +658,7 @@ for the table (`bridge.find`). Its contract is in
 `mod/tpf3mp_1/content/scripts/tpf3mp/bridge.lua`; the hook's half is
 `crates/tpf3mp-hook/src/lua.rs`:
 
-- `tpf3mp_native.version`: 11. The mod refuses any other.
+- `tpf3mp_native.version`: 12. The mod refuses any other.
 - `tpf3mp_native.note(key[, value])`: a short string one of the game's Lua
   states notes for the others (at most 16 keys, 512 bytes each; "" forgets
   it); with only a key, what was noted, or nil. The GUI runs in more than
@@ -738,6 +738,10 @@ for the table (`bridge.find`). Its contract is in
   game script's `postUpdate` at a checkpoint: the lanes the hook wants
   written to its log entry by entry, and each entry ("Lane dumps" below).
   Optional, as `built`.
+- `tpf3mp_native.cursor(x, y, building, label)` and `tpf3mp_native.cursors()`:
+  in the GUI: reports the player's world-plane pointer or active build preview
+  position, and reads other room members' active cursors, carried as advisory
+  datagrams. Optional in the contract.
 
 The table's functions run on whichever thread runs their state (the GUI's
 the main thread, the game scripts' a pool of simulation threads) and share

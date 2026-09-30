@@ -620,7 +620,7 @@ fn a_hook_of_another_version_is_not_used() {
     run_frames(&lua, 1);
     assert!(
         log(&lua).ends_with(
-            "[tpf3mp] the hook speaks bridge version 1, the mod 11; this is the plain game"
+            "[tpf3mp] the hook speaks bridge version 1, the mod 12; this is the plain game"
         ),
         "{}",
         log(&lua)
@@ -713,7 +713,7 @@ fn attach_refuses_a_partial_hook() {
              local function why(t) local _, r = BRIDGE.attach(t); out[#out + 1] = r end
              why(nil)
              why('hook')
-             why({ version = 11, command = print, log = print })
+             why({ version = 12, command = print, log = print })
              return out",
         )
         .eval()
@@ -916,10 +916,10 @@ fn the_guard_goes_on_once_and_a_hook_that_cannot_say_means_the_room() {
              out[#out + 1] = select(2, guard.install(nil, env))
              out[#out + 1] = select(2, guard.install({}, env))
              local bridge = ug_require('tpf3mp_1::/scripts/tpf3mp/bridge.lua')
-             local native = { version = 11 }
+             local native = { version = 12 }
              for _, n in ipairs({ 'command', 'take', 'log', 'poll', 'saved', 'world',
                                   'checkpoint', 'lanes', 'clicks', 'replaying', 'applied', 'results',
-                                  'status', 'chat', 'say' }) do
+                                  'status', 'chat', 'say', 'note' }) do
                  native[n] = function() end
              end
              native.room = function() error('gone') end
