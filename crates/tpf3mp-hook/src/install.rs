@@ -41,6 +41,10 @@ pub const PRINT_TARGET: &str = "luaB_print";
 /// them the tools stay refused in the room's game (crate::builds).
 pub const ADD_TARGET: &str = "CommandList::Add";
 pub const BUILD_APPLY_TARGET: &str = "WorldBuildProposal apply";
+/// The profile's name for the build tools' own preview, which they draw
+/// natively and tell no game script about (crate::preview). Without it no game
+/// shows another player's build in progress.
+pub const PREVIEW_UPDATE_TARGET: &str = "UI::StreetBuilder::CreateProposalAndUpdate";
 
 /// Lua's `print`, reached through its detour's trampoline.
 static PRINT_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
@@ -605,7 +609,23 @@ fn install_inner(profile: &Profile, link_name: &str) -> Result<u64, String> {
         }
         _ => "the build tools stay refused: the profile has no build targets".to_owned(),
     };
+
+    // The player's build preview, where the game draws it. The tools tell no
+    // game script about it, so without this the room never hears a cursor and
+    // no game shows another player's build in progress.
+    let preview = match at(PREVIEW_UPDATE_TARGET) {
+        // SAFETY: the function the profile resolved, which no thread runs yet;
+        // detour_forever installs it for good.
+        Ok(target) => {
+            // SAFETY: as above.
+            unsafe { crate::preview::install(target, detour_forever) }
+                .map(|()| "the player's build preview is read where the game draws it".to_owned())
+                .unwrap_or_else(|error| format!("the build preview is not read: {error}"))
+        }
+        Err(_) => "the build preview is not read: the profile has no preview target".to_owned(),
+    };
     log_line(&builds);
+    log_line(&preview);
     // Loading the room's world from the main menu (docs/HOOKS.md, "Loading
     // from the main menu"): without it, a game needs a world up to take the
     // room's, as before.

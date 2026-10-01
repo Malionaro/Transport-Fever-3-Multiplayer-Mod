@@ -131,6 +131,29 @@ offset = 0
 prologue = "48 89 5C 24 18 55 56 57 41 54 41 55 41 56"
 required = false
 
+# UI::StreetBuilder::CreateProposalAndUpdate (0x577ed0), the build tools' own
+# preview: the street, track and construction tools compute and draw it here,
+# in C++, and tell no game script about it (they send no
+# `builder.proposalCreate` while the pointer moves, and no
+# `builder.proposalPrepareForApply` at all; docs/HOOKS.md, "The build tools").
+# UI::StreetBuilder::Step (vtable slot 5, 0x585e50) calls it at 0x587953 on
+# every frame the pointer moves, so the detour sees each preview as the game
+# makes it. The pointer on the ground plane is at this+0x934/+0x938 and the
+# preview flag at +0x940; all three floats at +0x934..+0x93c are checked
+# against zero on entry and the function returns without a preview when all
+# three are (0x577f42..0x577f74). The hook reads the pointer and reports it as
+# a cursor (crates/tpf3mp-hook/src/preview.rs); the curves the game draws are
+# in the ProposalDataProduct this call hands a thread pool and are not read
+# yet, so what crosses the room is the pointer and the marker the mod draws for
+# it. Found with `tpfre q str 'StreetBuilder'` and `tpfre q dis 0x577ed0` on
+# build 40408.
+[[target]]
+name = "UI::StreetBuilder::CreateProposalAndUpdate"
+signature = "48 8B C4 48 89 58 10 48 89 70 18 48 89 78 20 55 41 54 41 55 41 56 41 57 48 8D A8 48 F3 FF FF"
+offset = 0
+prologue = "48 8B C4 48 89 58 10 48 89 70 18 48 89 78 20"
+required = false
+
 # UI::ModuleBuilder::MousePressed's call of CommandList::Add (0x543b25, in
 # 0x543630, which names "UI::ModuleBuilder::MousePressed" and
 # modulebuilder.cpp): `lea r9,[rbp+0xa0]; mov r8,rax; lea rdx,[rsp+0x50];

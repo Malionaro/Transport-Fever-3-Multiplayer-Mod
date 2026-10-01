@@ -28,6 +28,8 @@ const TARGETS: &[(&str, u64)] = &[
     ("CommandList::Add", 0x9d29c0),
     ("WorldBuildProposal apply", 0x9e1160),
     ("ModuleBuilder::MousePressed/Add call", 0x543b25),
+    // The build tools' own live preview (crates/tpf3mp-hook/src/preview.rs).
+    ("UI::StreetBuilder::CreateProposalAndUpdate", 0x577ed0),
     ("luaB_print", 0x2fccd10),
     ("lua_checkstack", 0x2fbd650),
     ("lua_createtable", 0x2fbd880),
