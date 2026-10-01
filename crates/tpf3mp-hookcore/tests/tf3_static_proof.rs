@@ -30,6 +30,9 @@ const TARGETS: &[(&str, u64)] = &[
     ("ModuleBuilder::MousePressed/Add call", 0x543b25),
     // The build tools' own live preview (crates/tpf3mp-hook/src/preview.rs).
     ("UI::StreetBuilder::CreateProposalAndUpdate", 0x577ed0),
+    ("BaseNodeConfig/field offsets", 0x1768337),
+    ("StreetProposal/node configuration offsets", 0x22c395f),
+    ("BaseNodeConfig/crosswalk set layout", 0xa4990d),
     ("luaB_print", 0x2fccd10),
     ("lua_checkstack", 0x2fbd650),
     ("lua_createtable", 0x2fbd880),
@@ -51,6 +54,7 @@ const TARGETS: &[(&str, u64)] = &[
     ("lua_type", 0x2fbef90),
     // The main menu's load (crates/tpf3mp-hook/src/menu.rs).
     ("UI::CMenuUI::DoStep", 0x6a0160),
+    ("UI::CMenuUI::DoStep/m_game test", 0x6a01c0),
     ("lua_pcallk", 0x2fbe0c0),
     ("luaL_ref", 0x2fb40b0),
     ("lua_load", 0x2fbdf70),
@@ -170,6 +174,16 @@ fn every_target_resolves_uniquely_in_the_installed_game() {
     );
     // The land-vehicle shuffle's seed is the tickCount getter's answer.
     assert_eq!(callee(0xac1b23), 0x2a95c0);
+    // The main menu's m_game test reads CMenuUI+0x6b0, the field StartGame
+    // asserts clear (`cmp [rax], r15` on `lea rax, [rcx+0x6b0]`).
+    assert_eq!(
+        &text_bytes[at(0x6a01c0)..at(0x6a01c0) + 7],
+        &[0x4C, 0x39, 0xAE, 0xB0, 0x06, 0x00, 0x00]
+    );
+    assert_eq!(
+        &text_bytes[at(0x6a3662)..at(0x6a3662) + 7],
+        &[0x48, 0x8D, 0x81, 0xB0, 0x06, 0x00, 0x00]
+    );
 
     // A required target's bytes changed: resolution fails closed.
     let mut tampered = text_bytes.to_vec();

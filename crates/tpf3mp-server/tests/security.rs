@@ -19,9 +19,10 @@ use tpf3mp_net::{
     Identity, client_config, read_message, read_preamble, write_message, write_preamble,
 };
 use tpf3mp_proto::{
-    CONTROL_MAX_FRAME, ClientMessage, EventBody, FRAME_HEADER_LEN, FixedBytes, Hello, JoinRoom,
-    LaneDigest, PROTOCOL_VERSION, Payload, Platform, PlayerId, RejectReason, Request, RequestError,
-    Response, RoomSettings, ServerMessage, Signature, Text, TurnMessage, decode_frame,
+    CONTROL_MAX_FRAME, ClientMessage, EventBody, FRAME_HEADER_LEN, FixedBytes, Hello,
+    IntentRejection, JoinRoom, LaneDigest, PROTOCOL_VERSION, Payload, Platform, PlayerId,
+    RejectReason, Request, RequestError, Response, RoomSettings, Seal, Secret, ServerMessage,
+    Signature, Text, TurnMessage, decode_frame,
 };
 use tpf3mp_server::ServerConfig;
 
@@ -693,6 +694,116 @@ async fn turns_lost_in_a_crash_are_not_replaced_under_a_client_that_saw_them() {
         commands(&ann),
         commands(&bob),
     );
+}
+
+fn seals(player: &Player) -> Vec<Option<Seal>> {
+    player
+        .applied
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::Command { seal, .. } => Some(*seal),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A company's password (DECISIONS.md, D22, proposed) goes to the server
+/// beside the intent and no further: every game gets the intent with the
+/// password's seal, the same seal for the same password and company, another
+/// for another company, and the room's log never holds the password. A
+/// member may send only so many.
+#[tokio::test]
+async fn a_company_password_reaches_the_games_only_as_its_seal() {
+    let dir = data_dir("seal");
+    let server = RunningServer::start(persistent(&dir, [6; 32])).await;
+    let mut clients = vec![server.client("ann").await, server.client("bob").await];
+    let mut seats: Vec<&mut TestClient> = clients.iter_mut().collect();
+    seat(&mut seats, FAST).await;
+    clients[0].client.start_game().await.unwrap();
+    let players: Vec<Player> = clients.into_iter().map(Player::new).collect();
+    let players = play_all(players, |p| p.executed >= 5).await;
+    let secret = |scope: u64, password: &str| {
+        Some(Secret {
+            scope,
+            password: Text::new(password).unwrap(),
+        })
+    };
+    let ann = players[0].client();
+    ann.send_intent_with(1, payload(b"lock"), secret(2, "hunter2"))
+        .await
+        .unwrap();
+    ann.send_intent_with(2, payload(b"join"), secret(2, "hunter2"))
+        .await
+        .unwrap();
+    ann.send_intent_with(3, payload(b"join"), secret(3, "hunter2"))
+        .await
+        .unwrap();
+    ann.send_intent_with(4, payload(b"join"), secret(2, "hunter3"))
+        .await
+        .unwrap();
+    ann.send_intent(5, payload(b"plain")).await.unwrap();
+    let players = play_all(players, |p| commands(p).len() == 5).await;
+    server.shut_down().await;
+
+    for player in &players {
+        let seals = seals(player);
+        let [
+            Some(lock),
+            Some(join),
+            Some(other_company),
+            Some(wrong),
+            None,
+        ] = seals[..]
+        else {
+            panic!("{seals:?}");
+        };
+        assert_eq!(lock, join, "the same password for the same company");
+        assert_eq!(lock.scope, 2);
+        assert_eq!(other_company.scope, 3);
+        assert_ne!(lock.tag, other_company.tag, "bound to the company");
+        assert_ne!(lock.tag, wrong.tag);
+    }
+    assert_eq!(seals(&players[0]), seals(&players[1]));
+    let log = std::fs::read(only_log(&dir)).unwrap();
+    assert!(
+        !log.windows(7).any(|w| w == b"hunter2"),
+        "the room's log holds the password"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Past its share of passwords in the window, a member's intents with one
+/// are refused as too many: each is a guess the room cannot tell from a
+/// right one.
+#[tokio::test]
+async fn a_member_may_send_only_so_many_passwords() {
+    let server = RunningServer::start(|_| {}).await;
+    let mut clients = vec![server.client("ann").await];
+    let mut seats: Vec<&mut TestClient> = clients.iter_mut().collect();
+    seat(&mut seats, FAST).await;
+    clients[0].client.start_game().await.unwrap();
+    let mut players: Vec<Player> = clients.into_iter().map(Player::new).collect();
+    players[0].play_until(|p| p.executed >= 5).await;
+    for seq in 1..=21 {
+        players[0]
+            .client()
+            .send_intent_with(
+                seq,
+                payload(b"join"),
+                Some(Secret {
+                    scope: 2,
+                    password: Text::new(format!("guess{seq}")).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    players[0]
+        .play_until(|p| commands(p).len() == 20 && p.rejections.len() == 1)
+        .await;
+    let rejected = players[0].rejections.clone();
+    server.shut_down().await;
+    assert_eq!(rejected, vec![(21, IntentRejection::RateLimited)]);
 }
 
 // ---------------------------------------------------------------------------

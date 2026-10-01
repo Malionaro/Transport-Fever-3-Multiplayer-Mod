@@ -40,17 +40,86 @@ into the suspended game before any of its code runs (D11), detours that body
    module's cache key, so the rest of the menu sees the same `MainPage`
    value it always did.
 3. The mod's `main_page.tl` is the game's file with marked `TPF3-MP:`
-   additions: a Multiplayer card in the top row, a Multiplayer button in the
-   top bar, and a `Tpf3mpLobbyWindow` opened through the menu's own window
-   container (as the Deluxe Edition window is).
+   additions (below), and a `Tpf3mpLobbyWindow` opened through the menu's
+   own window container (as the Deluxe Edition window is).
+
+**Before the game runs.** The game loads its main menu within seconds of
+starting, so the entry must be armed first. The launcher starts the game
+suspended, loads the hook, and keeps it suspended until the hook sets the
+event `tpf3mp_ipc::hook_ready_event` names for the game's process: the
+hook arms the entry first in its bootstrap, sets the event, and only then
+installs the step gate and the rest. A hook that never sets it lets the
+game run after 30 seconds. Without this the entry was sometimes missing
+(2026-09-30): the slower installs came first, and the game had loaded its
+own main page before the patch was in.
 
 The game log shows each step: `[tpf3mp] main menu: resolveutil.loadfile is
 wrapped`, `... ::/gui/menu/main_page.tl is served from
 tpf3mp_1::/gui/menu/main_page.tl`, `... TPF3-MP main_page.tl is in effect`.
 The hook's `hook.log` shows the profile match, `main-menu Multiplayer entry
-armed`, and `menu patch installed in Lua state ...`.
+armed`, and `menu patch installed in Lua state ...`. Then `main_page.tl SERVED: ...` when the menu's page came from the mod,
+or `main_page.tl MISSED: ...` when the game's own loaded first.
 
 A game Steam started has no hook and keeps the plain menu.
+
+## What the menu shows
+
+- **Two cards**, in a column right of the game's own grid of cards, each
+  a quarter of the menu wide and half high: the size the game gives its
+  `level2b` cards, so the grid's rows stay as they are and the menu grows
+  by one column. **Multiplayer** has the grid's top-right corner (the Map
+  Editor card gives it up), two of the game's own pictures, the TPF3-MP
+  glyph, and a live line under its title: not connected, online on EU,
+  the room with its players and ready count, or the room's world on its
+  way. **Join a friend** opens the window with joining first, and shows
+  the room's invite once in one. The labels are the game's card label
+  (`menu_icon_react_util.makeCardLabelBottomComponent`) with the live
+  line (`lobby.CardLine`, its own recipe, so only it redraws, once a
+  second) in place of the fixed description.
+- **A button in the top bar**, next to Settings: a glyph drawn as the
+  game's top-bar icons are, 100 px greyscale, white on black, for the game
+  to tint (`gui/tpf3mp/icons/menu_multiplayer_50@2x.tga` and its 50 px
+  copy, from `tools/art/icons/menu_icon.py`).
+- **The Multiplayer window** (`gui/menu/lobby.lua`), 940 by 660, in the
+  game's own classes: the `primary` and `secondary` buttons, the
+  `font-scale-*` sizes, and the default style sheet's colours and tapes
+  (`success`, `warning`, `error`, `info`). Along its top, the connection
+  and the steps to playing together; under them, what is under way until
+  the launcher answers, or what went wrong, or what just happened; the
+  room's world while it comes and loads, with a progress bar; how the
+  game differs from the room's. Then one of three views:
+  - not connected: the name, and **Connect to EU**;
+  - connected: a first page with two big cards, **Join a room** and
+    **Host a room**, each opening its own page with Back to the first.
+    Join: **Public rooms**, the server's room list
+    (D26 proposed; PROTOCOL.md, "Rooms"), as cards in the main menu's
+    style (the game's `menu_icon_react_util.CardButton`, class
+    `small-rectangle-card`), each with its climate's picture (the game's
+    own, `app.res.climateRep`, else its New Game card's), name,
+    players/limit, companies, year and a lock for a password; a click
+    joins, asking for a password first. The window asks for it when shown
+    and every 10 seconds; under it, joining with an invite. Host: its name, the save it starts
+    from, players, private or public (a public room is listed with the
+    save's climate and year, read as the Load Game page reads them:
+    `app.findAllSavegames`, `app.getSavegameInfo`), rules and a password.
+    **Your mods** opens from Join, Host and the room: the player's
+    installed mods to turn on or off (`choose_mod`), and in a room the
+    room's own and whether the player has each;
+  - in a room: its name, invite and counts, the players with their marks
+    (owner, you, ready, away, other mods) and, for the owner, a Remove
+    button that asks first; the chat; **Leave room** (asks first),
+    **Ready** or **Not ready**, and, for the owner, **Start the game**,
+    which waits until everyone is ready. Once the room's game runs, the
+    chat and Leave stay and Ready and Start go.
+
+  `crates/tpf3mp-hook/src/lobby/window_tests.rs` draws the window in every
+  view against a stand-in for the menu (`tests/lua/fake_menu.lua`), clicks
+  its buttons, and parses every action it sends as the hook does.
+
+The pause menu has no Multiplayer entry: in the room's game, the game
+bar's line and the Multiplayer window it opens are the room's (PLAYING.md,
+"While you play"), and a copy of the pause menu would be one more game file
+to carry over on every patch.
 
 ## The build profile
 
@@ -80,12 +149,42 @@ The window asks the hook for the lobby through the request channel above
 way (`tpf3mp/act.lua`). The hook does not answer on its own: an action is
 queued for the launcher that started the game and handed to its agent over
 the link (`ToAgent::Lobby`), and the state is the launcher's lobby as the
-agent last sent it (`ToHook::Lobby`, bridge version 9). Every request also
+agent last sent it (`ToHook::Lobby`, bridge version 10). Every request also
 reads the link, since at the main menu no step of the game does
 (`crates/tpf3mp-hook/src/lobby.rs`; `docs/HOOKS.md`, "The main menu's
 Multiplayer window"). The launcher carries the actions out as if its own
 window had asked; Connect goes to its own server (D12). A game whose hook
-has no link to its launcher shows so in the window and sends nothing.
+has no link to its launcher shows so in the window and sends nothing. The
+hook's answer to an action is `ok`, or `error: ` and why it refused it
+(such as a name too long), which the window shows.
+
+**Mods** (docs/MODS.md, "Choosing mods"). The lobby carries the player's
+installed mods (`mods`: `{ id, name, class, reason, chosen, choosable }`,
+class `personal`, `carried` or `shared`, those the player may choose first,
+64 at most) and the room's shared mods once known (`room_mods`: `{ id,
+version, have }`, have `yes`, `no` or `other_version`, 32 at most, and
+`room_mods_more` beyond). The window chooses one with
+`{"action":"choose_mod","id":"<id>","chosen":true|false}`; the launcher
+refuses a mod that is not choosable, with why. Bridge version 13.
+
+**The server** (D12, proposed amendment). The lobby carries the server as
+players see it (`server`, its name or address), its address
+(`server_address`, `host:port`) and the launcher's default
+(`server_default`; empty without one). The window changes the server with
+`{"action":"set_server","server":"host:port"}`, or `"server":""` to go
+back to the default: the launcher refuses anything but a `host:port`, and
+any change while in a room, with why; otherwise it remembers the server,
+and if connected it disconnects and connects there under the same name.
+An invite never changes the server. Bridge version 15.
+
+**The start save.** The lobby lists the player's saves, newest first, by
+name: those `steam::find_save` finds by that name, in the save folder of
+the Steam account playing (`steam::list_saves`, looked at every 5
+seconds). Create names one of them, or none. The launcher takes only a
+name it listed, never a path, finds the file and hands it to the room as
+`--start-save` does (`BridgeOptions::start_world`); a save it cannot find
+creates no room. The launcher's own `--start-save` is offered first, then
+the save last picked.
 
 ## The mod's copies
 
@@ -100,7 +199,9 @@ is listed in `_content.json` like any other file of the mod.
 
 Start the launcher, then **Start Transport Fever 3** (before or in a
 room), and click **Multiplayer** on the game's main menu. The mod must be
-installed in the game's staging area and active.
+installed in the game's staging area and active. After changing
+`main_page.tl`'s additions, run `tools/lobby/make_main_page.py` on the
+game's file again rather than editing the copy.
 
 `tools/lobby/launch-tf3-dev.bat` and `tpf3mp-launch` start the game with the
 hook but without a launcher: the entry and window appear, and the window

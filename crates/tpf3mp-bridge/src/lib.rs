@@ -23,24 +23,27 @@
 //! link; the game-specific part of the hook only implements [`Game`].
 
 mod gate;
+pub mod mods;
 mod session;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tpf3mp_proto::{
     BoundedVec, ChatText, Cursor, Event, IntentRejection, LaneDigest, MAX_ROOM_MEMBERS, Payload,
-    PlayerId, RulesName, Speed, Text,
+    PlayerId, RulesName, Secret, Speed, Text,
 };
 
 pub use gate::{Gate, GateError, Gated};
+pub use mods::{ModLists, ModName, Plan};
 pub use session::{Begin, Game, Load, Notice, SaveOrder, Session, SessionError, StepGate};
 
 /// Version of these messages. Both sides send it first and refuse a peer
 /// that speaks another. 7 added [`ToAgent::WorldUp`]; 8 added
 /// [`ToAgent::MenuUp`]; 9 added the main menu's Multiplayer window's
-/// [`ToHook::Lobby`] and [`ToAgent::Lobby`]; 10 added advisory [`ToHook::Cursor`]
-/// and [`ToAgent::Cursor`].
-pub const BRIDGE_VERSION: u32 = 10;
+/// [`LobbyAction::Create`]). 18 added the players' pointers: the player's own
+/// to the room as an advisory datagram ([`ToAgent::Cursor`]) and the other
+/// members' back to the game ([`ToHook::Cursor`], [`Gated::Cursor`]).
+pub const BRIDGE_VERSION: u32 = 18;
 /// The link name the agent creates and the hook opens, unless told
 /// otherwise.
 pub const DEFAULT_LINK: &str = "tpf3mp.default";
@@ -68,6 +71,11 @@ pub enum ToHook {
         checkpoint_interval: u32,
         saves: Text<MAX_PATH>,
         player: PlayerId,
+        /// The mods the room's worlds load with in this game: the room's
+        /// shared ones and this player's personal ones ([`mods::plan`]).
+        /// `None` when the agent does not know this player's mods: a world
+        /// then loads with the mods its save lists.
+        mods: Option<ModLists>,
     },
     /// Apply this event before running step `event.step`.
     Apply(Event),
@@ -105,14 +113,24 @@ pub enum ToHook {
     Room(RoomInfo),
     /// The launcher's lobby as it stands, for the main menu's Multiplayer
     /// window (D17): sent whenever it changes, before, during and after a
-    /// room's game. Only the latest counts.
-    Lobby(LobbyView),
+    /// room's game. Only the latest counts. Boxed: it is far larger than
+    /// the other messages.
+    Lobby(Box<LobbyView>),
     /// A member's pointer moved or their build tool is previewing.
     Cursor(Cursor),
 }
 
 /// Most chat lines a [`LobbyView`] carries: the newest.
 pub const MAX_LOBBY_CHAT: usize = 40;
+/// Most rules a [`LobbyView`] offers.
+pub const MAX_LOBBY_RULES: usize = 8;
+/// Most saves a [`LobbyView`] lists: the newest.
+pub const MAX_LOBBY_SAVES: usize = 40;
+/// Longest save name a [`LobbyView`] lists or a [`LobbyAction::Create`]
+/// names, in UTF-8 bytes.
+pub const MAX_SAVE_NAME: usize = 64;
+/// A save in the game's save folder, by its name without `.sav`.
+pub type SaveName = Text<MAX_SAVE_NAME>;
 
 /// What the main menu's Multiplayer window shows: the launcher's connection,
 /// room and chat, as the launcher window shows them (D17).
@@ -121,6 +139,14 @@ pub struct LobbyView {
     pub connection: LobbyConnection,
     /// The server the launcher plays on, as players see it.
     pub server: Text<128>,
+    /// That server's address, `host:port`, as the server setting shows it;
+    /// empty without one.
+    pub server_address: Text<128>,
+    /// The launcher's default server, `host:port`, which the setting's
+    /// "Reset to default" goes back to; empty without one.
+    pub server_default: Text<128>,
+    /// The banner this player picked, if any.
+    pub banner: Option<tpf3mp_proto::BannerId>,
     /// The player's name.
     pub name: Text<32>,
     /// What went wrong last, until something succeeds.
@@ -130,6 +156,138 @@ pub struct LobbyView {
     pub room: Option<LobbyRoom>,
     /// The room's chat, oldest first.
     pub chat: BoundedVec<LobbyLine, MAX_LOBBY_CHAT>,
+    /// The rules the server offers new rooms, its default first.
+    pub rules: BoundedVec<LobbyRules, MAX_LOBBY_RULES>,
+    /// The player's saves, newest first: what a room they create can start
+    /// from.
+    pub saves: BoundedVec<SaveName, MAX_LOBBY_SAVES>,
+    /// The save rooms this player creates start from unless they pick
+    /// another (the launcher's `--start-save`).
+    pub start_save: Option<SaveName>,
+    /// The room's world in this player's game.
+    pub world: LobbyWorld,
+    /// How this player's game differs from the room's, while it does.
+    pub differences: Option<Text<256>>,
+    /// The page of the server's public rooms last asked for
+    /// ([`LobbyAction::ListRooms`]), while connected.
+    pub rooms: Option<LobbyRoomList>,
+    /// The mods this player has installed, those they may choose first
+    /// (docs/MODS.md, "Choosing mods"), as many as fit.
+    pub mods: BoundedVec<LobbyMod, MAX_LOBBY_MODS>,
+    /// The room's shared mods, from its owner's start save, and whether this
+    /// player has each; empty while they are not known.
+    pub room_mods: BoundedVec<LobbyRoomMod, MAX_LOBBY_ROOM_MODS>,
+    /// The room's shared mods beyond those listed.
+    pub room_mods_more: u32,
+}
+
+/// Most installed mods a [`LobbyView`] lists.
+pub const MAX_LOBBY_MODS: usize = 64;
+/// Most of the room's shared mods a [`LobbyView`] lists.
+pub const MAX_LOBBY_ROOM_MODS: usize = 32;
+
+/// One mod this player has installed, as the window lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyMod {
+    /// Its id, as [`LobbyAction::ChooseMod`] names it.
+    pub id: ModName,
+    /// Its name for players.
+    pub name: Text<48>,
+    pub class: LobbyModClass,
+    /// Why it is of its class, in a line ("every player needs it: ...").
+    pub reason: Text<96>,
+    /// Whether the player plays with it.
+    pub chosen: bool,
+    /// Whether the player may choose it: a personal mod, or a carried one
+    /// with `--personal-game-scripts`. A shared mod never: every player
+    /// needs the room's.
+    pub choosable: bool,
+}
+
+/// What the scan made of a mod (`tpf3mp_modscan::Class`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LobbyModClass {
+    /// Only what this player sees.
+    Personal,
+    /// Decides in the simulation through what the room carries.
+    Carried,
+    /// Every player needs it.
+    Shared,
+}
+
+/// One of the room's shared mods, and whether this player has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyRoomMod {
+    pub id: ModName,
+    /// The room's version of it (empty when unknown).
+    pub version: Text<32>,
+    pub have: LobbyHave,
+}
+
+/// Whether this player has one of the room's shared mods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LobbyHave {
+    Yes,
+    No,
+    /// Installed, in another version.
+    OtherVersion,
+}
+
+/// A page of the server's public rooms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyRoomList {
+    pub page: u16,
+    pub rooms: BoundedVec<LobbyPublicRoom, { tpf3mp_proto::ROOMS_PER_PAGE }>,
+    /// A later page has more.
+    pub more: bool,
+}
+
+/// One public room, as the room browser shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyPublicRoom {
+    pub invite: Text<128>,
+    pub name: Text<48>,
+    pub rules: RulesName,
+    pub players: u8,
+    pub max_players: u8,
+    pub has_password: bool,
+    pub running: bool,
+    /// The climate, such as `temperate`; empty unknown.
+    pub map: Text<32>,
+    /// The game's year; 0 unknown.
+    pub year: u16,
+    pub companies: u8,
+    pub competitive: bool,
+}
+
+/// What a public room's list entry says of its world.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyListing {
+    /// The climate of the start save, such as `temperate`.
+    pub map: Text<32>,
+    /// The start save's year; 0 unknown.
+    pub year: u16,
+}
+
+/// Rules a room can be played by, as the server offers them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyRules {
+    pub name: RulesName,
+    pub description: Text<200>,
+}
+
+/// Where the room's world is in this player's game.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LobbyWorld {
+    /// No world of the room's yet.
+    #[default]
+    None,
+    /// Coming from the room: `bytes` of `total` so far.
+    Fetching { bytes: u64, total: u64 },
+    /// The game loads it.
+    Loading,
+    /// The game plays it.
+    Playing,
 }
 
 impl Default for LobbyView {
@@ -138,11 +296,23 @@ impl Default for LobbyView {
         Self {
             connection: LobbyConnection::Disconnected,
             server: Text::lossy(""),
+            server_address: Text::lossy(""),
+            server_default: Text::lossy(""),
+            banner: None,
             name: Text::lossy(""),
             error: None,
             notice: None,
             room: None,
             chat: BoundedVec::empty(),
+            rules: BoundedVec::empty(),
+            saves: BoundedVec::empty(),
+            start_save: None,
+            world: LobbyWorld::None,
+            differences: None,
+            mods: BoundedVec::empty(),
+            room_mods: BoundedVec::empty(),
+            room_mods_more: 0,
+            rooms: None,
         }
     }
 }
@@ -169,6 +339,8 @@ pub struct LobbyRoom {
     pub max_players: u8,
     pub has_password: bool,
     pub members: BoundedVec<LobbyMember, { MAX_ROOM_MEMBERS as usize }>,
+    /// Co-op (`false`) or competitive (`true`).
+    pub competitive: bool,
 }
 
 /// One member of the room, as its lobby shows it.
@@ -183,6 +355,8 @@ pub struct LobbyMember {
     /// Whether this member's game matches the owner's: `None` while either
     /// has not said.
     pub same_content: Option<bool>,
+    /// The banner this member picked (`tpf3mp_proto::BANNERS`), if any.
+    pub banner: Option<tpf3mp_proto::BannerId>,
 }
 
 /// One line of the room's chat.
@@ -206,6 +380,20 @@ pub enum LobbyAction {
         room: Text<48>,
         max_players: u8,
         password: Option<Text<64>>,
+        /// One of the server's rules; its default without.
+        rules: Option<RulesName>,
+        /// The save the room starts from, which every game loads from its
+        /// menu; without, the launcher's own (`--start-save`), if any.
+        start_save: Option<SaveName>,
+        /// `Some` lists the room in the server's room list; `None` keeps it
+        /// private.
+        listing: Option<LobbyListing>,
+        /// Competitive rather than co-op.
+        competitive: bool,
+    },
+    /// Asks for page `page` of the server's public rooms.
+    ListRooms {
+        page: u16,
     },
     Join {
         invite: Text<128>,
@@ -222,6 +410,24 @@ pub enum LobbyAction {
         text: ChatText,
     },
     Leave,
+    /// Play with the installed mod `id`, or not: a personal one, or a
+    /// carried one with `--personal-game-scripts` (docs/MODS.md). The
+    /// launcher remembers it for next time.
+    ChooseMod {
+        id: ModName,
+        chosen: bool,
+    },
+    /// The player's server setting: play on `server`, a `host:port`, from
+    /// now on; empty goes back to the launcher's default. The launcher
+    /// checks it, remembers it, and reconnects there if connected. Refused
+    /// in a room. Invites never change the server: only this does (D12).
+    SetServer {
+        server: Text<128>,
+    },
+    /// Show this banner in rooms; `None` for the default.
+    SetBanner {
+        banner: Option<tpf3mp_proto::BannerId>,
+    },
 }
 
 /// The room as the game's Multiplayer window shows it.
@@ -247,8 +453,12 @@ pub enum ToAgent {
     Hello { version: u32, build: Text<64> },
     /// The world is loaded, and `next_step` is the first step it will run.
     Loaded { next_step: u64 },
-    /// The local player did something: have the room order it.
-    Command { payload: Payload },
+    /// The local player did something: have the room order it, with the
+    /// password it needs, if any (a company's), which the room seals.
+    Command {
+        payload: Payload,
+        secret: Option<Secret>,
+    },
     /// The game ran this step.
     Ran { step: u64 },
     /// The world's digests at a checkpoint step, taken after running it.
@@ -345,6 +555,7 @@ mod tests {
                 player: PlayerId(FixedBytes([1; 32])),
                 client_seq: 9,
                 payload: Payload::new(vec![4, 5, 6]).unwrap(),
+                seal: None,
             },
         });
         assert_eq!(
@@ -379,6 +590,10 @@ mod tests {
                 player: PlayerId(FixedBytes([0xff; 32])),
                 client_seq: u64::MAX,
                 payload: Payload::new(vec![0xab; MAX_PAYLOAD]).unwrap(),
+                seal: Some(tpf3mp_proto::Seal {
+                    scope: u64::MAX,
+                    tag: FixedBytes([0xff; 32]),
+                }),
             },
         });
         assert!(encode(&apply).is_ok());
@@ -412,15 +627,19 @@ mod tests {
             owner: n == 0,
             you: n == 1,
             same_content: Some(true),
+            banner: None,
         };
         let line = LobbyLine {
             from: Text::new("y".repeat(32)).unwrap(),
             text: Text::new("z".repeat(280)).unwrap(),
             you: false,
         };
-        let view = ToHook::Lobby(LobbyView {
+        let view = ToHook::Lobby(Box::new(LobbyView {
             connection: LobbyConnection::Connected,
             server: Text::new("s".repeat(128)).unwrap(),
+            server_address: Text::new("a".repeat(128)).unwrap(),
+            server_default: Text::new("d".repeat(128)).unwrap(),
+            banner: Some(Text::new("b".repeat(16)).unwrap()),
             name: Text::new("n".repeat(32)).unwrap(),
             error: Some(Text::new("e".repeat(256)).unwrap()),
             notice: Some(Text::new("o".repeat(256)).unwrap()),
@@ -433,20 +652,102 @@ mod tests {
                 max_players: 64,
                 has_password: true,
                 members: BoundedVec::new((0..MAX_ROOM_MEMBERS).map(member).collect()).unwrap(),
+                competitive: false,
             }),
             chat: BoundedVec::new(vec![line; MAX_LOBBY_CHAT]).unwrap(),
-        });
+            rules: BoundedVec::new(vec![
+                LobbyRules {
+                    name: Text::new("r".repeat(32)).unwrap(),
+                    description: Text::new("d".repeat(200)).unwrap(),
+                };
+                MAX_LOBBY_RULES
+            ])
+            .unwrap(),
+            saves: BoundedVec::new(vec![
+                Text::new("s".repeat(MAX_SAVE_NAME)).unwrap();
+                MAX_LOBBY_SAVES
+            ])
+            .unwrap(),
+            start_save: Some(Text::new("s".repeat(MAX_SAVE_NAME)).unwrap()),
+            world: LobbyWorld::Fetching {
+                bytes: u64::MAX,
+                total: u64::MAX,
+            },
+            differences: Some(Text::new("d".repeat(256)).unwrap()),
+            mods: BoundedVec::new(vec![
+                LobbyMod {
+                    id: Text::new("m".repeat(96)).unwrap(),
+                    name: Text::new("n".repeat(48)).unwrap(),
+                    class: LobbyModClass::Carried,
+                    reason: Text::new("r".repeat(96)).unwrap(),
+                    chosen: true,
+                    choosable: true,
+                };
+                MAX_LOBBY_MODS
+            ])
+            .unwrap(),
+            room_mods: BoundedVec::new(vec![
+                LobbyRoomMod {
+                    id: Text::new("m".repeat(96)).unwrap(),
+                    version: Text::new("v".repeat(32)).unwrap(),
+                    have: LobbyHave::OtherVersion,
+                };
+                MAX_LOBBY_ROOM_MODS
+            ])
+            .unwrap(),
+            room_mods_more: u32::MAX,
+            rooms: Some(LobbyRoomList {
+                page: u16::MAX,
+                rooms: BoundedVec::new(vec![
+                    LobbyPublicRoom {
+                        invite: Text::new("i".repeat(128)).unwrap(),
+                        name: Text::new("n".repeat(48)).unwrap(),
+                        rules: Text::new("r".repeat(32)).unwrap(),
+                        players: u8::MAX,
+                        max_players: u8::MAX,
+                        has_password: true,
+                        running: true,
+                        map: Text::new("m".repeat(32)).unwrap(),
+                        year: u16::MAX,
+                        companies: u8::MAX,
+                        competitive: true,
+                    };
+                    tpf3mp_proto::ROOMS_PER_PAGE
+                ])
+                .unwrap(),
+                more: true,
+            }),
+        }));
         let bytes = encode(&view).unwrap();
         assert_eq!(decode::<ToHook>(&bytes).unwrap(), view);
         let action = ToAgent::Lobby(LobbyAction::Create {
             room: Text::new("Alps").unwrap(),
             max_players: 4,
             password: None,
+            rules: Some(Text::new("native").unwrap()),
+            start_save: Some(Text::new("mptest").unwrap()),
+            listing: Some(LobbyListing {
+                map: Text::new("temperate").unwrap(),
+                year: 1850,
+            }),
+            competitive: true,
         });
         assert_eq!(
             decode::<ToAgent>(&encode(&action).unwrap()).unwrap(),
             action
         );
+        let choose = ToAgent::Lobby(LobbyAction::ChooseMod {
+            id: Text::new("schbrongx_minimap").unwrap(),
+            chosen: true,
+        });
+        assert_eq!(
+            decode::<ToAgent>(&encode(&choose).unwrap()).unwrap(),
+            choose
+        );
+        let set = ToAgent::Lobby(LobbyAction::SetServer {
+            server: Text::new("s".repeat(128)).unwrap(),
+        });
+        assert_eq!(decode::<ToAgent>(&encode(&set).unwrap()).unwrap(), set);
     }
 
     #[test]

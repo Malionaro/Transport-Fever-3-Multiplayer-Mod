@@ -17,8 +17,8 @@ use tpf3mp_proto::{
     ContentManifest, CreateRoom, Event, EventBody, FixedBytes, GameMessage, Hello, IntentRejection,
     Invite, JoinRoom, LaneDigest, MemberView, ModRef, Os, Payload, Platform, PlayerId, Reject,
     RejectReason, Request, RequestError, Response, Resume, RoomId, RoomPhase, RoomSettings,
-    RoomView, RulesOffer, SavedWorld, ServerMessage, SessionId, Signature, SnapshotId, Speed, Text,
-    Turn, TurnMessage, TurnStart, Welcome, WorldOffer, decode_frame,
+    RoomView, RulesOffer, SavedWorld, Seal, Secret, ServerMessage, SessionId, Signature,
+    SnapshotId, Speed, Text, Turn, TurnMessage, TurnStart, Welcome, WorldOffer, decode_frame,
 };
 
 /// Decodes `bytes` as a `T`: an error, or a message that survives a round
@@ -68,6 +68,7 @@ fn room_view() -> RoomView {
                 ready: true,
                 content: Some(ContentFingerprint(FixedBytes([9; 32]))),
                 connected: true,
+                banner: Some(Text::new("m03").unwrap()),
             },
             MemberView {
                 player: player(2),
@@ -76,8 +77,10 @@ fn room_view() -> RoomView {
                 ready: false,
                 content: None,
                 connected: false,
+                banner: None,
             },
         ],
+        competitive: false,
     }
 }
 
@@ -130,6 +133,12 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                 password: Some(Text::new("secret").unwrap()),
                 settings: RoomSettings::DEFAULT,
                 rules: Some(Text::new("tpf2mp").unwrap()),
+                listing: Some(tpf3mp_proto::RoomListing {
+                    map: Text::new("temperate").unwrap(),
+                    year: 1850,
+                    companies: 2,
+                }),
+                competitive: true,
             }),
         },
         ClientMessage::Request {
@@ -158,6 +167,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
         ClientMessage::Game(GameMessage::Intent {
             client_seq: 3,
             payload: Payload::new(vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap(),
+            secret: Some(Secret {
+                scope: 2,
+                password: Text::new("correct horse").unwrap(),
+            }),
         }),
         ClientMessage::Game(GameMessage::Checkpoint {
             step: 500,
@@ -251,6 +264,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                         player: player(1),
                         client_seq: 3,
                         payload: Payload::new(vec![9; 40]).unwrap(),
+                        seal: Some(Seal {
+                            scope: 2,
+                            tag: FixedBytes([5; 32]),
+                        }),
                     },
                 },
                 Event {

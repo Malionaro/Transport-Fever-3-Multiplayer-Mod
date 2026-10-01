@@ -57,6 +57,11 @@
 -- reaches this game's scripts only, so only this game hands the action over;
 -- the room then orders it for every game.
 --
+-- With more than one company in the room, it samples the companies'
+-- scores four times a game month, the same game time in every game, and
+-- keeps their ranks (tpf3mp/progression.lua, docs/HOOKS.md "Company
+-- ranks"), each town's parts and each score said in the hook's log.
+--
 -- It also hears the company script's `startProspection` and
 -- `endProspection` (game_mechanics/company/company.script.tl), which every
 -- game's company script sends at the same update, and says in the hook's
@@ -66,7 +71,8 @@
 function data()
 	local MOD = "tpf3mp_1"
 	-- Per Lua state: tried once, then kept.
-	local tried, link, apply, lanes, capture, registry, companies = false, nil, nil, nil, nil, nil, nil
+	local tried, link, apply, lanes, capture, registry, companies, progression =
+		false, nil, nil, nil, nil, nil, nil, nil
 	-- Lanes that could not be read, and kinds the registry could not list,
 	-- logged once per state.
 	local told, toldRegistry = false, false
@@ -96,10 +102,13 @@ function data()
 	-- that a later build would send its proposals under them.
 	local CAPTURE = { constructionBuilder = "construction", streetBuilder = "street", trackBuilder = "track",
 		bulldozer = "bulldoze", streetTerminalBuilder = "stop", moduleBuilder = "construction",
-		moduleBulldozer = "bulldoze" }
+		moduleBulldozer = "bulldoze", streetTrackModifier = "modify", laneModifier = "junction",
+		crosswalkModifier = "junction", streetEdgeNodeModifier = "junction" }
 	-- In the GUI: the last proposal seen at each count of the player's builds
 	-- ({ action = t } or { why = text }), and the builds handed on so far.
 	local snapshots, handled = {}, nil
+	-- What the log said of the tools the room does not carry, by tool and change.
+	local toolsLogged = nil
 	-- The last reason a proposal was refused for, and how many were logged.
 	local refusedWhy, refusals = nil, 0
 	-- The events of the room's game the mod does not handle, by id and
@@ -118,6 +127,11 @@ function data()
 	-- construction tool's capture makes of it, which must replace the
 	-- construction edited.
 	local function moduleEdit(proposal, why)
+		if proposal and proposal.junctionEdit then
+			local ok, action, whyNot = pcall(capture.junction, proposal)
+			if not ok then action, whyNot = nil, tostring(action) end
+			return { action = action or nil, why = whyNot or "an empty junction edit", shape = "junction tool" }
+		end
 		local shape = "module editor"
 		if proposal == nil then
 			return { why = "the module editor's edit did not read: " .. tostring(why), shape = shape }
@@ -133,6 +147,9 @@ function data()
 		return { action = action, shape = shape }
 	end
 
+	-- The guard on what this player's personal mods' game scripts send, in
+	-- this state (tpf3mp/modguard.lua): put on once the link is.
+	local PERSONAL_UNGUARDED = "personal-mods-unguarded"
 	local function xy(v)
 		if v == nil then return nil end
 		local x = v.x or v[1]
@@ -297,6 +314,85 @@ function data()
 	local lastRemoteCursor = {}
 	local drawnZones = {}
 
+	local function guardPersonalMods(companiesModule, registryModule)
+		local okModule, modguard = pcall(ug_require, MOD .. "::/scripts/tpf3mp/modguard.lua")
+		local okCmd, cmd = pcall(function() return api.cmd end)
+		if not okModule or type(modguard) ~= "table" or not okCmd then
+			link:log("the personal mods' guard is not on: " .. tostring(modguard))
+			return
+		end
+		if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then
+			-- Without the stack no command can be told to be a personal
+			-- mod's. Fail closed: the hook loads the room's worlds without
+			-- this player's personal mods from now on (tpf3mp_native.note,
+			-- PERSONAL_UNGUARDED), and whatever one does before is this
+			-- game's alone, which the room's check finds and its resync
+			-- loads anew without them.
+			link:note(PERSONAL_UNGUARDED, "1")
+			if next(link:personal()) ~= nil then
+				link:log("the personal mods' guard is not on: this state has no debug.getinfo, "
+					.. "so this player's personal mods are left out of the room's worlds from the next load")
+			end
+			return
+		end
+		-- This player's personal mods, read again every so often: the room's
+		-- lists come with its Begin, perhaps after this state linked.
+		local personal, reads = {}, 0
+		local function isPersonal(mod)
+			reads = reads - 1
+			if reads <= 0 then
+				personal, reads = link:personal(), 200
+			end
+			return personal[mod] == true
+		end
+		local function registryNow()
+			local state = companiesModule.scriptState(api)
+			return state and state.registry
+		end
+		local function idOf(kind)
+			return function(entity) return registryModule.id(registryNow(), kind, entity) end
+		end
+		-- The company this player acts for: theirs in the roster, else the
+		-- game's player.
+		local function myCompany()
+			local state = companiesModule.scriptState(api)
+			local roster = state and state.companies
+			local status = link:status()
+			local me = status and status.me_id
+			if roster and me then
+				for _, m in ipairs(roster.members or {}) do
+					if m.player == me then
+						for _, c in ipairs(roster.list or {}) do
+							if c.id == m.company then return c.entity, roster end
+						end
+					end
+				end
+			end
+			local ok, player = pcall(function() return api.engine.util.getPlayer() end)
+			return ok and player or nil, roster
+		end
+		local wrapped, why = modguard.install(cmd, {
+			inRoom = function() return link:room() end,
+			personal = isPersonal,
+			command = function(action) return link:command(action) end,
+			context = { vehicle = idOf("vehicles"), line = idOf("lines"), group = idOf("groups"),
+				town = idOf("towns") },
+			mayTouch = function(entity)
+				local company, roster = myCompany()
+				return companiesModule.mayTouch(roster, company, entity, api, "thing")
+			end,
+			now = function()
+				local ok, t = pcall(function()
+					return api.engine.getComponent(api.engine.util.getWorld(),
+						api.type.ComponentType.GAME_TIME).gameTime
+				end)
+				return ok and t or 0
+			end,
+			log = function(line) link:log(line) end,
+		})
+		if not wrapped then link:log("the personal mods' guard is not on: " .. tostring(why)) end
+	end
+
 	local function linked()
 		if not tried then
 			tried = true
@@ -306,8 +402,9 @@ function data()
 			local okCapture, captureModule = pcall(ug_require, MOD .. "::/scripts/tpf3mp/capture.lua")
 			local okRegistry, registryModule = pcall(ug_require, MOD .. "::/scripts/tpf3mp/registry.lua")
 			local okCompanies, companiesModule = pcall(ug_require, MOD .. "::/scripts/tpf3mp/companies.lua")
-			if okBridge and okApply and okLanes and okCapture and okRegistry and okCompanies
-				and type(companiesModule) == "table" and type(bridge) == "table"
+			local okProgression, progressionModule = pcall(ug_require, MOD .. "::/scripts/tpf3mp/progression.lua")
+			if okBridge and okApply and okLanes and okCapture and okRegistry and okCompanies and okProgression
+				and type(companiesModule) == "table" and type(progressionModule) == "table" and type(bridge) == "table"
 				and type(applyModule) == "table" and type(lanesModule) == "table"
 				and type(captureModule) == "table" and type(registryModule) == "table" then
 				link = bridge.attach(bridge.find())
@@ -320,7 +417,11 @@ function data()
 				capture = captureModule
 				registry = registryModule
 				companies = companiesModule
-				if link then link:log("the game script is linked") end
+				progression = progressionModule
+				if link then
+					link:log("the game script is linked")
+					guardPersonalMods(companiesModule, registryModule)
+				end
 			end
 		end
 		return link
@@ -393,7 +494,7 @@ function data()
 				subscribed = true
 				for _, event in ipairs(EVENTS) do state:subscribeToEvent(event) end
 			end
-			local actions, origins = l:take()
+			local actions, origins, seals = l:take()
 			local checkpoint = l:checkpoint()
 			-- The registry begins at the room's first update, the same in
 			-- every game (tpf3mp/registry.lua), or at the first update since
@@ -403,21 +504,27 @@ function data()
 			-- A month begun since the companies' loans were last charged.
 			local month = companies.monthNow(api)
 			local monthly = l:room() and type(saved) == "table" and companies.due(saved.companies, month)
-			if not actions and not checkpoint and not begin and not monthly then return nil end
-			return { actions = actions, origins = origins, checkpoint = checkpoint, begin = begin,
-				monthly = monthly and month or nil }
+			-- A quarter of a month begun since the companies' scores were
+			-- last sampled, with more than one company (tpf3mp/progression.lua).
+			local quarter = progression.quarterNow(api)
+			local sample = l:room() and progression.due(saved, quarter)
+			if not actions and not checkpoint and not begin and not monthly and not sample then return nil end
+			return { actions = actions, origins = origins, seals = seals, checkpoint = checkpoint,
+				begin = begin, monthly = monthly and month or nil, sample = sample and quarter or nil }
 		end,
 
 		postUpdate = function(_params, state, _dt, work)
 			local l = linked()
 			if not l or type(work) ~= "table" then return end
-			if work.actions or work.begin or work.monthly then
+			if work.actions or work.begin or work.monthly or work.sample then
 				local saved = state:get()
 				if type(saved) ~= "table" then saved = {} end
 				local reg, _, failed = registry.sync(saved.registry)
 				-- The room's companies: begun at its first update, as the
 				-- registry, the same in every game (tpf3mp/companies.lua).
 				local roster = companies.ensure(saved.companies, api)
+				-- The companies' ranks (tpf3mp/progression.lua).
+				local prog = progression.ensure(saved.progression)
 				if #failed > 0 and not toldRegistry then
 					toldRegistry = true
 					l:log("the registry could not list " .. table.concat(failed, "; "))
@@ -429,11 +536,17 @@ function data()
 					-- Booked to the sender's company.
 					local player = work.origins and work.origins[i]
 					local company = player and companies.of(roster, player)
+					-- The seal of the password sent with it (a company's),
+					-- which the room made; never the password.
+					local seal = work.seals and work.seals[i] or nil
 					local ok, why, made = apply.run(action, {
 						registry = reg,
 						roster = roster,
 						player = player,
 						company = company and company.entity,
+						company = company and company.entity,
+						progression = prog,
+						seal = type(seal) == "table" and seal or nil,
 					})
 					local name = next(action)
 					-- What it changed keeps its id on whatever entity it is
@@ -464,6 +577,14 @@ function data()
 					l:applied(i, ok, entity, why)
 					if not ok then
 						l:log("action " .. i .. " of this step was not applied: " .. tostring(why))
+					elseif name == "CompanyOp" then
+						-- What became of the room's companies, for the log: the
+						-- operation, whose, and whether a seal came with it;
+						-- never a seal itself.
+						local op = next(action.CompanyOp)
+						l:log("company: " .. tostring(op) .. " by " .. tostring(player):sub(1, 8)
+							.. (seal and " (with a password's seal)" or "") .. ": "
+							.. companies.describe(roster))
 					end
 				end
 				if work.actions then l:replaying(false) end
@@ -471,8 +592,14 @@ function data()
 					local ok, why = pcall(companies.chargeMonths, roster, work.monthly, apply.send, api)
 					if not ok then l:log("the companies' loans were not charged: " .. tostring(why)) end
 				end
+				if work.sample then
+					local ok, why = progression.sample(prog, roster, api, work.sample,
+						function(line) l:log(line) end, reg, registry)
+					if not ok then l:log("the companies' scores were not sampled: " .. tostring(why)) end
+				end
 				saved.registry = reg
 				saved.companies = roster
+				saved.progression = prog
 				state:set(saved)
 			end
 			if work.checkpoint then
@@ -544,18 +671,31 @@ function data()
 			end
 			-- A tool the room does not carry: its proposals' shapes, for the
 			-- log, when they change, a few dozen times at most.
-			if refusals < 40 and type(param) == "table" and capture then
+			if type(param) == "table" and capture then
 				local described, text = pcall(capture.describe, param[1])
-				local key = tostring(id) .. " " .. (described and text or "")
-				if described and text ~= "" and key ~= refusedWhy then
-					refusedWhy, refusals = key, refusals + 1
-					l:log("the room does not carry the " .. tostring(id) .. " tool yet [" .. text .. "]")
+				local diffed, diff = pcall(capture.rebuildDiff, param[1])
+				local tool = l.note and l:note(capture.TOOL_NOTE) or "?"
+				-- Once for each tool and what it changes, a few dozen at most.
+				local key = tostring(id) .. " " .. tostring(tool) .. " " .. tostring(diff)
+				toolsLogged = toolsLogged or {}
+				if described and text ~= "" and not toolsLogged[key] and refusals < 80 then
+					toolsLogged[key], refusals = true, refusals + 1
+					l:log("the room does not carry the " .. tostring(id) .. " tool yet (" .. tostring(tool) .. ") [" .. text .. "]")
+					if diffed and diff ~= "" then
+						local n = 0
+						for part in (diff .. "; "):gmatch("(.-); ") do
+							n = n + 1
+							if n <= 12 then l:log("  what it changes: " .. part) end
+						end
+					elseif not diffed then
+						l:log("  what it changes: " .. tostring(diff))
+					end
 				end
 			end
 			return { errorMessages = { [REFUSED] = true } }
 		end,
 
-		guiUpdate = function(_params, state, _guiState)
+		guiUpdate = function(_params, _state, _guiState)
 			local l = linked()
 			if not l then return end
 			if l:room() then
@@ -566,7 +706,7 @@ function data()
 					l:cursor(nil)
 				end
 				local cursors = l:cursors()
-				local saved = state and state.get and state:get()
+				local saved = _state and _state.get and state:get()
 				local roster = type(saved) == "table" and saved.companies or nil
 				local activePlayers = {}
 				for player, cursor in pairs(cursors) do
@@ -649,6 +789,7 @@ function data()
 					drawnZones = {}
 				end
 			end
+
 			local clicks = l:clicks()
 			if clicks == nil then return end
 			if handled == nil then handled = clicks end

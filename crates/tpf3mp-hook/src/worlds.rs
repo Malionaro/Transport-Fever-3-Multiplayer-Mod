@@ -82,6 +82,10 @@ impl GameControl for GuiWorlds {
         lua::set_me(player);
     }
 
+    fn set_mods(&mut self, mods: Option<tpf3mp_bridge::ModLists>) {
+        lua::set_mods(mods);
+    }
+
     fn request_load(&mut self, file: &Path, from: LoadFrom) -> Result<(), String> {
         let folder = self.folder.clone()?;
         let name = format!("tpf3mp_room_{}", self.tag);

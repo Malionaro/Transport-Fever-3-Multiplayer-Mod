@@ -18,6 +18,7 @@ use super::model::{ModelWorld, Observation};
 /// Something that must hold of every replica's world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
+    Junctions(usize),
     StreetEdges(usize),
     TrackEdges(usize),
     Constructions(usize),
@@ -72,6 +73,7 @@ impl Check {
             (want != got).then(|| format!("{got} {what}, expected {want}"))
         };
         match self {
+            Self::Junctions(n) => count("junction configurations", *n, seen.junctions),
             Self::StreetEdges(n) => count("street edges", *n, seen.street_edges),
             Self::TrackEdges(n) => count("track edges", *n, seen.track_edges),
             Self::Constructions(n) => count("constructions", *n, seen.constructions),
@@ -131,6 +133,7 @@ impl Check {
 impl fmt::Display for Check {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Junctions(n) => write!(f, "{n} junction configurations"),
             Self::StreetEdges(n) => write!(f, "{n} street edges"),
             Self::TrackEdges(n) => write!(f, "{n} track edges"),
             Self::Constructions(n) => write!(f, "{n} constructions"),

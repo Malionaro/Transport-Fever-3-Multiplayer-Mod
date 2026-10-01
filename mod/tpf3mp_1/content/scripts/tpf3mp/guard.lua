@@ -23,7 +23,19 @@
 -- begins, after it ends) every command is sent as it would be.
 --
 -- Only the GUI state's api.cmd is wrapped. The mod's game script applies the
--- room's actions through its own state's api.cmd, which is left alone.
+-- room's actions through its own state's api.cmd, which is left alone, but
+-- for commands a player's personal mods' game scripts send there
+-- (tpf3mp/modguard.lua).
+--
+-- Personal mods (docs/MODS.md): a mod only one player may run goes through
+-- this guard like the player's own clicks. The one thing it may send past
+-- the room is an event to its own game script (makeScriptingSendEventCmd),
+-- which runs in this game alone: one whose id names the mod
+-- (guard.ownEvent), and neither an id nor a name the game's own scripts or
+-- TPF3-MP listen to (guard.RESERVED_IDS, guard.RESERVED_NAMES). Any other
+-- event of a personal mod goes the way a click's does: carried if the room
+-- carries it, refused if not. A refusal names the mod the command came from
+-- (guard.caller).
 --
 -- Pure Lua; the tests hand install() a fake api.cmd.
 
@@ -55,7 +67,8 @@ guard.CARRY = {
 	-- The finance window's loans (finances_loan_gui.tl): the loan script's
 	-- events, with the loans as the script keeps them. The construction
 	-- menu's prospecting: the company script's spawnIndustry
-	-- (capture.prospect).
+	-- (capture.prospect). The company window's ranks: the growth script's
+	-- applyLevel.
 	makeScriptingSendEventCmd = function(ctx, _src, id, name, param)
 		if id == "Loan" and type(param) == "table" then
 			if name == "Obtain" and type(param[1]) == "table" and type(param[2]) == "table" then
@@ -65,6 +78,14 @@ guard.CARRY = {
 			end
 		elseif id == "Companies" and name == "spawnIndustry" then
 			return capture().prospect(ctx, param)
+		elseif id == "Companies" and name == "applyLevel" then
+			-- The company window taking a rank (company.tl): the acting
+			-- player's company takes it in every game (tpf3mp/progression.lua).
+			local level = type(param) == "table" and param.level or nil
+			if type(level) ~= "number" or level ~= math.floor(level) or level < 1 or level > 255 then
+				error("a rank of " .. tostring(level), 0)
+			end
+			return { ApplyRank = { level = level } }
 		elseif id == "Notifications" and name == "initialSound" and type(param) == "table"
 			and type(param.notificationId) == "number" and param.notificationId >= 0
 			and param.notificationId == math.floor(param.notificationId) then
@@ -83,6 +104,7 @@ guard.CARRY = {
 	makeVehicleSendToDepotCmd = by("vehicleToDepot"),
 	makeVehicleReverseCmd = by("vehicleReverse"),
 	makeVehicleTryToDepartCmd = by("vehicleDepart"),
+	makeVehicleSetManualDepartureCmd = by("vehicleManualDeparture"),
 	makeLineCreateCmd = by("lineCreate"),
 	makeLineUpdateCmd = by("lineUpdate"),
 	makeLineDestroyCmd = by("lineDestroy"),
@@ -161,6 +183,96 @@ guard.FACTORIES = {
 	"makeWorldSetBulldozableCmd",
 }
 
+-- TPF3-MP's own mod, whose files are never "a mod's" to the guards.
+guard.OWN = "tpf3mp_1"
+
+-- The mods whose scripts are on the stack of a call, nearest first, each
+-- once: every function whose source names a mod's file ("<modId>::/...", as
+-- the game names a mod's files) other than TPF3-MP's own. The game's own
+-- files ("::/...") name no mod, so a click in the game's own windows gives
+-- none. `getinfo` is debug.getinfo (the tests hand a fake one).
+function guard.callers(getinfo)
+	local mods, seen = {}, {}
+	if getinfo == nil and type(debug) == "table" then getinfo = debug.getinfo end
+	if type(getinfo) ~= "function" then return mods end
+	for level = 1, 64 do
+		local ok, info = pcall(getinfo, level, "S")
+		if not ok or type(info) ~= "table" then break end
+		local source = info.source
+		local mod = type(source) == "string" and source:match("^@?([%w_%.%-]+)::/") or nil
+		if mod and mod ~= guard.OWN and not seen[mod] then
+			seen[mod] = true
+			mods[#mods + 1] = mod
+		end
+	end
+	return mods
+end
+
+-- The mod whose script made a call, the nearest (guard.callers), or nil.
+function guard.caller(getinfo)
+	return guard.callers(getinfo)[1]
+end
+
+-- Event ids the game's own game scripts and TPF3-MP listen to (build 40408,
+-- each base game script's handleEvent), and the empty id of the game's
+-- init events: a personal mod's event under one of them is never its own.
+guard.RESERVED_IDS = {
+	[""] = true, ArrivalTracker = true, CloudCoverage = true, Companies = true,
+	Company = true, Emissions = true, GameTime = true, Industries = true, Loan = true,
+	MissionEndWindow = true, MissionWindow = true, Notifications = true,
+	SimCargoSystem = true, SimEntityAtBuildingSystem = true,
+	SimEntityAtTerminalSystem = true, SimPersonAtVehicleSystem = true,
+	SimPersonSystem = true, StockListSystem = true, Subvention = true, Towns = true,
+	TransportVehicleSystem = true, VehicleModifier = true, apply_command = true,
+	fireworks = true, ["guide-system"] = true, ["mission-dialogue"] = true,
+	tpf3mp = true,
+}
+
+-- Name prefixes some of the game's scripts listen to whatever the id
+-- (company.script.tl: "company.lockPermits", "builder.proposalApply").
+guard.RESERVED_NAMES = { "company.", "builder.", "init", "handleLegacy" }
+
+-- The id's letters and digits, in lower case.
+local function squeeze(text)
+	return (tostring(text):lower():gsub("[^%w]", ""))
+end
+
+-- Whether the event id `squeezed` (squeeze()d) names the mod `mod`: it
+-- contains the mod's id, or one of its words of four letters or more
+-- (Timetables' "TimetablesEdit" for celmi_timetables).
+local function names(mod, squeezed)
+	if squeezed:find(squeeze(mod), 1, true) then return true end
+	for word in mod:gmatch("[%w]+") do
+		if #word >= 4 and not word:match("^%d+$") and squeezed:find(word:lower(), 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Whether an event from the personal mod `mod` (its modId) is addressed to
+-- the mod's own game script: its id is not one the game's scripts or
+-- TPF3-MP listen to, its name is none they listen to under any id, the id
+-- names the mod, and it names none of `shared`, the room's shared mods,
+-- whose game scripts run in every game and might hear it too (a personal
+-- "timetables_ui_tweak" sending "TimetablesEdit", which the shared
+-- celmi_timetables hears, would desync this game). Without the shared
+-- list (nil), no event is the mod's own.
+function guard.ownEvent(mod, id, name, shared)
+	if type(mod) ~= "string" or type(id) ~= "string" or type(name) ~= "string" then return false end
+	if type(shared) ~= "table" then return false end
+	if guard.RESERVED_IDS[id] then return false end
+	for _, prefix in ipairs(guard.RESERVED_NAMES) do
+		if name:sub(1, #prefix) == prefix then return false end
+	end
+	local squeezed = squeeze(id)
+	if squeezed == "" or not names(mod, squeezed) then return false end
+	for _, other in ipairs(shared) do
+		if other ~= mod and names(other, squeezed) then return false end
+	end
+	return true
+end
+
 -- What the player is told when a command of `kind` is refused.
 function guard.notice(kind)
 	return "Not in multiplayer yet: " .. (guard.WHAT[kind] or "this action")
@@ -184,7 +296,13 @@ guard.HOLD = 240
 --   refused(kind, why) -> a command of `kind` (nil: made by no factory the
 --                    guard knows) was refused;
 --   later(fn)     -> runs fn on the next frame;
---   context       -> names what commands name (tpf3mp/capture.lua).
+--   context       -> names what commands name (tpf3mp/capture.lua);
+--   personal(mod) -> optional: whether `mod` is one of this player's
+--                    personal mods (docs/MODS.md);
+--   shared()      -> optional: the room's shared mods, a list of names, or
+--                    nil (then no personal mod's event is its own);
+--   caller()      -> optional: the mod a command came from (guard.caller).
+-- refused() is also given the mod the command came from, if one did.
 -- Returns the number of factories wrapped, or nil and why the guard could
 -- not be put there.
 function guard.install(cmd, env)
@@ -197,6 +315,10 @@ function guard.install(cmd, env)
 	-- itself.
 	local kinds = setmetatable({}, { __mode = "k" })
 	local calls = setmetatable({}, { __mode = "k" })
+	-- The mod that made each command, if one did: a window's helper
+	-- (engine_react_util's commit) sends what a mod's function made, with
+	-- that mod no longer on the stack.
+	local makers = setmetatable({}, { __mode = "k" })
 	local factories = {}
 	for name, factory in pairs(cmd) do
 		if type(name) == "string" and name:match("^make.+Cmd$") then
@@ -213,7 +335,10 @@ function guard.install(cmd, env)
 			local t = type(command)
 			if t == "table" or t == "userdata" then
 				kinds[command] = name
-				if guard.CARRY[name] then calls[command] = { n = select("#", ...), ... } end
+				makers[command] = (env.caller or guard.caller)()
+				if guard.CARRY[name] or name == "makeScriptingSendEventCmd" then
+					calls[command] = { n = select("#", ...), ... }
+				end
 			end
 			return command
 		end
@@ -229,6 +354,16 @@ function guard.install(cmd, env)
 		local kind = kinds[command]
 		if kind ~= nil and guard.PASS[kind] then
 			return send(command, ...)
+		end
+		local from = makers[command] or (env.caller or guard.caller)()
+		-- A personal mod's event to its own game script reaches this game's
+		-- scripts alone, where that script runs (docs/MODS.md); any other of
+		-- its events is carried or refused below, as a click's.
+		if kind == "makeScriptingSendEventCmd" and from and env.personal and env.personal(from) then
+			local args = calls[command]
+			if args and guard.ownEvent(from, args[2], args[3], env.shared and env.shared()) then
+				return send(command, ...)
+			end
 		end
 		local callback = ...
 		local carry, args = kind and guard.CARRY[kind], calls[command]
@@ -248,12 +383,12 @@ function guard.install(cmd, env)
 				end
 				return
 			end
-			env.refused(kind, ticket)
+			env.refused(kind, ticket, from)
 		elseif carry and args and not made then
 			-- Why the room cannot carry it: what the capture raised.
-			env.refused(kind, tostring(action))
+			env.refused(kind, tostring(action), from)
 		else
-			env.refused(kind)
+			env.refused(kind, nil, from)
 		end
 		if callback ~= nil then
 			env.later(function() callback(command, false, {}) end)

@@ -1,12 +1,28 @@
 //! What the window shows, worked out from the launcher's state alone: every
 //! label, button and line, as the page's `view.js` works them out (D20).
 //! It draws nothing, so its tests need no window.
+//!
+//! The room's lobby is in the game (D17, amended 2026-09-30): by default
+//! the window only starts the game and shows where things stand
+//! ([`present_in_game`]); the lobby the page has ([`present`]) stays one
+//! click away, for a game whose menu the hook cannot reach.
 
 use tpf3mp_agent::launcher::{
     Action, Connection, Differences, Member, MemberContent, Phase, State, World,
 };
 
 use crate::{probe::Reach, theme::Pill, update::UpdateState};
+
+/// Where the player uses the room's lobby.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Place {
+    /// In the game's Multiplayer window, on its main menu (D17): this
+    /// window starts the game and shows where things stand.
+    #[default]
+    Game,
+    /// In this window, as the page has it.
+    Launcher,
+}
 
 /// A form the panel shows over its main button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +623,124 @@ pub fn updates(update: &UpdateState) -> Updates {
     }
 }
 
+/// The five steps of playing from the game's Multiplayer window, and which
+/// are done.
+pub fn steps_in_game(state: &State) -> Vec<(&'static str, bool)> {
+    let room = state.room.as_ref();
+    let running = room.is_some_and(|room| room.phase == Phase::Running);
+    let everyone = running
+        || room.is_some_and(|room| {
+            !room.members.is_empty() && room.members.iter().all(|member| member.ready)
+        });
+    vec![
+        (
+            "Start Transport Fever 3 from here",
+            state.game.attached.is_some() || running,
+        ),
+        (
+            "Click Multiplayer on its main menu",
+            state.connection == Connection::Connected,
+        ),
+        ("Create a room, or join with an invite", room.is_some()),
+        ("Everyone ready", everyone),
+        ("Play together", running),
+    ]
+}
+
+/// The big button when the lobby is in the game: it starts the game, then
+/// says how the room's world comes along.
+fn main_in_game(state: &State, update: &UpdateState) -> Main {
+    let main = |label: &str, icon, does| Main {
+        label: label.to_owned(),
+        icon,
+        does,
+        progress: None,
+    };
+    if state.outdated {
+        return main_action(state, update);
+    }
+    if state.game.attached.is_none() {
+        let does = if state.installed.is_some() {
+            Does::Act(Action::LaunchGame)
+        } else {
+            Does::Nothing
+        };
+        return main("Start Transport Fever 3", "play", does);
+    }
+    let running = state
+        .room
+        .as_ref()
+        .is_some_and(|room| room.phase == Phase::Running);
+    if state.connection == Connection::Connected && (state.game.world != World::None || running) {
+        // Receiving, loading, playing: as the lobby's button says it.
+        return main_action(state, update);
+    }
+    main("Continue in the game", "users", Does::Nothing)
+}
+
+/// The line under the buttons when the lobby is in the game.
+fn status_in_game(state: &State, reach: Reach) -> Option<(String, Tone)> {
+    if state.error.is_some() || state.outdated {
+        return status(state, reach);
+    }
+    if state.installed.is_none() {
+        return Some((
+            "Transport Fever 3 was not found in Steam. Install it, then come back here.".into(),
+            Tone::Error,
+        ));
+    }
+    let Some(build) = &state.game.attached else {
+        return Some((
+            "Start Transport Fever 3 from here, then click Multiplayer on its main menu to \
+             connect, create a room or join one. Started from Steam, it is the plain game."
+                .into(),
+            Tone::Plain,
+        ));
+    };
+    if state.connection != Connection::Connected {
+        if state.server_fixed && reach == Reach::Offline {
+            return status(state, reach);
+        }
+        return Some((
+            format!(
+                "The game is running ({build}). Click Multiplayer on its main menu to connect."
+            ),
+            Tone::Plain,
+        ));
+    }
+    let Some(room) = &state.room else {
+        return Some((
+            "Connected. Create a room or join one in the game's Multiplayer window.".into(),
+            Tone::Plain,
+        ));
+    };
+    match state.game.world {
+        World::None if room.phase == Phase::Lobby => Some((
+            "In the room: its players, chat, Ready and Start are in the game's Multiplayer \
+             window."
+                .into(),
+            Tone::Plain,
+        )),
+        _ => status(state, reach),
+    }
+}
+
+/// Everything the window draws when the lobby is in the game (D17): the
+/// big button starts the game, and the rest says where things stand. The
+/// room is shown, not played: its buttons are in the game's window.
+pub fn present_in_game(state: &State, reach: Reach, update: Option<&UpdateState>) -> View {
+    let mut view = present(state, reach, update);
+    let none = UpdateState::Off("this launcher does not update itself".into());
+    view.main = main_in_game(state, update.unwrap_or(&none));
+    view.secondary = Vec::new();
+    view.status = status_in_game(state, reach);
+    view.steps = steps_in_game(state);
+    for player in &mut view.players {
+        player.removable = false;
+    }
+    view
+}
+
 /// Everything the window draws, for `state`, the server's `reach` and the
 /// updater's state (`None` without an updater).
 pub fn present(state: &State, reach: Reach, update: Option<&UpdateState>) -> View {
@@ -659,6 +793,7 @@ mod tests {
             ready,
             connected: true,
             content: MemberContent::Same,
+            banner: None,
         }
     }
 
@@ -682,6 +817,7 @@ mod tests {
                 max_players: 4,
                 has_password: false,
                 members,
+                competitive: false,
             }),
             ..State::default()
         }
@@ -857,6 +993,72 @@ mod tests {
             Some(("Step 18432, at 2×.".into(), Tone::Ready))
         );
         assert_eq!(view.pill, ("Playing", Pill::Ready));
+    }
+
+    #[test]
+    fn with_the_lobby_in_the_game_the_window_starts_the_game_and_shows_where_things_stand() {
+        // Nothing yet: the game starts from here, and its menu does the rest.
+        let state = State {
+            server: Some("tpf3mp.example.org:29470".into()),
+            server_fixed: true,
+            server_name: Some("EU".into()),
+            installed: Some(InstalledGame {
+                dir: r"C:\Games\Transport Fever 3".into(),
+                build: "20364158".into(),
+            }),
+            ..State::default()
+        };
+        let view = present_in_game(&state, Reach::Online, None);
+        assert_eq!(view.main.label, "Start Transport Fever 3");
+        assert_eq!(view.main.does, Does::Act(Action::LaunchGame));
+        assert!(view.secondary.is_empty(), "no forms, no lobby buttons");
+        let (text, _) = view.status.clone().unwrap();
+        assert!(
+            text.contains("click Multiplayer on its main menu"),
+            "{text}"
+        );
+        assert_eq!(view.steps[0], ("Start Transport Fever 3 from here", false));
+
+        // The game runs: it says where to click.
+        let mut state = state;
+        state.game.attached = Some("40408".into());
+        let view = present_in_game(&state, Reach::Online, None);
+        assert_eq!(view.main.label, "Continue in the game");
+        assert!(!view.main.enabled());
+        assert!(view.status.unwrap().0.contains("Click Multiplayer"));
+
+        // In a room: shown, not played from here.
+        let mut state = in_room(
+            vec![
+                member("Ann", true, true, false),
+                member("Bob", false, false, true),
+            ],
+            true,
+        );
+        state.game.attached = Some("40408".into());
+        let view = present_in_game(&state, Reach::Online, None);
+        assert!(!view.main.enabled(), "Ready and Start are in the game");
+        assert!(view.players.iter().all(|player| !player.removable));
+        assert!(view.status.unwrap().0.contains("game's Multiplayer window"));
+        assert_eq!(
+            view.steps.iter().filter(|(_, done)| *done).count(),
+            3,
+            "started, connected, in a room"
+        );
+
+        // The room's world on its way: as the lobby says it.
+        state.room.as_mut().unwrap().phase = Phase::Running;
+        state.game.world = World::Fetching;
+        state.game.bytes = 50;
+        state.game.total = 100;
+        let view = present_in_game(&state, Reach::Online, None);
+        assert_eq!(view.main.label, "Receiving the world 50%");
+        assert_eq!(view.main.progress, Some(0.5));
+
+        // An error is said, whatever else.
+        state.error = Some("the room is full".into());
+        let view = present_in_game(&state, Reach::Online, None);
+        assert_eq!(view.status, Some(("the room is full".into(), Tone::Error)));
     }
 
     #[test]

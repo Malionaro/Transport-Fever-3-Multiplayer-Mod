@@ -6,7 +6,10 @@
 use std::cell::RefCell;
 
 use eframe::egui::{self, accesskit::Role};
-use egui_kittest::{Harness, kittest::Queryable};
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT, Queryable},
+};
 use tpf3mp_agent::launcher::{
     Action, Connection, Differences, Game, InstalledGame, Member, MemberContent, Phase, Room,
     RulesChoice, State,
@@ -14,6 +17,7 @@ use tpf3mp_agent::launcher::{
 use tpf3mp_launcher::{
     app::{Extras, LauncherApp, Shown},
     backend::Backend,
+    view::Place,
 };
 
 #[derive(Default)]
@@ -36,13 +40,24 @@ impl Backend for Recorder {
     }
 }
 
+/// The window with the lobby in it, as the page has it: most tests click
+/// through that lobby.
 fn window(state: State) -> Harness<'static, LauncherApp<Recorder>> {
-    window_sized(state, 690.0)
+    window_sized(state, 690.0, Place::Launcher)
+}
+
+/// The window as it opens: the lobby in the game's menu (D17).
+fn window_for_the_game(state: State) -> Harness<'static, LauncherApp<Recorder>> {
+    window_sized(state, 690.0, Place::Game)
 }
 
 /// A window this tall: tall enough, the room's players and chat are in
 /// view without scrolling.
-fn window_sized(state: State, height: f32) -> Harness<'static, LauncherApp<Recorder>> {
+fn window_sized(
+    state: State,
+    height: f32,
+    place: Place,
+) -> Harness<'static, LauncherApp<Recorder>> {
     let recorder = Recorder {
         state: RefCell::new(state),
         ..Recorder::default()
@@ -58,7 +73,8 @@ fn window_sized(state: State, height: f32) -> Harness<'static, LauncherApp<Recor
                 installed_mod: Some(None),
             },
         },
-    );
+    )
+    .with_place(place);
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1100.0, height))
         .build_ui_state(|ui, app: &mut LauncherApp<Recorder>| app.show(ui), app);
@@ -80,6 +96,7 @@ fn member(name: &str, owner: bool, you: bool, ready: bool) -> Member {
         owner,
         you,
         content: MemberContent::Same,
+        banner: None,
     }
 }
 
@@ -104,6 +121,7 @@ fn in_room(members: Vec<Member>, you_own: bool) -> State {
             max_players: 4,
             has_password: false,
             members,
+            competitive: false,
         }),
         ..State::default()
     }
@@ -180,6 +198,9 @@ fn a_room_is_created_with_the_rules_the_host_picks() {
             max_players: 4,
             password: None,
             rules: Some("native".into()),
+            start_save: None,
+            listing: None,
+            competitive: false,
         }]
     );
 }
@@ -236,6 +257,7 @@ fn removing_a_player_asks_first() {
             true,
         ),
         1200.0,
+        Place::Launcher,
     );
     window.get_by_label("Remove").click();
     window.run_steps(4);
@@ -316,6 +338,7 @@ fn chat_is_sent_to_the_room() {
     let mut window = window_sized(
         in_room(vec![member("Ann", true, true, false)], true),
         1200.0,
+        Place::Launcher,
     );
     let chat = window.get_by_role(Role::TextInput);
     chat.focus();
@@ -429,4 +452,226 @@ fn a_package_with_its_own_server_offers_no_other() {
             name: "Ann".into(),
         }]
     );
+}
+
+#[test]
+fn by_default_the_window_starts_the_game_and_the_lobby_is_in_its_menu() {
+    let state = State {
+        name: "Ann".into(),
+        server: Some("tpf3mp.example.org:29470".into()),
+        server_fixed: true,
+        server_name: Some("EU".into()),
+        installed: installed(),
+        ..State::default()
+    };
+    let mut window = window_for_the_game(state);
+    // No lobby forms here: the game's Multiplayer window has them.
+    assert!(window.query_by_label("Connect").is_none());
+    assert!(
+        window
+            .query_by_role_and_label(Role::TextInput, "YOUR NAME")
+            .is_none()
+    );
+    window.get_by_label("HOW TO PLAY: IN THE GAME");
+    window.get_by_label("Click Multiplayer on its main menu");
+    window.get_by_label("Start Transport Fever 3").click();
+    window.run_steps(2);
+    assert_eq!(actions(&window), [Action::LaunchGame]);
+
+    // The lobby comes back here with one click, and goes again.
+    window.get_by_label("Lobby in this window instead").click();
+    window.run_steps(4);
+    window.get_by_label("Connect");
+    window
+        .get_by_label("Lobby in the game's menu instead")
+        .click();
+    window.run_steps(4);
+    assert!(window.query_by_label("Connect").is_none());
+}
+
+#[test]
+fn in_a_room_the_window_shows_it_but_its_buttons_are_in_the_game() {
+    let mut state = in_room(
+        vec![
+            member("Ann", true, true, true),
+            member("Bob", false, false, false),
+        ],
+        true,
+    );
+    state.game = Game {
+        attached: Some("40408".into()),
+        ..Game::default()
+    };
+    // In the lobby here, the same room has them.
+    let here = window_sized(state.clone(), 1200.0, Place::Launcher);
+    for there in ["Remove", "Send", "Leave room", "Not ready", "Copy invite"] {
+        assert!(
+            here.query_by_role_and_label(Role::Button, there).is_some(),
+            "{there}"
+        );
+    }
+    let window = window_for_the_game(state);
+    window.get_by_label("Friday trains");
+    window.get_by_label("Bob");
+    window.get_by_label("Continue in the game");
+    window.get_by_label(
+        "Chat, Ready, Start and removing players are in the game's Multiplayer window.",
+    );
+    for gone in [
+        "Remove",
+        "Send",
+        "Leave room",
+        "Ready",
+        "Not ready",
+        "Copy invite",
+    ] {
+        assert!(
+            window.query_by_role_and_label(Role::Button, gone).is_none(),
+            "{gone}"
+        );
+    }
+    assert!(
+        window.query_by_role(Role::TextInput).is_none(),
+        "no chat field"
+    );
+}
+
+fn on_the_relay() -> State {
+    State {
+        name: "Ann".into(),
+        server: Some("relay.example.org:29470".into()),
+        server_fixed: true,
+        server_default: Some("relay.example.org:29470".into()),
+        server_name: Some("Relay".into()),
+        connection: Connection::Connected,
+        ..State::default()
+    }
+}
+
+/// Replaces what the field holds with `text`, as a player selecting it all
+/// and typing would.
+fn retyped(window: &mut Harness<'static, LauncherApp<Recorder>>, field: &str, text: &str) {
+    let input = window.get_by_role_and_label(Role::TextInput, field);
+    input.focus();
+    window.run_steps(1);
+    window.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    window.run_steps(1);
+    window
+        .get_by_role_and_label(Role::TextInput, field)
+        .type_text(text);
+    window.run_steps(4);
+}
+
+/// The server setting (D12, as amended): Settings shows the server played
+/// on, takes another as host:port only, and goes back to the default.
+#[test]
+fn the_server_is_changed_in_settings() {
+    let mut window = window(on_the_relay());
+    window.get_by_label("Settings").click();
+    window.run_steps(4);
+    window.get_by_label("You play on Relay (relay.example.org:29470), the default server.");
+    let reset = window.get_by_role_and_label(Role::Button, "Reset to default");
+    assert!(
+        reset.accesskit_node().is_disabled(),
+        "already on the default"
+    );
+    assert!(
+        window
+            .get_by_role_and_label(Role::Button, "Use this server")
+            .accesskit_node()
+            .is_disabled(),
+        "the field holds the server played on"
+    );
+
+    // Not a host:port: said, and not taken.
+    retyped(&mut window, "SERVER ADDRESS", "eu.example.org");
+    window.get_by_label("the server must be host:port, such as tpf3mp.example.org:29470");
+    window.get_by_label("Use this server").click();
+    window.run_steps(2);
+    assert!(actions(&window).is_empty());
+
+    retyped(&mut window, "SERVER ADDRESS", "eu.example.org:29470");
+    assert!(
+        window
+            .query_by_label("the server must be host:port, such as tpf3mp.example.org:29470")
+            .is_none()
+    );
+    window.get_by_label("Use this server").click();
+    window.run_steps(2);
+    assert_eq!(
+        actions(&window),
+        [Action::SetServer {
+            server: "eu.example.org:29470".into()
+        }]
+    );
+
+    // On another server: its address, and a way back.
+    let mut window = self::window(State {
+        server: Some("eu.example.org:29470".into()),
+        server_name: None,
+        ..on_the_relay()
+    });
+    window.get_by_label("Settings").click();
+    window.run_steps(4);
+    window.get_by_label("You play on eu.example.org:29470.");
+    let reset = window.get_by_role_and_label(Role::Button, "Reset to default");
+    assert!(!reset.accesskit_node().is_disabled());
+    reset.hover();
+    window.run_steps(2);
+    window.get_by_label("Reset to default").click();
+    window.run_steps(2);
+    assert_eq!(
+        actions(&window),
+        [Action::SetServer {
+            server: String::new()
+        }]
+    );
+}
+
+#[test]
+fn the_server_stays_while_in_a_room() {
+    let mut state = in_room(vec![member("Ann", true, true, true)], true);
+    state.server = Some("eu.example.org:29470".into());
+    state.server_fixed = true;
+    state.server_default = Some("relay.example.org:29470".into());
+    let mut window = window_sized(state, 1200.0, Place::Launcher);
+    window.get_by_label("Settings").click();
+    window.run_steps(4);
+    window.get_by_label("Leave the room to change the server.");
+    assert!(
+        window
+            .get_by_role_and_label(Role::Button, "Reset to default")
+            .accesskit_node()
+            .is_disabled()
+    );
+    retyped(&mut window, "SERVER ADDRESS", "us.example.org:29470");
+    assert!(
+        window
+            .get_by_role_and_label(Role::Button, "Use this server")
+            .accesskit_node()
+            .is_disabled()
+    );
+    window.get_by_label("Use this server").click();
+    window.run_steps(2);
+    assert!(actions(&window).is_empty());
+}
+
+#[test]
+fn the_server_setting_checks_what_was_typed() {
+    use tpf3mp_launcher::app::ServerSetting;
+    let state = on_the_relay();
+    let setting = |typed: &str| ServerSetting::of(typed, &state);
+    assert!(setting("eu.example.org:29470").can_apply);
+    assert!(
+        !setting(" RELAY.example.org:29470 ").can_apply,
+        "the same server"
+    );
+    assert!(!setting("").can_apply && setting("").problem.is_none());
+    assert!(setting("eu.example.org").problem.is_some());
+    assert!(!setting("anything").can_reset, "already the default");
+    let elsewhere = State {
+        server: Some("eu.example.org:29470".into()),
+        ..on_the_relay()
+    };
+    assert!(ServerSetting::of("", &elsewhere).can_reset);
 }

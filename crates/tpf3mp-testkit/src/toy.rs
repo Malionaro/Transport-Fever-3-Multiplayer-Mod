@@ -417,6 +417,7 @@ mod tests {
                 player: player(id),
                 client_seq: seq,
                 payload: command.encode(),
+                seal: None,
             },
         }
     }

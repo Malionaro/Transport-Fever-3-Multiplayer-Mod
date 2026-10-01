@@ -9,6 +9,11 @@ about two hours; this one plays its whole library in seconds, and is meant
 to stay under 10 minutes a platform once the real game plays it.
 
 Today the games play a model of the game (below), not Transport Fever 3.
+The `junctions` scenario builds a street junction, applies turns,
+crosswalks and timed light phases, refuses another company's edit and
+resets it. Junction state participates in the model's network digest.
+The native/Lua adapter tests and pending real-game checklist are in
+[HOOKS.md](HOOKS.md#junction-tools).
 The script, the runner and the checks do not depend on which: the real
 game's hook plugs into the same script once it applies actions ("With the
 real game").

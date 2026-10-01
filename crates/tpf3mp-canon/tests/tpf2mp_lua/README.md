@@ -4,7 +4,7 @@ These files are byte-identical copies of TPF2MP sources. The differential
 tests in `../differential/` run them under Lua 5.1 next to the Rust port in
 `src/economy/` and require identical results (see `docs/ECONOMY.md`).
 
-- Source: `tf2mod` (TPF2MP by Julian Cooper), commit
+- Source: `tf2mod` (TPF2MP by _Sep), commit
   `58da402ba144b2b5ad9f5615f7d686aadd34ffb2`.
 - Licence: MIT, copyright (c) 2026 Julian Cooper, the same licence and holder
   as this repository (see `LICENSE` at the repository root).

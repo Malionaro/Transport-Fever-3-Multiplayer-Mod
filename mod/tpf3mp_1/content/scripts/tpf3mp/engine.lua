@@ -29,6 +29,7 @@ end
 
 local roads = module("roads")
 local geom = module("geom")
+local junctions = module("junctions")
 
 local engine = {}
 
@@ -124,18 +125,64 @@ local function styleName(v)
 	return resName(v, "roadStyle")
 end
 
--- Refuses an edge that carries stops or signals: the room does not carry
--- them yet, and an edge replaced without them leaves them pointing nowhere
--- (on TPF2 that crashed every game at the same step; docs/BUILDING.md).
-local function noObjects(c, what)
-	local objects = get(c, "objects")
-	if objects ~= nil and #list(objects) > 0 then error(what .. " with a stop or signal on it", 0) end
+-- The stops and signals an edge's component lists, by entity, sorted: an
+-- edge replaced without its own leaves them pointing nowhere (on TPF2 that
+-- crashed every game at the same step; docs/BUILDING.md), so a build may
+-- only rebuild an edge in place with the same ones (engine.fromProposal).
+local function objectEntities(c)
+	local out = {}
+	for _, o in ipairs(list(get(c, "objects"))) do
+		local entity = get(o, 1)
+		if type(entity) ~= "number" then error("an edge object it cannot read", 0) end
+		out[#out + 1] = entity
+	end
+	table.sort(out)
+	return out
+end
+
+-- An edge's decorations (noise barriers, alleys) by name, with the game's
+-- flag for each (BaseEdge.edgeDecorations: { decoration id, flag }).
+local function decorationsOf(c)
+	local out = {}
+	for _, d in ipairs(list(get(c, "edgeDecorations"))) do
+		local id, flag = get(d, 1), get(d, 2)
+		local name
+		pcall(function() name = api.res.edgeDecorationRep.getName(id) end)
+		out[#out + 1] = { name = resName(name, "an edge decoration"), flag = flag == true }
+	end
+	return out
+end
+
+-- An edge's lanes (BaseEdge.laneConfigs): speed, width, height and offset
+-- in the game's units, the direction, and the transport modes as a bit for
+-- each TransportMode value. A tram track or a bus lane is here on TF3, not
+-- in the template.
+local function lanesOf(c)
+	local out = {}
+	for _, lc in ipairs(list(get(c, "laneConfigs"))) do
+		local tm = get(lc, "transportModes")
+		local modes = 0
+		for m = 0, 15 do
+			local on = false
+			pcall(function() on = tm[m] == true end)
+			if on then modes = modes + 2 ^ m end
+		end
+		local lane = { forward = get(lc, "forward") == true, modes = modes }
+		for _, f in ipairs({ "speed", "width", "height", "offset" }) do
+			local v = get(lc, f)
+			if type(v) ~= "number" then error("a lane with no " .. f, 0) end
+			lane[f] = v
+		end
+		out[#out + 1] = lane
+	end
+	return out
 end
 
 local function segment(seg)
 	local c = get(seg, "comp")
 	if c == nil then error("an edge with no component", 0) end
-	noObjects(c, "a build that moves an edge")
+	local owner = get(seg, "playerOwned")
+	local player = owner and get(owner, "player")
 	local e = {
 		node0 = c.node0, node1 = c.node1,
 		network = networkOf(seg),
@@ -143,6 +190,11 @@ local function segment(seg)
 		structure = "Ground",
 		template = resName(c.roadTemplate, "roadTemplate"),
 		style = styleName(c.roadStyle),
+		objects = objectEntities(c),
+		decorations = decorationsOf(c),
+		locked = get(c, "roadDevelopmentLocked") == true,
+		owned = type(player) == "number" and player >= 0,
+		lanes = lanesOf(c),
 	}
 	local types = enum("BaseEdgeType")
 	if c.type == types.BRIDGE then
@@ -155,15 +207,79 @@ local function segment(seg)
 	return e
 end
 
+-- Stops and signals move with a build only on an edge it rebuilds in
+-- place: a new edge between the same places, in the same direction, as a
+-- removed one, listing exactly its objects (a modifier tool's, a road drawn
+-- through). Each game's build then gives the new edge the objects of the
+-- one it replaces (tpf3mp/apply.lua). Anything else is refused: a new stop
+-- or signal, one dropped, or one carried onto another edge.
+function engine.keptInPlace(capture)
+	local newPos = {}
+	for _, n in ipairs(capture.nodes) do newPos[n.id] = n.pos end
+	for _, n in ipairs(capture.removedNodes) do newPos[n.id] = n.pos end
+	local function posOf(id)
+		if newPos[id] then return newPos[id] end
+		return nodePos(id)
+	end
+	local function same(a, b)
+		return a and b and math.abs(a[1] - b[1]) < 0.05 and math.abs(a[2] - b[2]) < 0.05
+			and math.abs(a[3] - b[3]) < 0.05
+	end
+	local function key(list) return table.concat(list, ",") end
+	local placed = {}
+	for _, e in ipairs(capture.edges) do
+		if #e.objects > 0 then
+			for _, o in ipairs(e.objects) do
+				if o < 0 then error("a build that adds a stop or signal", 0) end
+			end
+			local found
+			for k, r in ipairs(capture.removed) do
+				if not placed[k] and key(r.objects) == key(e.objects)
+					and same(posOf(r.node0), posOf(e.node0)) and same(posOf(r.node1), posOf(e.node1)) then
+					found = k
+					break
+				end
+			end
+			if found == nil then error("a build that moves a stop or signal", 0) end
+			placed[found] = true
+		end
+	end
+	for k, r in ipairs(capture.removed) do
+		if #r.objects > 0 and not placed[k] then error("a build that removes an edge with a stop or signal on it", 0) end
+	end
+end
+
 -- A tool's proposal as tpf3mp/roads.lua takes it, or raises. `network` is
 -- the tool's; nil for the construction tool's, whose street part is taken
 -- alone (`constructions` true lets the proposal carry them) in the network
 -- of its first new edge. Returns nil for a proposal of nothing (the tool
 -- before its first point, a construction with no street part).
+-- `constructions` "town" lets the proposal carry town buildings only: the
+-- ones a road modifier clears and puts back along the road, which every
+-- game's build clears again as the tool's does (ignoreErrors,
+-- tpf3mp/apply.lua).
+local function townBuildingsOnly(proposal)
+	for _, e in ipairs(list(get(proposal, "toRemove"))) do
+		-- A town building is a construction that lists its town buildings
+		-- (as capture.construction tells them).
+		local c = api.engine.getComponent(e, api.type.ComponentType.CONSTRUCTION)
+		local buildings = c and get(c, "townBuildings")
+		if buildings == nil or #list(buildings) == 0 then error("a build that removes a construction", 0) end
+	end
+	for _, c in ipairs(list(get(proposal, "toAdd"))) do
+		local file = get(c, "fileName")
+		if type(file) ~= "string" or not file:find("/buildings/", 1, true) then
+			error("a build with constructions", 0)
+		end
+	end
+end
+
 function engine.fromProposal(proposal, network, constructions)
 	local street = get(proposal, "proposal")
 	if street == nil then error("a proposal with no street proposal", 0) end
-	if not constructions then
+	if constructions == "town" then
+		townBuildingsOnly(proposal)
+	elseif not constructions then
 		for _, name in ipairs({ "toAdd", "toRemove" }) do
 			if #list(get(proposal, name)) > 0 then error("a build with constructions", 0) end
 		end
@@ -177,7 +293,8 @@ function engine.fromProposal(proposal, network, constructions)
 	local removedNodes = list(get(street, "removedNodes"))
 	if #added == 0 and #segments == 0 and #removed == 0 and #removedNodes == 0 then return nil end
 
-	local capture = { network = network, nodes = {}, edges = {}, removed = {}, removedNodes = {} }
+	local capture = { network = network, nodes = {}, edges = {}, removed = {}, removedNodes = {},
+		junctions = junctions.capture(street) }
 	for _, n in ipairs(added) do
 		capture.nodes[#capture.nodes + 1] = { id = n.entity, pos = vec3(n.comp.position) }
 	end
@@ -189,13 +306,13 @@ function engine.fromProposal(proposal, network, constructions)
 		if not first and e.network == network then first = e end
 	end
 	for _, seg in ipairs(removed) do
-		noObjects(seg.comp, "a build that removes an edge")
 		capture.removed[#capture.removed + 1] = { node0 = seg.comp.node0, node1 = seg.comp.node1,
-			network = networkOf(seg) }
+			network = networkOf(seg), objects = objectEntities(seg.comp) }
 	end
 	for _, n in ipairs(removedNodes) do
 		capture.removedNodes[#capture.removedNodes + 1] = { id = n.entity, pos = vec3(get(n.comp, "position")) }
 	end
+	engine.keptInPlace(capture)
 
 	-- The build's own kind: its first edge of the tool's network. The
 	-- template names the edge whole on TF3: its lanes, bus lanes and tram
@@ -209,6 +326,154 @@ function engine.fromProposal(proposal, network, constructions)
 		capture.style = first.style
 	end
 	return capture
+end
+
+-- What a tool changed, for the log: for each added edge between two
+-- existing nodes, the fields that differ from the game's edge between them
+-- now (`field=old>new`), and each node configuration it adds, summed up.
+-- "" when nothing reads.
+-- Engine values are userdata whose fields pairs() cannot list: these are
+-- read by name (build 40408's LaneConfig, LaneConnection, BaseNodeConfig,
+-- TrafficLightConfig and TrafficLightState).
+local KNOWN = { "speed", "width", "height", "forward", "offset", "transportModes", "segment0", "lane0",
+	"segment1", "lane1", "withRoad", "withTram", "lockedLanes", "duration", "minDuration", "canSkip",
+	"states", "trafficLightType", "laneConnections", "crosswalks", "trafficLightPreference",
+	"trafficLightConfig", "doubleSlipSwitch", "userModifiedLaneConnections",
+	"userModifiedTrafficLightStates", "x", "y", "z" }
+local function ser(v, depth)
+	depth = depth or 0
+	if depth > 5 then return "..." end
+	local t = type(v)
+	if t ~= "table" and t ~= "userdata" then return tostring(v) end
+	local ok, n = pcall(function() return #v end)
+	if ok and type(n) == "number" and n > 0 then
+		local parts = {}
+		for i = 1, math.min(n, 40) do
+			local okI, x = pcall(function() return v[i] end)
+			parts[#parts + 1] = okI and ser(x, depth + 1) or "?"
+		end
+		return "[" .. table.concat(parts, ",") .. (n > 40 and ",..." or "") .. "]"
+	end
+	local parts = {}
+	pcall(function()
+		for k, x in pairs(v) do parts[#parts + 1] = tostring(k) .. "=" .. ser(x, depth + 1) end
+	end)
+	if #parts == 0 then
+		for _, f in ipairs(KNOWN) do
+			local okF, x = pcall(function() return v[f] end)
+			if okF and x ~= nil then parts[#parts + 1] = f .. "=" .. ser(x, depth + 1) end
+		end
+	end
+	if #parts == 0 then return t == "table" and "{}" or "<" .. t .. ">" end
+	table.sort(parts)
+	return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local EDGE_FIELDS = { "type", "typeIndex", "roadTemplate", "roadStyle", "roadDevelopmentLocked",
+	"edgeDecorations", "laneConfigs" }
+local STREET_FIELDS = { "precedenceNode0", "precedenceNode1" }
+
+function engine.rebuildDiff(proposal)
+	local street = get(proposal, "proposal")
+	if street == nil then return "" end
+	local C = api.type.ComponentType
+	local function current(n0, n1)
+		local found
+		pcall(function()
+			for _, e in ipairs(api.engine.system.streetSystem.getNodeSegments(n0)) do
+				local c = api.engine.getComponent(e, C.BASE_EDGE)
+				if c and ((c.node0 == n0 and c.node1 == n1) or (c.node0 == n1 and c.node1 == n0)) then found = e end
+			end
+		end)
+		return found
+	end
+	local out = {}
+	-- The removed edges by where their ends are: a tool that removes a node
+	-- and adds it again at the same place gives its edges new node ids.
+	local at = {}
+	for _, n in ipairs(list(get(street, "addedNodes"))) do at[get(n, "entity")] = vec3(get(get(n, "comp"), "position")) end
+	for _, n in ipairs(list(get(street, "removedNodes"))) do at[get(n, "entity")] = vec3(get(get(n, "comp"), "position")) end
+	local function posKey(id)
+		local p = at[id] or nodePos(id)
+		if p == nil then return "?" .. tostring(id) end
+		return string.format("%.0f,%.0f", p[1], p[2])
+	end
+	local removedAt = {}
+	for _, r in ipairs(list(get(street, "removedSegments"))) do
+		local c = get(r, "comp")
+		if c then removedAt[posKey(c.node0) .. ">" .. posKey(c.node1)] = r end
+	end
+	-- One lane of the first new edge, raw: how its transport modes are keyed.
+	pcall(function()
+		local first = list(get(street, "addedSegments"))[1]
+		local lane = list(get(get(first, "comp"), "laneConfigs"))[1]
+		local tm = get(lane, "transportModes")
+		local keys = {}
+		for k, v in pairs(tm) do keys[#keys + 1] = tostring(k) .. "=" .. tostring(v) end
+		table.sort(keys)
+		out[#out + 1] = "a lane's modes (" .. type(tm) .. ", #" .. tostring(#tm) .. "): " .. table.concat(keys, ",")
+	end)
+	for _, s in ipairs(list(get(street, "addedSegments"))) do
+		local c = get(s, "comp")
+		local old = c and removedAt[posKey(c.node0) .. ">" .. posKey(c.node1)]
+		if old then
+			local diff = {}
+			local oc = get(old, "comp")
+			for _, f in ipairs(EDGE_FIELDS) do
+				local a, b = ser(get(oc, f)), ser(get(c, f))
+				if a ~= b then diff[#diff + 1] = f .. "=" .. a .. ">" .. b end
+			end
+			local a, b = ser(get(old, "streetEdge")), ser(get(s, "streetEdge"))
+			if a ~= b then diff[#diff + 1] = "streetEdge=" .. a .. ">" .. b end
+			a, b = ser(get(old, "playerOwned")), ser(get(s, "playerOwned"))
+			if a ~= b then diff[#diff + 1] = "playerOwned=" .. a .. ">" .. b end
+			out[#out + 1] = "moved edge " .. posKey(c.node0) .. ">" .. posKey(c.node1) .. ": "
+				.. (#diff > 0 and table.concat(diff, " ") or "same")
+		end
+	end
+	for _, s in ipairs(list(get(street, "addedSegments"))) do
+		local c = get(s, "comp")
+		local n0, n1 = c and get(c, "node0"), c and get(c, "node1")
+		if type(n0) == "number" and type(n1) == "number" and n0 >= 0 and n1 >= 0 then
+			local e = current(n0, n1)
+			local diff = {}
+			if e == nil then
+				diff[1] = "no edge between them now"
+			else
+				local old = api.engine.getComponent(e, C.BASE_EDGE)
+				for _, f in ipairs(EDGE_FIELDS) do
+					local a, b = ser(get(old, f)), ser(get(c, f))
+					if a ~= b then diff[#diff + 1] = f .. "=" .. a .. ">" .. b end
+				end
+				local oldStreet = api.engine.getComponent(e, C.BASE_EDGE_STREET)
+				local newStreet = get(s, "streetEdge")
+				if oldStreet or newStreet then
+					for _, f in ipairs(STREET_FIELDS) do
+						local a, b = ser(oldStreet and get(oldStreet, f)), ser(newStreet and get(newStreet, f))
+						if a ~= b then diff[#diff + 1] = f .. "=" .. a .. ">" .. b end
+					end
+				end
+				local owner = api.engine.getComponent(e, C.PLAYER_OWNED)
+				local a, b = ser(owner and get(owner, "player")), ser(get(get(s, "playerOwned"), "player"))
+				if a ~= b then diff[#diff + 1] = "owner=" .. a .. ">" .. b end
+			end
+			out[#out + 1] = "edge " .. n0 .. ">" .. n1 .. (e and (" (" .. e .. ")") or "") .. ": "
+				.. (#diff > 0 and table.concat(diff, " ") or "same")
+		end
+	end
+	for _, nc in ipairs(list(get(street, "nodeConfigsToAdd"))) do
+		out[#out + 1] = "nodeConfig " .. tostring(get(nc, "entity")) .. ": " .. ser(get(nc, "comp"))
+	end
+	for _, k in ipairs({ "nodeConfigsToRemove", "edgeObjectsToAdd", "edgeObjectsToRemove", "removedSegments",
+		"removedNodes", "addedNodes" }) do
+		local n = #list(get(street, k))
+		if n > 0 then out[#out + 1] = k .. "#" .. n end
+	end
+	for _, k in ipairs({ "toAdd", "toRemove" }) do
+		local n = #list(get(proposal, k))
+		if n > 0 then out[#out + 1] = k .. "#" .. n end
+	end
+	return table.concat(out, "; ")
 end
 
 -- A tool's proposal in one line, for the log: nodes added (+n) and removed
@@ -326,7 +591,7 @@ function engine.bulldoze(proposal)
 			elseif n ~= network then
 				error("removing streets and tracks at once", 0)
 			end
-			noObjects(seg.comp, "removing an edge")
+			if #objectEntities(seg.comp) > 0 then error("removing an edge with a stop or signal on it", 0) end
 			local a, b = nodePos(seg.comp.node0), nodePos(seg.comp.node1)
 			if a == nil or b == nil then error("removed edge " .. k .. " has no position here", 0) end
 			edges[k] = { a = { x = a[1], y = a[2], z = a[3] }, b = { x = b[1], y = b[2], z = b[3] } }
@@ -405,7 +670,10 @@ end
 -- model names it itself. A two-sided stop is one click that adds an object
 -- on each side. false for a proposal of nothing; nil and why the room
 -- cannot carry it.
-function engine.placeStop(proposal, noted)
+-- Signals and waypoints go the same way, on a track (category 2 and 1, the
+-- engine's SIGNAL), one at a time, `oneWay` as the tool had it.
+local OBJECT_KINDS = { [0] = "Stop", [1] = "Waypoint", [2] = "Signal" }
+function engine.placeStop(proposal, noted, oneWay)
 	local ok, action = pcall(function()
 		local street = get(proposal, "proposal")
 		if street == nil then error("a proposal with no street proposal", 0) end
@@ -432,12 +700,19 @@ function engine.placeStop(proposal, noted)
 		if #added == 0 then return false end
 		if #added > 2 then error("more than two stops at once", 0) end
 		local types = enum("EdgeObjectType")
+		local kind = OBJECT_KINDS[get(toAdd[added[1]], "category")]
+		if kind == nil then error("an edge object of category " .. tostring(get(toAdd[added[1]], "category")), 0) end
+		if kind ~= "Stop" and #added > 1 then error("more than one signal at once", 0) end
 		for _, k in ipairs(added) do
 			local eo = toAdd[k]
-			if get(eo, "category") ~= 0 then error("a signal or waypoint", 0) end
-			-- INFERRED: the engine lists a stop it calls left as STOP_LEFT.
-			if now[k][2] ~= (get(eo, "left") == true and types.STOP_LEFT or types.STOP_RIGHT) then
-				error("a stop whose side the room cannot say", 0)
+			if OBJECT_KINDS[get(eo, "category")] ~= kind then error("a stop and a signal at once", 0) end
+			if kind == "Stop" then
+				-- INFERRED: the engine lists a stop it calls left as STOP_LEFT.
+				if now[k][2] ~= (get(eo, "left") == true and types.STOP_LEFT or types.STOP_RIGHT) then
+					error("a stop whose side the room cannot say", 0)
+				end
+			elseif now[k][2] ~= types.SIGNAL then
+				error("a signal the engine lists as no signal", 0)
 			end
 		end
 		local twoSided = #added == 2
@@ -490,6 +765,8 @@ function engine.placeStop(proposal, noted)
 			direction = { x = d[1] / len, y = d[2] / len, z = d[3] / len },
 			model = model,
 			two_sided = twoSided,
+			object = kind,
+			one_way = kind ~= "Stop" and oneWay == true,
 		} }
 	end)
 	if not ok then return nil, tostring(action) end
@@ -531,8 +808,29 @@ end
 
 -- The action table of a street or track tool's proposal; false for a
 -- proposal of nothing; or nil and why the room cannot carry it.
+-- The town buildings a road or track clears go with it: every game's build
+-- clears them again (tpf3mp/apply.lua, gatherBuildings); any other
+-- construction in the way is refused.
 function engine.captureBuild(proposal, network)
-	local ok, capture = pcall(engine.fromProposal, proposal, network)
+	local ok, capture = pcall(engine.fromProposal, proposal, network, "town")
+	if not ok then return nil, tostring(capture) end
+	if capture == nil then return false end
+	return roads.capture(capture, engine.world())
+end
+
+-- A road or track modifier's build (the upgrade tools: tram tracks, bus
+-- lanes, a street or track type, decorations, the towns' lock, the
+-- company's ownership): the edges it rebuilds, each with its new template,
+-- decorations, lock and owner, their stops kept in place, as a BuildRoad
+-- or BuildTrack of the network of its first edge. The town buildings it
+-- clears along the road every game's build clears again.
+function engine.captureModify(proposal)
+	local street = get(proposal, "proposal")
+	if street and #list(get(street,"addedNodes")) == 0 and #list(get(street,"addedSegments")) == 0
+		and #list(get(street,"removedNodes")) == 0 and #list(get(street,"removedSegments")) == 0 then
+		return junctions.edit(proposal)
+	end
+	local ok, capture = pcall(engine.fromProposal, proposal, nil, "town")
 	if not ok then return nil, tostring(capture) end
 	if capture == nil then return false end
 	return roads.capture(capture, engine.world())

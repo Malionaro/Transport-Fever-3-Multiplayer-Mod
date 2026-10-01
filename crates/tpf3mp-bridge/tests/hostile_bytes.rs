@@ -10,8 +10,8 @@ use std::fmt::Debug;
 use proptest::{collection::vec, prelude::*, sample::Index};
 use serde::{Serialize, de::DeserializeOwned};
 use tpf3mp_bridge::{
-    LobbyAction, LobbyConnection, LobbyLine, LobbyMember, LobbyRoom, LobbyView, RoomInfo,
-    RoomMember, ToAgent, ToHook, decode, encode,
+    LobbyAction, LobbyConnection, LobbyLine, LobbyMember, LobbyRoom, LobbyRules, LobbyView,
+    LobbyWorld, RoomInfo, RoomMember, ToAgent, ToHook, decode, encode,
 };
 use tpf3mp_proto::{
     BoundedVec, Event, EventBody, FixedBytes, IntentRejection, LaneDigest, Payload, PlayerId,
@@ -48,6 +48,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
             checkpoint_interval: 50,
             saves: Text::new("C:/Users/player/TPF3-MP/worlds/saves").unwrap(),
             player: PlayerId(FixedBytes([7; 32])),
+            mods: Some(tpf3mp_bridge::ModLists {
+                shared: BoundedVec::new(vec![Text::new("vehicles_pack").unwrap()]).unwrap(),
+                personal: BoundedVec::new(vec![Text::new("minimap").unwrap()]).unwrap(),
+            }),
         },
         ToHook::Apply(Event {
             seq: 12,
@@ -56,6 +60,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                 player: PlayerId(FixedBytes([1; 32])),
                 client_seq: 3,
                 payload: Payload::new(vec![9; 40]).unwrap(),
+                seal: Some(tpf3mp_proto::Seal {
+                    scope: 2,
+                    tag: FixedBytes([4; 32]),
+                }),
             },
         }),
         ToHook::Release { through: 410 },
@@ -96,9 +104,12 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
             ])
             .unwrap(),
         }),
-        ToHook::Lobby(LobbyView {
+        ToHook::Lobby(Box::new(LobbyView {
             connection: LobbyConnection::Connected,
             server: Text::new("EU").unwrap(),
+            server_address: Text::new("tpf3mp.example.org:29470").unwrap(),
+            server_default: Text::new("tpf3mp.example.org:29470").unwrap(),
+            banner: Some(Text::new("m03").unwrap()),
             name: Text::new("Ann").unwrap(),
             error: None,
             notice: Some(Text::new("created the room").unwrap()),
@@ -118,8 +129,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                     owner: true,
                     you: true,
                     same_content: Some(true),
+                    banner: None,
                 }])
                 .unwrap(),
+                competitive: false,
             }),
             chat: BoundedVec::new(vec![LobbyLine {
                 from: Text::new("Ann").unwrap(),
@@ -127,7 +140,36 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
                 you: true,
             }])
             .unwrap(),
-        }),
+            rules: BoundedVec::new(vec![LobbyRules {
+                name: Text::new("native").unwrap(),
+                description: Text::new("The game's own economy").unwrap(),
+            }])
+            .unwrap(),
+            saves: BoundedVec::new(vec![Text::new("mptest").unwrap()]).unwrap(),
+            start_save: Some(Text::new("mptest").unwrap()),
+            world: LobbyWorld::Fetching {
+                bytes: 1 << 20,
+                total: 1 << 24,
+            },
+            differences: Some(Text::new("you lack stations 3").unwrap()),
+            mods: BoundedVec::new(vec![tpf3mp_bridge::LobbyMod {
+                id: Text::new("schbrongx_minimap").unwrap(),
+                name: Text::new("Minimap").unwrap(),
+                class: tpf3mp_bridge::LobbyModClass::Personal,
+                reason: Text::new("only what this player sees").unwrap(),
+                chosen: true,
+                choosable: true,
+            }])
+            .unwrap(),
+            room_mods: BoundedVec::new(vec![tpf3mp_bridge::LobbyRoomMod {
+                id: Text::new("vehicles_pack").unwrap(),
+                version: Text::new("3").unwrap(),
+                have: tpf3mp_bridge::LobbyHave::No,
+            }])
+            .unwrap(),
+            room_mods_more: 0,
+            rooms: None,
+        })),
     ];
     let to_agent = [
         ToAgent::Hello {
@@ -137,6 +179,10 @@ fn samples() -> Vec<(Check, Vec<u8>)> {
         ToAgent::Loaded { next_step: 401 },
         ToAgent::Command {
             payload: Payload::new(vec![7; 64]).unwrap(),
+            secret: Some(tpf3mp_proto::Secret {
+                scope: 2,
+                password: Text::new("pw").unwrap(),
+            }),
         },
         ToAgent::Ran { step: 402 },
         ToAgent::Checkpoint {

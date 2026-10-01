@@ -82,10 +82,15 @@ impl<const N: usize> RegionCache<N> {
         };
         let mut at = address;
         while at < end {
-            if let Some(&(_, region_end)) = self.regions[..self.len]
+            if let Some(i) = self.regions[..self.len]
                 .iter()
-                .find(|(base, region_end)| *base <= at && at < *region_end)
+                .position(|(base, region_end)| *base <= at && at < *region_end)
             {
+                let region_end = self.regions[i].1;
+                // A hit moves to the front, so the regions in use stay
+                // and the least recently used one goes first: evicting by
+                // age alone thrashed once more than N regions were in play.
+                self.regions[..=i].rotate_right(1);
                 at = region_end;
                 continue;
             }
@@ -101,11 +106,27 @@ impl<const N: usize> RegionCache<N> {
         true
     }
 
-    fn remember(&mut self, base: usize, end: usize) {
+    /// Puts `[base, end)` first, merged with every remembered region it
+    /// overlaps or touches. VirtualQuery answers a region from the page of
+    /// the address asked, not from where the region begins, so a check below
+    /// a remembered region's start asks again and gets an overlapping answer:
+    /// merged, it is one entry, not a second copy crowding out the others.
+    fn remember(&mut self, mut base: usize, mut end: usize) {
         if N == 0 {
             return;
         }
-        let keep = self.len.min(N - 1);
+        let mut kept = 0;
+        for i in 0..self.len {
+            let (other_base, other_end) = self.regions[i];
+            if other_base <= end && base <= other_end {
+                base = base.min(other_base);
+                end = end.max(other_end);
+            } else {
+                self.regions[kept] = self.regions[i];
+                kept += 1;
+            }
+        }
+        let keep = kept.min(N - 1);
         self.regions.copy_within(0..keep, 1);
         self.regions[0] = (base, end);
         self.len = keep + 1;
@@ -291,7 +312,8 @@ mod cache_tests {
         assert!(cache.readable_with(0x2ff8, 0x10, &mut query));
         assert!(cache.readable_with(0x3008, 8, &mut query));
         assert_eq!(*asked.borrow(), vec![0x1010, 0x3000]);
-        assert_eq!(cache.len(), 2);
+        // The two touch, and both are readable: one entry.
+        assert_eq!(cache.len(), 1);
         // Past the readable memory: refused, whatever is remembered.
         assert!(!cache.readable_with(0x3ff8, 0x10, &mut query));
         assert!(!cache.readable_with(0x800, 8, &mut query));
@@ -299,25 +321,63 @@ mod cache_tests {
         assert!(cache.readable_with(0x10, 0, &mut query), "zero bytes");
     }
 
-    #[test]
-    fn the_oldest_region_is_forgotten_first() {
-        let mut cache = RegionCache::<2>::new();
-        let asked = std::cell::Cell::new(0);
-        let mut query = |at: usize| {
+    /// Separate one-page regions (a gap between each, so none merge).
+    fn pages(asked: &std::cell::Cell<usize>) -> impl FnMut(usize) -> Option<(usize, usize)> + '_ {
+        move |at: usize| {
             asked.set(asked.get() + 1);
             let base = at & !0xfff;
             Some((base, base + 0x1000))
-        };
-        for page in [0x1000, 0x2000, 0x3000] {
+        }
+    }
+
+    #[test]
+    fn the_least_recently_used_region_is_forgotten_first() {
+        let mut cache = RegionCache::<2>::new();
+        let asked = std::cell::Cell::new(0);
+        let mut query = pages(&asked);
+        for page in [0x1000, 0x3000, 0x5000] {
             assert!(cache.readable_with(page, 4, &mut query));
         }
         assert_eq!(cache.len(), 2);
-        // 0x2000 and 0x3000 remembered; 0x1000 was forgotten.
+        // 0x3000 and 0x5000 remembered; 0x1000 was forgotten.
+        assert!(cache.readable_with(0x5004, 4, &mut query));
         assert!(cache.readable_with(0x3004, 4, &mut query));
-        assert!(cache.readable_with(0x2004, 4, &mut query));
         assert_eq!(asked.get(), 3);
         assert!(cache.readable_with(0x1004, 4, &mut query));
         assert_eq!(asked.get(), 4);
+    }
+
+    #[test]
+    fn a_region_in_use_stays_while_others_come_and_go() {
+        // One region read between visits to many others: evicting by age
+        // alone asked for it again each time (the thrashing seen in the
+        // road-entry benchmark); a hit keeps it.
+        let mut cache = RegionCache::<2>::new();
+        let asked = std::cell::Cell::new(0);
+        let mut query = pages(&asked);
+        assert!(cache.readable_with(0x1000, 4, &mut query));
+        for other in [0x3000, 0x5000, 0x7000, 0x9000] {
+            assert!(cache.readable_with(other, 4, &mut query));
+            assert!(cache.readable_with(0x1004, 4, &mut query));
+        }
+        assert_eq!(asked.get(), 5, "0x1000 asked once, each other once");
+    }
+
+    #[test]
+    fn a_check_below_a_remembered_start_merges_into_one_region() {
+        // VirtualQuery answers from the page asked: [page, region end).
+        let mut cache = RegionCache::<4>::new();
+        let asked = std::cell::Cell::new(0);
+        let mut query = |at: usize| {
+            asked.set(asked.get() + 1);
+            Some((at & !0xfff, 0x10_000))
+        };
+        assert!(cache.readable_with(0x8000, 4, &mut query));
+        assert!(cache.readable_with(0x2000, 4, &mut query));
+        assert_eq!(cache.len(), 1, "one region, not two overlapping copies");
+        assert!(cache.readable_with(0x5000, 4, &mut query));
+        assert!(cache.readable_with(0x9000, 4, &mut query));
+        assert_eq!(asked.get(), 2);
     }
 
     #[test]

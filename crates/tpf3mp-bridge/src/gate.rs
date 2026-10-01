@@ -57,7 +57,7 @@ pub enum Gated {
     /// Show the room as it stands.
     Room(RoomInfo),
     /// Keep the launcher's lobby for the main menu's window.
-    Lobby(LobbyView),
+    Lobby(Box<LobbyView>),
     /// A member's pointer moved or their build tool is previewing.
     Cursor(Cursor),
     /// Nothing to do but check [`Gate::may_run`] again.

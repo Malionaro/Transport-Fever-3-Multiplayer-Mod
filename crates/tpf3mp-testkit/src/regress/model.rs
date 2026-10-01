@@ -22,11 +22,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use tpf3mp_proto::{
-    Event, EventBody, FixedBytes, LaneDigest, PlayerId,
+    Event, EventBody, FixedBytes, LaneDigest, PlayerId, Seal,
     action::{
         Action, Bulldoze, CompanyId, CompanyOp, ConstructionBuild, ConstructionRef, EdgeEnds,
-        LineChange, LineId, LoanOp, Network, Polyline, Pos, Prospect, ReplaceVehicle, Resolve,
-        Structure, Terraform, VehicleChange,
+        JunctionChange, JunctionConfig, LineChange, LineId, LoanOp, Network, Polyline, Pos,
+        Prospect, ReplaceVehicle, Resolve, Structure, Terraform, VehicleChange,
     },
 };
 
@@ -52,10 +52,30 @@ pub const CAR_CAPACITY: u32 = 40;
 pub const MAX_WAITING: u32 = 1_000;
 
 /// Steps a prospection takes before its outcome, the model's stand-in for
-/// TF3's six months.
-pub const PROSPECTION_STEPS: u64 = 300;
+/// TF3's six months. Far more than a scenario's acts take to be ordered
+/// (some 100 steps each at the regression runs' pace, more on a loaded
+/// machine), so the prospecting scenario's prospections are all still under
+/// way when its last one is.
+pub const PROSPECTION_STEPS: u64 = 2_000;
 /// In hundredths: how often a prospection finds an industry.
 pub const PROSPECTION_CHANCE: u64 = 60;
+
+/// Company progression, the model's stand-in for the mod's rule
+/// (`mod/tpf3mp_1/content/scripts/tpf3mp/progression.lua`, D23 proposed):
+/// each station is a town of [`TOWN_POPULATION`] people, a company's share
+/// of a town is its share of the passengers delivered there, its rating in
+/// every town is [`TOWN_RATING`] (the model keeps no ratings), and its score
+/// is the sum over the towns of population x share x rating / 100. With one
+/// company its score is the world's population, as TF3's own. Recomputed
+/// every [`PROGRESSION_EVERY`] steps; experience never falls.
+pub const TOWN_POPULATION: u64 = 1_000;
+pub const TOWN_RATING: u64 = 100;
+pub const PROGRESSION_EVERY: u64 = 100;
+/// Experience a rank needs above the one before, the model's stand-in for
+/// TF3's thresholds.
+pub const RANK_EXPERIENCE: u64 = 1_000;
+/// TF3's highest rank (`company_progression_util.getMaxRank`).
+pub const MAX_RANK: u8 = 15;
 
 /// Tolerances of `docs/BUILDING.md`, in millimetres.
 const NODE_TOLERANCE: i64 = 1_500;
@@ -108,6 +128,15 @@ fn dist2(a: P, b: P) -> i128 {
         .sum()
 }
 
+/// A player as the mod names one: 64 lowercase hex digits.
+fn hex(player: &PlayerId) -> String {
+    player
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn within(a: P, b: P, tolerance: i64) -> bool {
     dist2(a, b) <= i128::from(tolerance) * i128::from(tolerance)
 }
@@ -126,6 +155,43 @@ fn metres(a: P, b: P) -> i64 {
 struct Company {
     name: String,
     money: i64,
+    /// TF3's company progression: the highest score it reached, the rank
+    /// that reaches and the rank it took.
+    progress: Progress,
+    /// Who founded it: its head while they play for it.
+    founder: Option<PlayerId>,
+    /// Its players, in the order they joined: the first is its head once
+    /// the founder has gone (DECISIONS.md, D22, proposed).
+    members: Vec<PlayerId>,
+    /// The seal of its password (scope and tag), if it has one.
+    lock: Option<(u64, [u8; 32])>,
+    /// Whether other companies' lines may stop at its stations.
+    open: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct Progress {
+    experience: u64,
+    potential: u8,
+    level: u8,
+}
+
+impl Progress {
+    /// As TF3's company growth script (`company_growth.script.tl`): a
+    /// company begins at rank 1, and its experience never falls.
+    const fn new() -> Self {
+        Self {
+            experience: 0,
+            potential: 1,
+            level: 1,
+        }
+    }
+}
+
+fn rank_for(experience: u64) -> u8 {
+    u8::try_from(experience / RANK_EXPERIENCE)
+        .unwrap_or(MAX_RANK)
+        .min(MAX_RANK)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +279,7 @@ struct State {
     member_of: BTreeMap<PlayerId, u32>,
     companies: BTreeMap<u32, Company>,
     edges: BTreeMap<EdgeKey, Edge>,
+    junctions: BTreeMap<(u8, P), JunctionConfig>,
     objects: BTreeMap<(EdgeKey, P), EdgeObject>,
     constructions: BTreeMap<(String, P), Construction>,
     stations: BTreeMap<u32, Station>,
@@ -230,6 +297,9 @@ struct State {
     next_line: u32,
     next_vehicle: u32,
     delivered: u64,
+    /// Passengers each company delivered at each station, by (company,
+    /// station): its deliveries for its share of the station's town.
+    served: BTreeMap<(u32, u32), u64>,
     /// Actions that changed nothing.
     ignored: u64,
     rng: u64,
@@ -250,11 +320,11 @@ impl State {
             return;
         }
         self.players.push(player);
-        let company = self.found(format!("Company {}", self.next_company + 1));
-        self.member_of.insert(player, company);
+        let company = self.found(format!("Company {}", self.next_company + 1), player);
+        self.set_member(player, company);
     }
 
-    fn found(&mut self, name: String) -> u32 {
+    fn found(&mut self, name: String, founder: PlayerId) -> u32 {
         let id = self.next_company;
         self.next_company += 1;
         self.companies.insert(
@@ -262,9 +332,51 @@ impl State {
             Company {
                 name,
                 money: START_MONEY,
+                progress: Progress::new(),
+                founder: Some(founder),
+                members: Vec::new(),
+                lock: None,
+                open: true,
             },
         );
         id
+    }
+
+    /// `player` plays for `company` from now on, last in its join order.
+    fn set_member(&mut self, player: PlayerId, company: u32) {
+        if let Some(old) = self.member_of.insert(player, company)
+            && let Some(entry) = self.companies.get_mut(&old)
+        {
+            entry.members.retain(|p| *p != player);
+        }
+        if let Some(entry) = self.companies.get_mut(&company) {
+            entry.members.push(player);
+        }
+    }
+
+    /// A company's head: its founder while they play for it, else its
+    /// longest-standing player.
+    fn head(&self, company: u32) -> Option<PlayerId> {
+        let entry = self.companies.get(&company)?;
+        entry
+            .founder
+            .filter(|founder| entry.members.contains(founder))
+            .or_else(|| entry.members.first().copied())
+    }
+
+    /// Who owns station `id`: the company of the stop or construction that
+    /// is it.
+    fn station_owner(&self, id: u32) -> Option<u32> {
+        self.objects
+            .values()
+            .find(|o| o.station == Some(id))
+            .map(|o| o.owner)
+            .or_else(|| {
+                self.constructions
+                    .values()
+                    .find(|c| c.kind == Kind::Station(id))
+                    .map(|c| c.owner)
+            })
     }
 
     fn charge(&mut self, company: u32, amount: i64) -> Result<(), Refusal> {
@@ -278,9 +390,14 @@ impl State {
         Ok(())
     }
 
-    fn act(&mut self, player: &PlayerId, action: &Action) -> Result<(), Refusal> {
+    fn act(
+        &mut self,
+        player: &PlayerId,
+        action: &Action,
+        seal: Option<&Seal>,
+    ) -> Result<(), Refusal> {
         if let Action::CompanyOp(op) = action {
-            return self.company_op(player, op);
+            return self.company_op(player, op, seal);
         }
         let Some(&company) = self.member_of.get(player) else {
             refuse!("the player has no company");
@@ -348,7 +465,7 @@ impl State {
                 Ok(())
             }
             Action::CreateLine(create) => {
-                let stops = self.stops(create.line.stops.iter())?;
+                let stops = self.stops(create.line.stops.iter(), company)?;
                 let id = self.next_line;
                 self.next_line += 1;
                 self.lines.insert(
@@ -373,7 +490,7 @@ impl State {
                             [color.r, color.g, color.b];
                     }
                     LineChange::Update(line_data) => {
-                        let stops = self.stops(line_data.stops.iter())?;
+                        let stops = self.stops(line_data.stops.iter(), company)?;
                         let count = stops.len();
                         self.lines.get_mut(&line).expect("checked").stops = stops;
                         for vehicle in self.vehicles.values_mut() {
@@ -486,7 +603,64 @@ impl State {
             Action::Prospect(prospect) => self.prospect(prospect, company),
             // A notification's sound played: nothing the model keeps.
             Action::NotificationSeen { .. } => Ok(()),
+            Action::ApplyRank { level } => self.apply_rank(company, *level),
+            Action::EditJunctions(edit) => self.edit_junctions(&edit.changes, company),
             Action::CompanyOp(_) => unreachable!("handled above"),
+        }
+    }
+
+    /// As TF3's company growth script's `applyLevel`: a rank above the one
+    /// taken, and reached.
+    fn apply_rank(&mut self, company: u32, level: u8) -> Result<(), Refusal> {
+        let Some(entry) = self.companies.get_mut(&company) else {
+            refuse!("company-{company} is gone");
+        };
+        let progress = &mut entry.progress;
+        if level <= progress.level || level > progress.potential {
+            refuse!(
+                "company-{company} has rank {} of {} reached, not {level}",
+                progress.level,
+                progress.potential
+            );
+        }
+        progress.level = level;
+        Ok(())
+    }
+
+    /// The companies' scores, as the mod's rule (see [`TOWN_POPULATION`]):
+    /// with one company the world's population, as TF3's own; with more,
+    /// each town's population split by the passengers each delivered
+    /// there, times its rating there over 100.
+    fn progress(&mut self) {
+        let towns: Vec<u32> = self.stations.keys().copied().collect();
+        let world = TOWN_POPULATION.saturating_mul(u64::try_from(towns.len()).unwrap_or(0));
+        let single = self.companies.len() <= 1;
+        let mut scores: BTreeMap<u32, u64> = BTreeMap::new();
+        if !single {
+            for town in towns {
+                let here = || self.served.iter().filter(move |((_, at), _)| *at == town);
+                let all: u64 = here().map(|(_, n)| *n).sum();
+                if all == 0 {
+                    continue;
+                }
+                for ((company, _), n) in here() {
+                    let part =
+                        u128::from(TOWN_POPULATION) * u128::from(*n) * u128::from(TOWN_RATING)
+                            / (u128::from(all) * 100);
+                    let entry = scores.entry(*company).or_default();
+                    *entry = entry.saturating_add(u64::try_from(part).unwrap_or(u64::MAX));
+                }
+            }
+        }
+        for (id, company) in &mut self.companies {
+            let score = if single {
+                world
+            } else {
+                scores.get(id).copied().unwrap_or(0)
+            };
+            let progress = &mut company.progress;
+            progress.experience = progress.experience.max(score);
+            progress.potential = progress.potential.max(rank_for(progress.experience));
         }
     }
 
@@ -547,18 +721,43 @@ impl State {
         }
     }
 
-    fn company_op(&mut self, player: &PlayerId, op: &CompanyOp) -> Result<(), Refusal> {
+    /// The company rules of D21 and D22 (proposed), as the mod keeps them
+    /// (`tpf3mp/companies.lua`): a password's seal to join a locked company,
+    /// and its head alone to lock, unlock, dismiss or share.
+    fn company_op(
+        &mut self,
+        player: &PlayerId,
+        op: &CompanyOp,
+        seal: Option<&Seal>,
+    ) -> Result<(), Refusal> {
         let current = self.member_of.get(player).copied();
+        let head_of = |state: &Self, company: u32| -> Result<(), Refusal> {
+            if !state.companies.contains_key(&company) {
+                refuse!("no company-{company}");
+            }
+            if state.head(company) != Some(*player) {
+                refuse!("only the head of company-{company} does that");
+            }
+            Ok(())
+        };
         match op {
             CompanyOp::Create { name } => {
-                let company = self.found(name.as_str().to_owned());
-                self.member_of.insert(*player, company);
+                let company = self.found(name.as_str().to_owned(), *player);
+                self.set_member(*player, company);
             }
             CompanyOp::Join(CompanyId(company)) => {
-                if !self.companies.contains_key(company) {
+                let Some(entry) = self.companies.get(company) else {
                     refuse!("no company-{company}");
+                };
+                if current != Some(*company)
+                    && let Some(lock) = entry.lock
+                    && seal.map(|s| (s.scope, s.tag.0)) != Some(lock)
+                {
+                    refuse!("the password for company-{company} is not right");
                 }
-                self.member_of.insert(*player, *company);
+                if current != Some(*company) {
+                    self.set_member(*player, *company);
+                }
             }
             CompanyOp::Rename {
                 company: CompanyId(company),
@@ -595,6 +794,87 @@ impl State {
                 }
                 self.companies.remove(company);
                 self.member_of.remove(player);
+            }
+            CompanyOp::Lock(CompanyId(company)) => {
+                head_of(self, *company)?;
+                let Some(seal) = seal.filter(|s| s.scope == u64::from(*company)) else {
+                    refuse!("a password for company-{company} comes sealed by the room");
+                };
+                self.companies.get_mut(company).expect("checked").lock =
+                    Some((seal.scope, seal.tag.0));
+            }
+            CompanyOp::Unlock(CompanyId(company)) => {
+                head_of(self, *company)?;
+                self.companies.get_mut(company).expect("checked").lock = None;
+            }
+            CompanyOp::Dismiss {
+                company: CompanyId(company),
+                player: dismissed,
+            } => {
+                head_of(self, *company)?;
+                let Some(&other) = self.companies[company]
+                    .members
+                    .iter()
+                    .find(|p| hex(p) == dismissed.as_str())
+                else {
+                    refuse!("that player does not play for company-{company}");
+                };
+                if other == *player {
+                    refuse!("the head leaves by joining another company");
+                }
+                // The model has no shared first company: they found their
+                // own, as on joining the room.
+                let own = self.found(format!("Company {}", self.next_company + 1), other);
+                self.set_member(other, own);
+            }
+            CompanyOp::ShareStations {
+                company: CompanyId(company),
+                open,
+            } => {
+                head_of(self, *company)?;
+                self.companies.get_mut(company).expect("checked").open = *open;
+            }
+        }
+        Ok(())
+    }
+
+    fn edit_junctions(&mut self, changes: &[JunctionChange], company: u32) -> Result<(), Refusal> {
+        for change in changes {
+            let network = net(change.node.network);
+            let at = p(&change.node.at);
+            let incident: Vec<_> = self
+                .edges
+                .iter()
+                .filter(|((n, a, b), _)| *n == network && (*a == at || *b == at))
+                .collect();
+            if incident.is_empty() {
+                refuse!("the junction no longer exists");
+            }
+            if incident
+                .iter()
+                .any(|(_, e)| e.owner.is_some_and(|owner| owner != company))
+            {
+                refuse!("the junction touches another company's edge");
+            }
+            if let Some(config) = &change.config {
+                for reference in config
+                    .connections
+                    .iter()
+                    .flat_map(|c| [&c.incoming, &c.outgoing])
+                    .chain(config.crosswalks.iter())
+                {
+                    let key = edge_key(
+                        net(reference.network),
+                        p(&reference.ends.a),
+                        p(&reference.ends.b),
+                    );
+                    if !self.edges.contains_key(&key) || (key.1 != at && key.2 != at) {
+                        refuse!("a lane or crosswalk outside its junction");
+                    }
+                }
+                self.junctions.insert((network, at), config.clone());
+            } else {
+                self.junctions.remove(&(network, at));
             }
         }
         Ok(())
@@ -706,6 +986,7 @@ impl State {
             );
             cost = cost.saturating_add(metres(a, b).saturating_mul(cost_per_m));
         }
+        self.edit_junctions(&polyline.junctions, company)?;
         self.charge(company, cost)
     }
 
@@ -929,9 +1210,12 @@ impl State {
         Ok(())
     }
 
+    /// A line's stops, for `company`: at stations no company owns, its own,
+    /// or another company's that keeps its stations open (D22, proposed).
     fn stops<'a>(
         &self,
         stops: impl Iterator<Item = &'a tpf3mp_proto::action::LineStop>,
+        company: u32,
     ) -> Result<Vec<(u32, Option<u16>)>, Refusal> {
         let stops: Vec<_> = stops
             .map(|s| (s.group.0, Some(s.terminal.terminal)))
@@ -942,6 +1226,14 @@ impl State {
         for (station, _) in &stops {
             if !self.stations.contains_key(station) {
                 refuse!("no station-{station}");
+            }
+            if let Some(owner) = self.station_owner(*station)
+                && owner != company
+                && self.companies.get(&owner).is_some_and(|c| !c.open)
+            {
+                refuse!(
+                    "station-{station} is company-{owner}'s, which keeps its stations to itself"
+                );
             }
         }
         Ok(stops)
@@ -1064,6 +1356,7 @@ impl State {
             vehicles,
             companies,
             delivered,
+            served,
             ..
         } = self;
         for vehicle in vehicles.values_mut() {
@@ -1091,6 +1384,11 @@ impl State {
             }
             vehicle.progress = 0;
             *delivered += u64::from(vehicle.load);
+            if vehicle.load > 0 {
+                *served
+                    .entry((vehicle.owner, line.stops[next].0))
+                    .or_default() += u64::from(vehicle.load);
+            }
             if let Some(owner) = companies.get_mut(&vehicle.owner) {
                 owner.money += i64::from(vehicle.load) * FARE;
             }
@@ -1110,6 +1408,9 @@ impl State {
                 }
             }
         }
+        if step.is_multiple_of(PROGRESSION_EVERY) {
+            self.progress();
+        }
         self.rng = rng.state();
     }
 }
@@ -1126,6 +1427,7 @@ pub struct LineView {
 /// game's hook answers the same questions from the game's own state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
+    pub junctions: usize,
     /// The money of each player's company, in the order they joined, so
     /// actors first.
     pub money: Vec<Option<i64>>,
@@ -1150,6 +1452,9 @@ pub struct Observation {
     pub prospections: usize,
     /// Industries prospecting found.
     pub industries: usize,
+    /// Each player's company's rank, taken and reached, in the order they
+    /// joined.
+    pub ranks: Vec<Option<(u8, u8)>>,
 }
 
 /// One replica of the model.
@@ -1207,13 +1512,16 @@ impl ModelWorld {
             EventBody::PlayerJoined { player, .. } => self.state.join(*player),
             EventBody::PlayerLeft { .. } | EventBody::Save => {}
             EventBody::Command {
-                player, payload, ..
+                player,
+                payload,
+                seal,
+                ..
             } => {
                 let outcome = Action::from_payload(payload)
                     .map_err(|error| error.to_string())
                     .and_then(|action| {
                         let mut next = self.state.clone();
-                        next.act(player, &action)?;
+                        next.act(player, &action, seal.as_ref())?;
                         Ok(next)
                     });
                 match outcome {
@@ -1245,7 +1553,7 @@ impl ModelWorld {
             .collect();
         let stations: Vec<(u32, P)> = s.stations.iter().map(|(id, st)| (*id, st.at)).collect();
         vec![
-            lane_digest(lane::NETWORK, &(&s.edges, &s.terrain)),
+            lane_digest(lane::NETWORK, &(&s.edges, &s.terrain, &s.junctions)),
             lane_digest(
                 lane::CONSTRUCTIONS,
                 &(
@@ -1268,6 +1576,7 @@ impl ModelWorld {
                     &s.companies,
                     s.next_company,
                     s.delivered,
+                    &s.served,
                     s.ignored,
                     s.rng,
                 ),
@@ -1294,6 +1603,7 @@ impl ModelWorld {
             .collect();
         let edges = |n: u8| s.edges.keys().filter(|(of, _, _)| *of == n).count();
         Observation {
+            junctions: self.state.junctions.len(),
             money: s
                 .players
                 .iter()
@@ -1326,6 +1636,14 @@ impl ModelWorld {
             terrain_cells: s.terrain.len(),
             prospections: s.prospections.len(),
             industries: s.industries.len(),
+            ranks: s
+                .players
+                .iter()
+                .map(|player| {
+                    let progress = s.companies.get(s.member_of.get(player)?)?.progress;
+                    Some((progress.level, progress.potential))
+                })
+                .collect(),
         }
     }
 }
@@ -1370,14 +1688,235 @@ mod tests {
     }
 
     fn act(world: &mut ModelWorld, seq: u64, player: PlayerId, action: &Action) {
+        act_sealed(world, seq, player, action, None);
+    }
+
+    fn act_sealed(
+        world: &mut ModelWorld,
+        seq: u64,
+        player: PlayerId,
+        action: &Action,
+        seal: Option<Seal>,
+    ) {
         world.apply(&event(
             seq,
             EventBody::Command {
                 player,
                 client_seq: seq,
                 payload: action.to_payload().unwrap(),
+                seal,
             },
         ));
+    }
+
+    fn joined(players: &[PlayerId]) -> ModelWorld {
+        let mut world = ModelWorld::new(1);
+        for (seq, player) in players.iter().enumerate() {
+            world.apply(&event(
+                seq as u64 + 1,
+                EventBody::PlayerJoined {
+                    player: *player,
+                    name: Text::new("p").unwrap(),
+                    platform: Platform::current(),
+                },
+            ));
+        }
+        world
+    }
+
+    #[test]
+    fn junction_settings_change_the_network_digest_and_survive_save_load() {
+        use crate::regress::{library, script::Item};
+        let player = PlayerId(FixedBytes([7; 32]));
+        let mut world = joined(&[player]);
+        let scenario = library::scenarios()
+            .into_iter()
+            .find(|s| s.name == "junctions")
+            .unwrap();
+        let mut actions = scenario.items.iter().filter_map(|item| match item {
+            Item::Act { action, .. } => Some(action),
+            _ => None,
+        });
+        act(&mut world, 2, player, actions.next().unwrap());
+        let before = world.lanes()[0];
+        let edit = actions.next().unwrap();
+        let Action::EditJunctions(edit_data) = edit else {
+            panic!("junction action");
+        };
+        act(&mut world, 3, player, edit);
+        assert!(world.ignored().is_empty());
+        assert_ne!(world.lanes()[0], before);
+        assert_eq!(
+            world.state.junctions.values().next(),
+            edit_data.changes[0].config.as_ref()
+        );
+        let restored = ModelWorld::load(&world.save()).unwrap();
+        assert_eq!(restored.state.junctions, world.state.junctions);
+        assert_eq!(restored.lanes(), world.lanes());
+    }
+
+    fn stations(world: &mut ModelWorld, count: u32) {
+        for id in 0..count {
+            world.state.stations.insert(
+                id,
+                Station {
+                    at: [i32::try_from(id).unwrap() * 1_000_000, 0, 0],
+                    waiting: 0,
+                },
+            );
+        }
+    }
+
+    /// With one company its score is the world's population, as TF3's own,
+    /// and it takes the ranks that reaches, one above another.
+    #[test]
+    fn one_company_ranks_by_the_worlds_population() {
+        let player = PlayerId(FixedBytes([1; 32]));
+        let mut world = joined(&[player]);
+        stations(&mut world, 2);
+        world.step(PROGRESSION_EVERY);
+        assert_eq!(world.observe().ranks, [Some((1, 2))]);
+        act(&mut world, 3, player, &Action::ApplyRank { level: 3 });
+        act(&mut world, 4, player, &Action::ApplyRank { level: 2 });
+        act(&mut world, 5, player, &Action::ApplyRank { level: 2 });
+        assert_eq!(world.observe().ranks, [Some((2, 2))]);
+        assert_eq!(world.ignored().len(), 2, "{:?}", world.ignored());
+    }
+
+    /// With two, each town's population is split by what each delivered
+    /// there, and each company's score is its parts' sum.
+    #[test]
+    fn two_companies_split_each_towns_population_by_their_deliveries() {
+        let (one, two) = (PlayerId(FixedBytes([1; 32])), PlayerId(FixedBytes([2; 32])));
+        let mut world = joined(&[one, two]);
+        stations(&mut world, 3);
+        // Town 0: 30 to 10; towns 1 and 2 the second company's alone.
+        for (key, n) in [((0, 0), 30), ((1, 0), 10), ((1, 1), 5), ((1, 2), 7)] {
+            world.state.served.insert(key, n);
+        }
+        world.step(PROGRESSION_EVERY);
+        let s = &world.state;
+        assert_eq!(s.companies[&0].progress.experience, 750);
+        assert_eq!(s.companies[&1].progress.experience, 2_250);
+        assert_eq!(world.observe().ranks, [Some((1, 1)), Some((1, 2))]);
+        // Experience never falls.
+        world.state.served.clear();
+        world.step(2 * PROGRESSION_EVERY);
+        assert_eq!(world.state.companies[&1].progress.experience, 2_250);
+        act(&mut world, 3, two, &Action::ApplyRank { level: 2 });
+        act(&mut world, 4, one, &Action::ApplyRank { level: 2 });
+        assert_eq!(world.observe().ranks, [Some((1, 1)), Some((2, 2))]);
+    }
+
+    /// D22 (proposed): a locked company takes a player only with its
+    /// password's seal; its head alone locks, dismisses and shares; the
+    /// head's place passes on when the founder leaves.
+    #[test]
+    fn a_locked_company_takes_only_the_right_seal_and_its_head_rules_it() {
+        let players: Vec<PlayerId> = (1..=3).map(|n| PlayerId(FixedBytes([n; 32]))).collect();
+        let (ann, bob, cat) = (players[0], players[1], players[2]);
+        let mut world = ModelWorld::new(1);
+        for (seq, player) in players.iter().enumerate() {
+            world.apply(&event(
+                seq as u64 + 1,
+                EventBody::PlayerJoined {
+                    player: *player,
+                    name: Text::new(format!("p{seq}")).unwrap(),
+                    platform: Platform::current(),
+                },
+            ));
+        }
+        let seal = |scope: u64, byte: u8| Seal {
+            scope,
+            tag: FixedBytes([byte; 32]),
+        };
+        let op = |op: CompanyOp| Action::CompanyOp(op);
+        // Ann's company is company 0. Bob cannot lock it; Ann can, only with
+        // a seal for it.
+        act_sealed(
+            &mut world,
+            10,
+            bob,
+            &op(CompanyOp::Lock(CompanyId(0))),
+            Some(seal(0, 1)),
+        );
+        act(&mut world, 11, ann, &op(CompanyOp::Lock(CompanyId(0))));
+        act_sealed(
+            &mut world,
+            12,
+            ann,
+            &op(CompanyOp::Lock(CompanyId(0))),
+            Some(seal(1, 1)),
+        );
+        act_sealed(
+            &mut world,
+            13,
+            ann,
+            &op(CompanyOp::Lock(CompanyId(0))),
+            Some(seal(0, 1)),
+        );
+        assert_eq!(world.ignored().len(), 3);
+        // Bob joins with the wrong password, then the right one; Cat without.
+        act_sealed(
+            &mut world,
+            14,
+            bob,
+            &op(CompanyOp::Join(CompanyId(0))),
+            Some(seal(0, 2)),
+        );
+        act(&mut world, 15, cat, &op(CompanyOp::Join(CompanyId(0))));
+        act_sealed(
+            &mut world,
+            16,
+            bob,
+            &op(CompanyOp::Join(CompanyId(0))),
+            Some(seal(0, 1)),
+        );
+        assert_eq!(world.ignored().len(), 5);
+        assert_eq!(world.state.member_of[&bob], 0);
+        // Bob is no head: he cannot dismiss or close the stations.
+        let dismiss_ann = op(CompanyOp::Dismiss {
+            company: CompanyId(0),
+            player: Text::new(hex(&ann)).unwrap(),
+        });
+        act(&mut world, 17, bob, &dismiss_ann);
+        act(
+            &mut world,
+            18,
+            bob,
+            &op(CompanyOp::ShareStations {
+                company: CompanyId(0),
+                open: false,
+            }),
+        );
+        assert_eq!(world.ignored().len(), 7);
+        // Ann leaves: Bob, the next to have joined, heads company 0 now.
+        act(&mut world, 19, ann, &op(CompanyOp::Join(CompanyId(1))));
+        act(
+            &mut world,
+            20,
+            bob,
+            &op(CompanyOp::ShareStations {
+                company: CompanyId(0),
+                open: false,
+            }),
+        );
+        assert_eq!(world.ignored().len(), 7, "{:?}", world.ignored());
+        assert!(!world.state.companies[&0].open);
+        // Ann returns only with the password; Bob unlocks, and Cat joins.
+        act(&mut world, 21, ann, &op(CompanyOp::Join(CompanyId(0))));
+        act(&mut world, 22, bob, &op(CompanyOp::Unlock(CompanyId(0))));
+        act(&mut world, 23, cat, &op(CompanyOp::Join(CompanyId(0))));
+        assert_eq!(world.ignored().len(), 8);
+        assert_eq!(world.state.member_of[&cat], 0);
+        // Bob dismisses Cat, who plays for a company of her own again.
+        let dismiss_cat = op(CompanyOp::Dismiss {
+            company: CompanyId(0),
+            player: Text::new(hex(&cat)).unwrap(),
+        });
+        act(&mut world, 24, bob, &dismiss_cat);
+        assert_ne!(world.state.member_of[&cat], 0);
+        assert_eq!(world.ignored().len(), 8);
     }
 
     #[test]

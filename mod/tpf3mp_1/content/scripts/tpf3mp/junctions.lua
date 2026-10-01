@@ -1,0 +1,369 @@
+-- Junction configuration capture/replay. Layout and field semantics follow
+-- TF3 build 40408's shipped api/tealdef/api/{type,engine}.d.tl. Entity ids
+-- stay inside this adapter; actions use positions and resource names.
+-- PLAN.md Part 3: enable in matching acceptance-test copies on both games,
+-- then change the default only after the two-player sandbox check passes.
+local junctions = { strict_junctions = false }
+
+function junctions.requireEnabled()
+	if not junctions.strict_junctions then error("junction tools await the two-player acceptance test (strict_junctions)",0) end
+end
+
+local function get(v, k)
+	if v == nil then return nil end
+	local ok, x = pcall(function() return v[k] end)
+	if ok then return x end
+end
+local function list(v)
+	if v == nil then return {} end
+	local out = {}
+	for i = 1, #v do out[i] = v[i] end
+	return out
+end
+local function component(id, kind, source)
+	local api = source or api
+	local c = api.type.ComponentType[kind]
+	if c ~= nil then return api.engine.getComponent(id, c) end
+end
+local function pos(v)
+	if v == nil then error("a junction with no position", 0) end
+	local p = { x = get(v, "x") or get(v, 1), y = get(v, "y") or get(v, 2), z = get(v, "z") or get(v, 3) }
+	for _, k in ipairs({ "x", "y", "z" }) do
+		local n = p[k]
+		if type(n) ~= "number" or n ~= n or math.abs(n) == math.huge then error("an invalid junction position", 0) end
+	end
+	return p
+end
+local function near(a, b)
+	return math.abs(a.x-b.x) <= 0.002 and math.abs(a.y-b.y) <= 0.002 and math.abs(a.z-b.z) <= 0.002
+end
+local function pointKey(p)
+	return string.format("%.0f,%.0f,%.0f", p.x*1000, p.y*1000, p.z*1000)
+end
+local function nodeKey(n) return n.network .. ":" .. pointKey(n.at) end
+local function edgeKey(e)
+	local a, b = pointKey(e.ends.a), pointKey(e.ends.b)
+	if a > b then a, b = b, a end
+	return e.network .. ":" .. a .. ">" .. b
+end
+
+-- A view including proposed geometry. Negative ids are used only while
+-- reading a proposal and are immediately replaced by portable references.
+local readComponent = component
+local function world(street, source)
+	local api = source or api
+	local function component(id, kind) return readComponent(id, kind, api) end
+	local w = { nodes = {}, edges = {}, removed = {} }
+	for _, n in ipairs(list(get(street, "addedNodes") or get(street, "nodesToAdd"))) do
+		w.nodes[n.entity] = pos(n.comp.position)
+	end
+	for _, e in ipairs(list(get(street, "addedSegments") or get(street, "edgesToAdd"))) do w.edges[e.entity] = e end
+	for _, e in ipairs(list(get(street, "removedSegments") or get(street, "edgesToRemove"))) do
+		w.removed[type(e) == "number" and e or e.entity] = true
+	end
+	function w.position(id)
+		return w.nodes[id] or pos(get(component(id, "BASE_NODE"), "position"))
+	end
+	function w.edge(id)
+		local proposed = w.edges[id]
+		local c = proposed and proposed.comp or component(id, "BASE_EDGE")
+		if not c then error("a junction edge no longer exists", 0) end
+		local network
+		if proposed then
+			if proposed.type == 0 then network = "Street" elseif proposed.type == 1 then network = "Track" end
+		else
+			for _, kind in ipairs({ "Street", "Track" }) do
+				for _, e in ipairs(list(api.engine.system.streetSystem["getNode" .. kind .. "Segments"](c.node0))) do
+					if e == id then network = kind end
+				end
+			end
+		end
+		if not network then error("a junction edge of unknown network", 0) end
+		return { network = network, ends = { a = w.position(c.node0), b = w.position(c.node1) } }, c
+	end
+	function w.node(id)
+		local network
+		for _, kind in ipairs(id >= 0 and { "Street", "Track" } or {}) do
+			local edges = api.engine.system.streetSystem["getNode" .. kind .. "Segments"](id)
+			if edges and #edges > 0 then network = kind break end
+		end
+		if not network then
+			for _, e in pairs(w.edges) do
+				if e.comp.node0 == id or e.comp.node1 == id then
+					local kind = e.type == 0 and "Street" or "Track"
+					if not network or kind == "Street" then network = kind end
+				end
+			end
+		end
+		if not network then error("a junction outside either network", 0) end
+		return { network = network, at = w.position(id) }
+	end
+	return w
+end
+
+local PREFERENCES = { Auto = "AUTO", Yes = "YES", No = "NO" }
+local function captureConfig(c, w, source)
+	local api = source or api
+	local preference
+	local enums = api.type.enum.TrafficLightPreference
+	for name, key in pairs(PREFERENCES) do if c.trafficLightPreference == enums[key] then preference = name end end
+	if not preference then error("unknown traffic light preference", 0) end
+	local config = { connections = {}, crosswalks = {}, preference = preference, phases = {},
+		double_slip = c.doubleSlipSwitch == true, custom_phases = c.userModifiedTrafficLightStates == true }
+	for _, turn in ipairs(list(c.laneConnections)) do
+		config.connections[#config.connections+1] = { incoming = w.edge(turn.segment0), lane_in = turn.lane0,
+			outgoing = w.edge(turn.segment1), lane_out = turn.lane1, road = turn.withRoad == true, tram = turn.withTram == true }
+	end
+	for _, e in ipairs(list(c.crosswalks)) do config.crosswalks[#config.crosswalks+1] = w.edge(e) end
+	local lights = c.trafficLightConfig
+	if lights == nil then error("traffic light configuration did not read", 0) end
+	if lights.trafficLightType ~= -1 then
+		config.light = api.res.trafficLightTypeRep.getName(lights.trafficLightType)
+		if type(config.light) ~= "string" or config.light == "" then error("unknown traffic light resource", 0) end
+	end
+	for _, phase in ipairs(list(lights.states)) do
+		config.phases[#config.phases+1] = { locked = list(phase.lockedLanes), duration = phase.duration,
+			minimum = phase.minDuration, skip = phase.canSkip == true }
+	end
+	return config
+end
+
+-- Capture both updates and explicit resets; preserve order within a config
+-- because a traffic-light phase's indices address that order.
+function junctions.capture(street)
+	local adds, removes = list(get(street, "nodeConfigsToAdd")), list(get(street, "nodeConfigsToRemove"))
+	if #adds == 0 and #removes == 0 then return {} end
+	local w, changes, seen = world(street), {}, {}
+	for _, record in ipairs(adds) do
+		if seen[record.entity] then error("a junction configured twice", 0) end
+		seen[record.entity] = true
+		changes[#changes+1] = { node = w.node(record.entity), config = captureConfig(record.comp, w) }
+	end
+	for _, id in ipairs(removes) do
+		if not seen[id] then changes[#changes+1] = { node = w.node(id) } seen[id] = true end
+	end
+	table.sort(changes, function(a,b) return nodeKey(a.node) < nodeKey(b.node) end)
+	return changes
+end
+
+function junctions.edit(proposal)
+	junctions.requireEnabled()
+	local street = get(proposal, "proposal")
+	if street == nil then error("a junction edit with no proposal", 0) end
+	for _, name in ipairs({ "toAdd", "toRemove" }) do
+		if #list(get(proposal, name)) > 0 then error("a junction edit with constructions", 0) end
+	end
+	for _, name in ipairs({ "addedNodes", "removedNodes", "addedSegments", "removedSegments", "nodesToAdd", "nodesToRemove", "edgesToAdd", "edgesToRemove", "edgeObjectsToAdd", "edgeObjectsToRemove" }) do
+		if #list(get(street, name)) > 0 then error("a junction edit with geometry or edge objects", 0) end
+	end
+	local changes = junctions.capture(street)
+	if #changes == 0 then return false end
+	return { EditJunctions = { changes = changes } }
+end
+
+local function makeConfig(config, edge, node)
+	local c = api.type.BaseNodeConfig.new()
+	local turns, walks = {}, {}
+	local function at(e)
+		local id, comp = edge(e)
+		if comp.node0 ~= node and comp.node1 ~= node then error("a lane or crosswalk outside its junction", 0) end
+		return id, comp
+	end
+	for _, turn in ipairs(config.connections) do
+		local t = api.type.LaneConnection.new()
+		local a, ac = at(turn.incoming)
+		local b, bc = at(turn.outgoing)
+		if turn.lane_in >= #ac.laneConfigs or turn.lane_out >= #bc.laneConfigs then error("the junction's lanes changed", 0) end
+		t.segment0, t.lane0, t.segment1, t.lane1 = a, turn.lane_in, b, turn.lane_out
+		t.withRoad, t.withTram = turn.road, turn.tram
+		turns[#turns+1] = t
+	end
+	for _, e in ipairs(config.crosswalks) do walks[#walks+1] = at(e) end
+	c.laneConnections, c.crosswalks = turns, walks
+	c.trafficLightPreference = api.type.enum.TrafficLightPreference[PREFERENCES[config.preference]]
+	if c.trafficLightPreference == nil then error("unknown traffic light preference", 0) end
+	c.doubleSlipSwitch, c.userModifiedTrafficLightStates = config.double_slip, config.custom_phases
+	local lights = c.trafficLightConfig
+	local phases = {}
+	for _, phase in ipairs(config.phases) do
+		local p = api.type.TrafficLightState.new()
+		local locked, seen = {}, {}
+		for _, index in ipairs(phase.locked) do
+			if index < 0 or index >= #turns+#walks or seen[index] then error("invalid locked lane in traffic lights", 0) end
+			seen[index], locked[#locked+1] = true, index
+		end
+		if phase.minimum < 0 or phase.minimum > phase.duration or phase.duration > 86400 then error("invalid traffic light duration", 0) end
+		p.lockedLanes, p.duration, p.minDuration, p.canSkip = locked, phase.duration, phase.minimum, phase.skip
+		phases[#phases+1] = p
+	end
+	local light = config.light and api.res.trafficLightTypeRep.find(config.light) or -1
+	if config.light and (type(light) ~= "number" or light < 0) then error("missing traffic light resource", 0) end
+	lights.states, lights.trafficLightType = phases, light
+	c.trafficLightConfig = lights
+	return c
+end
+
+-- Add configs to a SimpleProposal. Match in three dimensions and reject
+-- ambiguous parallel edges/nodes instead of picking a game's lowest id.
+-- `preserve` names the existing nodes whose incident edges are rebuilt.
+function junctions.into(proposal, changes, preserve, mine)
+	if #(changes or {}) == 0 and #(preserve or {}) == 0 then return end
+	local s = proposal.streetProposal
+	local w = world(s)
+	local removedNodes = {}
+	for _, id in ipairs(list(s.nodesToRemove)) do removedNodes[id] = true end
+	local allEdges, allNodes = {}, {}
+	for _, kind in ipairs({ "Street", "Track" }) do
+		for node, ids in pairs(api.engine.system.streetSystem["getNode2" .. kind .. "EdgeMap"]()) do
+			if not removedNodes[node] then
+				allNodes[#allNodes+1] = { id = node, network = kind, at = w.position(node) }
+			end
+			for _, id in ipairs(list(ids)) do
+				if not w.removed[id] and not allEdges[id] then allEdges[id] = { ref = w.edge(id), comp = component(id,"BASE_EDGE") } end
+			end
+		end
+	end
+	for id, p in pairs(w.nodes) do
+		local n = w.node(id)
+		allNodes[#allNodes+1] = { id = id, network = n.network, at = p }
+	end
+	for id, e in pairs(w.edges) do allEdges[id] = { ref = w.edge(id), comp = e.comp } end
+	local function resolveNode(ref)
+		local found
+		for _, n in ipairs(allNodes) do
+			if n.network == ref.network and near(n.at, ref.at) then
+				if found and found ~= n.id then error("ambiguous junction position", 0) end
+				found = n.id
+			end
+		end
+		if not found then error("the junction no longer exists", 0) end
+		return found
+	end
+	local function resolveEdge(ref, allowMissing)
+		local found, comp
+		for id, e in pairs(allEdges) do
+			local a, b = e.ref.ends, ref.ends
+			if ref.network == e.ref.network and ((near(a.a,b.a) and near(a.b,b.b)) or (near(a.a,b.b) and near(a.b,b.a))) then
+				if found then error("ambiguous junction edge", 0) end
+				found, comp = id, e.comp
+			end
+		end
+		if not found then
+			if allowMissing then return nil end
+			error("the junction's road or track changed", 0)
+		end
+		if mine and found >= 0 then mine(found, "junction edge") end
+		return found, comp
+	end
+	local adds, removes, handled = {}, {}, {}
+	local function add(node, c)
+		local n = api.type.BaseNodeLaneConnectionAndEntity.new()
+		n.entity, n.comp = node, c
+		adds[#adds+1] = n
+	end
+	local function remove(node)
+		if node >= 0 and component(node,"BASE_NODE_CONFIG") ~= nil then removes[#removes+1] = node end
+	end
+	for _, change in ipairs(changes or {}) do
+		local node = resolveNode(change.node)
+		if handled[node] then error("a junction changed twice", 0) end
+		handled[node] = true
+		if mine and node >= 0 then
+			for _, kind in ipairs({"Street", "Track"}) do
+				for _, id in ipairs(list(api.engine.system.streetSystem["getNode"..kind.."Segments"](node))) do mine(id,"junction edge") end
+			end
+		end
+		remove(node)
+		if change.config then add(node, makeConfig(change.config, resolveEdge, node)) end
+	end
+	-- A geometry rebuild must not throw away settings. The original turns
+	-- keep their order (and hence phase indices); their old edges are mapped
+	-- to the unique replacement leaving this same node in the same direction.
+	for _, node in ipairs(preserve or {}) do
+		if not handled[node] and not removedNodes[node] then
+			handled[node] = true
+			local old = component(node, "BASE_NODE_CONFIG")
+			if old then
+				local base = world(nil)
+				local config = captureConfig(old, base)
+				local function remap(ref)
+					local id, comp = resolveEdge(ref, true)
+					if id then return id, comp end
+					-- A split of a curved road preserves the endpoint tangent,
+					-- not the chord between its old endpoints. Find that exact
+					-- original edge and require one replacement with its tangent.
+					local original
+					for gone in pairs(w.removed) do
+						local r, c = base.edge(gone)
+						if edgeKey(r) == edgeKey(ref) then
+							if original then error("ambiguous original junction edge",0) end
+							original = c
+						end
+					end
+					if not original then error("missing original junction edge",0) end
+					local function direction(c)
+						local d = pos(c.node0 == node and c.tangent0 or c.tangent1)
+						local sign = c.node0 == node and 1 or -1
+						return d.x*sign,d.y*sign,d.z*sign
+					end
+					local dx,dy,dz = direction(original)
+					local len = math.sqrt(dx*dx+dy*dy+dz*dz)
+					local found, c
+					for candidate,e in pairs(w.edges) do
+						local n0,n1 = e.comp.node0,e.comp.node1
+						if n0 == node or n1 == node then
+							local er = allEdges[candidate].ref
+							local x,y,z = direction(e.comp)
+							local l = math.sqrt(x*x+y*y+z*z)
+							if er.network == ref.network and len > 0 and l > 0 and (x*dx+y*dy+z*dz)/(l*len) > 0.99999 then
+								if found then error("ambiguous replacement for a junction edge", 0) end
+								found,c = candidate,e.comp
+							end
+						end
+					end
+					if not found then error("cannot preserve junction settings across this rebuild", 0) end
+					return found,c
+				end
+				remove(node)
+				add(node, makeConfig(config, remap, node))
+			end
+		end
+	end
+	if #adds > 0 then s.nodeConfigsToAdd = adds end
+	if #removes > 0 then s.nodeConfigsToRemove = removes end
+end
+
+-- Canonical, portable rows for checkpoints. Phase indices are expressed as
+-- the turns/crosswalks they lock, so local entity/vector ordering is irrelevant.
+function junctions.rows(api)
+	local w, rows, seen = world(nil, api), {}, {}
+	for _, kind in ipairs({"Street", "Track"}) do
+		for node in pairs(api.engine.system.streetSystem["getNode2"..kind.."EdgeMap"]()) do
+			if not seen[node] then
+				seen[node] = true
+				local c = component(node,"BASE_NODE_CONFIG",api)
+				if c then
+					local v, lanes = captureConfig(c,w,api), {}
+					for _, t in ipairs(v.connections) do lanes[#lanes+1] = edgeKey(t.incoming)..":"..t.lane_in..">"..edgeKey(t.outgoing)..":"..t.lane_out..":"..tostring(t.road)..":"..tostring(t.tram) end
+					for _, e in ipairs(v.crosswalks) do lanes[#lanes+1] = "walk:"..edgeKey(e) end
+					local sorted = list(lanes) table.sort(sorted)
+					local phases = {}
+					for _, phase in ipairs(v.phases) do
+						local locked = {}
+						for _, i in ipairs(phase.locked) do
+							if not lanes[i+1] then error("traffic phase references no lane",0) end
+							locked[#locked+1] = lanes[i+1]
+						end
+						table.sort(locked)
+						phases[#phases+1] = string.format("%.3f/%.3f/%s:%s",phase.duration,phase.minimum,tostring(phase.skip),table.concat(locked,","))
+					end
+					rows[#rows+1] = nodeKey(w.node(node)).."|"..table.concat(sorted,";").."|"..v.preference.."|"..(v.light or "default").."|"..tostring(v.double_slip).."|"..tostring(v.custom_phases).."|"..table.concat(phases,";")
+				end
+			end
+		end
+	end
+	table.sort(rows)
+	return rows
+end
+
+return junctions

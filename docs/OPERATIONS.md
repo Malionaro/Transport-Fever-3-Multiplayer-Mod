@@ -408,15 +408,17 @@ either.
    Caddy block under [Tunnels](#tunnels)), and check it from another
    machine with `tpf3mp-agent connect <host>:29470`.
 4. **Set the variable `TPF3MP_DEFAULT_SERVER`** to its `host:port`: the
-   server every player plays on, and the only one (D12 in
-   [DECISIONS.md](DECISIONS.md)).
+   server every player plays on by default (D12 in
+   [DECISIONS.md](DECISIONS.md); under its proposed amendment players may
+   change it in Settings). For the project's relay that is
+   `tpf3mp.213-133-98-90.sslip.io:29470`, with `TPF3MP_SERVER_NAME` `EU`.
 5. **Rebuild the draft:** re-run the latest `release` run of `main` (in
    Actions), or promote a new commit to `main`. It stops, and makes no
    draft, while `TPF3MP_UPDATE_PUBLIC_KEY` or `TPF3MP_DEFAULT_SERVER` is
    missing.
 6. **Try the draft's packages:** on each platform, download the package
    from the draft, start the launcher and connect; it names the server by
-   itself, and offers no other.
+   itself, and connects there without being told.
 7. **Publish the draft,** then approve the `sign` run waiting in Actions:
    the release gets its `release.json` and `release.json.sig`, which
    launchers update from. Publishing also starts `image.yml`, which
@@ -447,21 +449,36 @@ runs on distributions with an older C library too.
 - **The server players play on.** Set the repository variable
   `TPF3MP_DEFAULT_SERVER` (Settings, Secrets and variables, Actions,
   Variables) to the public server's `host:port`. It is built into the
-  packages' launcher, which plays on it and on no other: players do not
-  type a server, and an invite that names another is refused (D12 in
-  [DECISIONS.md](DECISIONS.md)). `TPF3MP_SERVER_NAME`, such as `EU`, is
-  what the launcher shows of it instead of its address, with a dot that
+  packages' launcher as its default server (D12 in
+  [DECISIONS.md](DECISIONS.md)): an invite that names another server is
+  refused. Under D12's proposed amendment players may change the server
+  in Settings (remembered in `launcher.json` as `chosen_server`), and
+  **Reset to default** returns to this one. A build without the variable,
+  as a developer's, defaults to the project's relay
+  (`tpf3mp.213-133-98-90.sslip.io:29470`, shown as `EU`; `setup::RELAY`
+  in `tpf3mp-agent`), but the workflow still drafts no release without
+  it, so each release names its server on purpose. `TPF3MP_SERVER_NAME`,
+  such as `EU`, is what the launcher shows of the default server instead
+  of its address, with a dot that
   is green while the server answers `https://<host>/tpf3mp/health`, the
   one path of its admin endpoint the host's nginx passes on
   (`deploy/nginx.conf.example`). No draft is made without it. For
   development and playtests, `--server <host:port>` on the launcher's
-  command line plays on another server instead; a launcher built without
-  either, as a developer's own, asks for the server. The packages also
+  command line plays on another server for that run, over the player's
+  setting. The launcher trusts a server by the public certificate
+  authorities, so a server players choose needs a real certificate, as
+  the relay's (Let's Encrypt, for its sslip.io name) is; `--pin-cert` is
+  for development servers. The packages also
   carry `PLAYING.md`.
 - **Updates.** The launcher installs a release only if it is signed with
   a key it trusts. Whoever holds that key can run code on every player's
   machine, so it lives where no branch or workflow but one can read it,
-  and every signing needs your approval. Set it up once:
+  and every signing needs your approval. Set it up once, the repository's
+  owner, by hand: `tools/github/setup-update-key.cmd` (double-click it on
+  Windows; it needs `gh` signed in as the owner) does the three steps
+  below, keeps the private key in a folder you pick outside every
+  repository, never prints it, and re-runs the last release run of `main`.
+  Or by hand:
 
   1. Create the key on a trusted machine, and keep a copy of the `.pem`
      offline:

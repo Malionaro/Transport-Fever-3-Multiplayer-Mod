@@ -11,13 +11,16 @@
 //! the link over already greeted, and gives it back when it ends.
 
 use tpf3mp_bridge::{
-    BRIDGE_VERSION, LobbyAction, LobbyConnection, LobbyLine, LobbyMember, LobbyRoom, LobbyView,
-    MAX_LOBBY_CHAT, ToAgent, ToHook, check_version, decode, encode,
+    BRIDGE_VERSION, LobbyAction, LobbyConnection, LobbyHave, LobbyLine, LobbyMember, LobbyMod,
+    LobbyModClass, LobbyPublicRoom, LobbyRoom, LobbyRoomList, LobbyRoomMod, LobbyRules, LobbyView,
+    LobbyWorld, MAX_LOBBY_CHAT, MAX_LOBBY_MODS, MAX_LOBBY_ROOM_MODS, MAX_LOBBY_RULES,
+    MAX_LOBBY_SAVES, MAX_SAVE_NAME, ModName, SaveName, ToAgent, ToHook, check_version, decode,
+    encode,
 };
 use tpf3mp_proto::{BoundedVec, Text};
 use tracing::{debug, info, warn};
 
-use super::api::{self, Action, Connection, MemberContent, Phase, State};
+use super::api::{self, Action, Connection, MemberContent, ModClass, ModHave, Phase, State, World};
 use crate::bridge::{BridgeFault, HookLink};
 
 /// The lobby the menu's window shows, from what the launcher shows.
@@ -58,14 +61,17 @@ pub(crate) fn view(state: &State) -> LobbyView {
                             MemberContent::Differs => Some(false),
                             MemberContent::Unknown => None,
                         },
+                        banner: member.banner.as_deref().and_then(banner),
                     })
                 })
                 .take(usize::from(tpf3mp_proto::MAX_ROOM_MEMBERS))
                 .collect(),
         )
         .unwrap_or_default(),
+        competitive: room.competitive,
     });
     LobbyView {
+        banner: state.banner.as_deref().and_then(banner),
         connection: match state.connection {
             Connection::Disconnected => LobbyConnection::Disconnected,
             Connection::Connecting => LobbyConnection::Connecting,
@@ -78,16 +84,137 @@ pub(crate) fn view(state: &State) -> LobbyView {
                 .or(state.server.as_deref())
                 .unwrap_or_default(),
         ),
+        server_address: Text::lossy(state.server.as_deref().unwrap_or_default()),
+        server_default: Text::lossy(state.server_default.as_deref().unwrap_or_default()),
         name: Text::lossy(&state.name),
         error: state.error.as_deref().map(Text::lossy),
-        notice: state.notices.last().map(|notice| Text::lossy(notice)),
+        // The newest notice meant for the game: the one that says the
+        // launcher started it is for the launcher's window, and out of
+        // place in the game it started.
+        notice: state
+            .notices
+            .iter()
+            .rev()
+            .find(|notice| notice.as_str() != super::GAME_STARTED)
+            .map(|notice| Text::lossy(notice)),
         room,
         chat: BoundedVec::new(chat).unwrap_or_default(),
+        rules: BoundedVec::new(
+            state
+                .rules
+                .iter()
+                .take(MAX_LOBBY_RULES)
+                .map(|rules| LobbyRules {
+                    name: Text::lossy(&rules.name),
+                    description: Text::lossy(&rules.description),
+                })
+                .collect(),
+        )
+        .unwrap_or_default(),
+        saves: BoundedVec::new(
+            state
+                .saves
+                .iter()
+                .filter_map(|name| save(name))
+                .take(MAX_LOBBY_SAVES)
+                .collect(),
+        )
+        .unwrap_or_default(),
+        start_save: state.start_save.as_deref().and_then(save),
+        world: match state.game.world {
+            World::None => LobbyWorld::None,
+            World::Fetching => LobbyWorld::Fetching {
+                bytes: state.game.bytes,
+                total: state.game.total,
+            },
+            World::Loading => LobbyWorld::Loading,
+            World::Playing => LobbyWorld::Playing,
+        },
+        differences: state
+            .content_diff
+            .as_ref()
+            .map(|diff| Text::lossy(&diff.summary)),
+        // A mod whose id is too long to name whole is left out: a shortened
+        // one would name no mod.
+        mods: BoundedVec::new(
+            state
+                .mods
+                .iter()
+                .filter_map(|m| {
+                    Some(LobbyMod {
+                        id: ModName::new(&m.id).ok()?,
+                        name: Text::lossy(&m.name),
+                        class: match m.class {
+                            ModClass::Personal => LobbyModClass::Personal,
+                            ModClass::Carried => LobbyModClass::Carried,
+                            ModClass::Shared => LobbyModClass::Shared,
+                        },
+                        reason: Text::lossy(&m.reason),
+                        chosen: m.chosen,
+                        choosable: m.choosable,
+                    })
+                })
+                .take(MAX_LOBBY_MODS)
+                .collect(),
+        )
+        .unwrap_or_default(),
+        room_mods: BoundedVec::new(
+            state
+                .room_mods
+                .iter()
+                .take(MAX_LOBBY_ROOM_MODS)
+                .map(|m| LobbyRoomMod {
+                    id: Text::lossy(&m.id),
+                    version: Text::lossy(&m.version),
+                    have: match m.have {
+                        ModHave::Yes => LobbyHave::Yes,
+                        ModHave::No => LobbyHave::No,
+                        ModHave::OtherVersion => LobbyHave::OtherVersion,
+                    },
+                })
+                .collect(),
+        )
+        .unwrap_or_default(),
+        room_mods_more: u32::try_from(state.room_mods.len().saturating_sub(MAX_LOBBY_ROOM_MODS))
+            .unwrap_or(u32::MAX),
+        rooms: state.rooms.as_ref().map(|list| LobbyRoomList {
+            page: list.page,
+            more: list.more,
+            rooms: BoundedVec::new(
+                list.rooms
+                    .iter()
+                    .take(tpf3mp_proto::ROOMS_PER_PAGE)
+                    .map(|room| LobbyPublicRoom {
+                        invite: Text::lossy(&room.invite),
+                        name: Text::lossy(&room.name),
+                        rules: Text::lossy(&room.rules),
+                        players: room.players,
+                        max_players: room.max_players,
+                        has_password: room.has_password,
+                        running: room.running,
+                        map: Text::lossy(&room.map),
+                        year: room.year,
+                        companies: room.companies,
+                        competitive: room.competitive,
+                    })
+                    .collect(),
+            )
+            .unwrap_or_default(),
+        }),
     }
+}
+
+/// A save's name as the window lists it; a name too long to name whole is
+/// left out, since a shortened one would name no save.
+fn save(name: &str) -> Option<SaveName> {
+    (name.len() <= MAX_SAVE_NAME)
+        .then(|| Text::new(name).ok())
+        .flatten()
 }
 
 /// The launcher action a button of the menu's window stands for. Connect
 /// goes to the server the launcher plays on (D12): the window names none.
+/// The server setting changes that server, as in the launcher's window.
 pub(crate) fn action(action: LobbyAction, state: &State) -> Action {
     match action {
         LobbyAction::Connect { name } => Action::Connect {
@@ -99,12 +226,23 @@ pub(crate) fn action(action: LobbyAction, state: &State) -> Action {
             room,
             max_players,
             password,
+            rules,
+            start_save,
+            listing,
+            competitive,
         } => Action::Create {
             room: room.as_str().to_owned(),
             max_players,
             password: password.map(|password| password.as_str().to_owned()),
-            rules: None,
+            rules: rules.map(|rules| rules.as_str().to_owned()),
+            start_save: start_save.map(|save| save.as_str().to_owned()),
+            listing: listing.map(|listing| api::Listing {
+                map: listing.map.as_str().to_owned(),
+                year: listing.year,
+            }),
+            competitive,
         },
+        LobbyAction::ListRooms { page } => Action::ListRooms { page },
         LobbyAction::Join { invite, password } => Action::Join {
             invite: invite.as_str().to_owned(),
             password: password.map(|password| password.as_str().to_owned()),
@@ -118,7 +256,24 @@ pub(crate) fn action(action: LobbyAction, state: &State) -> Action {
             text: text.as_str().to_owned(),
         },
         LobbyAction::Leave => Action::Leave,
+        LobbyAction::ChooseMod { id, chosen } => Action::ChooseMod {
+            id: id.as_str().to_owned(),
+            chosen,
+        },
+        LobbyAction::SetServer { server } => Action::SetServer {
+            server: server.as_str().to_owned(),
+        },
+        LobbyAction::SetBanner { banner } => Action::SetBanner {
+            banner: banner.map(|id| id.as_str().to_owned()),
+        },
     }
+}
+
+/// A banner id as the window may show it: one of the known ones.
+fn banner(id: &str) -> Option<tpf3mp_proto::BannerId> {
+    tpf3mp_proto::is_banner(id)
+        .then(|| Text::new(id).ok())
+        .flatten()
 }
 
 /// The game's link while no room session holds it.
@@ -200,7 +355,7 @@ impl<L: HookLink> IdleLink<L> {
             }
         }
         if self.build.is_some() && self.told.as_ref() != Some(lobby) {
-            let bytes = encode(&ToHook::Lobby(lobby.clone()))?;
+            let bytes = encode(&ToHook::Lobby(Box::new(lobby.clone())))?;
             if self.link.send(&bytes)? {
                 self.told = Some(lobby.clone());
             }
@@ -219,7 +374,7 @@ pub(crate) mod tests {
     use tpf3mp_proto::{FixedBytes, PlayerId};
 
     use super::*;
-    use crate::launcher::{ChatLine, Member, Room};
+    use crate::launcher::{ChatLine, Differences, Game, Member, Room, RulesChoice};
 
     /// Both ends of a link in memory: what each side sent the other.
     #[derive(Clone, Default)]
@@ -300,20 +455,26 @@ pub(crate) mod tests {
                 ToHook::Hello {
                     version: BRIDGE_VERSION
                 },
-                ToHook::Lobby(lobby("Ann"))
+                ToHook::Lobby(Box::new(lobby("Ann")))
             ]
         );
         // Unchanged, it is not sent again; changed, it is.
         idle.pump(&lobby("Ann")).unwrap();
         assert!(fake.hook_hears().is_empty());
         idle.pump(&lobby("Ann B")).unwrap();
-        assert_eq!(fake.hook_hears(), vec![ToHook::Lobby(lobby("Ann B"))]);
+        assert_eq!(
+            fake.hook_hears(),
+            vec![ToHook::Lobby(Box::new(lobby("Ann B")))]
+        );
 
         // Given back by a session, the lobby goes out again at once.
         let (link, build) = idle.into_parts();
         let mut idle = IdleLink::resumed(link, build);
         idle.pump(&lobby("Ann B")).unwrap();
-        assert_eq!(fake.hook_hears(), vec![ToHook::Lobby(lobby("Ann B"))]);
+        assert_eq!(
+            fake.hook_hears(),
+            vec![ToHook::Lobby(Box::new(lobby("Ann B")))]
+        );
     }
 
     #[test]
@@ -336,6 +497,7 @@ pub(crate) mod tests {
             name: "Ann".into(),
             player: Some(ann.to_string()),
             server: Some("tpf3mp.example.org:29470".into()),
+            server_default: Some("tpf3mp.example.org:29470".into()),
             server_name: Some("EU".into()),
             connection: Connection::Connected,
             error: Some("that room is full".into()),
@@ -358,6 +520,7 @@ pub(crate) mod tests {
                         owner: true,
                         you: true,
                         content: MemberContent::Same,
+                        banner: None,
                     },
                     Member {
                         id: "not a player".into(),
@@ -368,8 +531,10 @@ pub(crate) mod tests {
                         owner: false,
                         you: false,
                         content: MemberContent::Unknown,
+                        banner: None,
                     },
                 ],
+                competitive: false,
             }),
             chat: (0..50)
                 .map(|n| ChatLine {
@@ -378,8 +543,83 @@ pub(crate) mod tests {
                     you: false,
                 })
                 .collect(),
+            rules: vec![RulesChoice {
+                name: "native".into(),
+                description: "The game's own economy".into(),
+            }],
+            saves: vec![
+                "mptest".into(),
+                "x".repeat(MAX_SAVE_NAME + 1),
+                "older".into(),
+            ],
+            start_save: Some("mptest".into()),
+            game: Game {
+                world: World::Fetching,
+                bytes: 10,
+                total: 40,
+                ..Game::default()
+            },
+            content_diff: Some(Differences {
+                summary: "you lack stations 3".into(),
+                ..Differences::default()
+            }),
+            mods: vec![
+                api::ModRow {
+                    id: "schbrongx_minimap".into(),
+                    name: "Minimap".into(),
+                    class: ModClass::Personal,
+                    reason: "only what this player sees".into(),
+                    chosen: true,
+                    choosable: true,
+                },
+                api::ModRow {
+                    id: "m".repeat(200),
+                    name: "A mod whose id is too long".into(),
+                    class: ModClass::Shared,
+                    reason: String::new(),
+                    chosen: false,
+                    choosable: false,
+                },
+            ],
+            room_mods: (0..40)
+                .map(|n| api::RoomModRow {
+                    id: format!("pack{n}"),
+                    version: "1".into(),
+                    have: if n == 0 { ModHave::No } else { ModHave::Yes },
+                })
+                .collect(),
             ..State::default()
         }
+    }
+
+    #[test]
+    fn the_menus_window_sees_the_players_mods_and_the_rooms() {
+        let view = view(&state());
+        assert_eq!(
+            view.mods.len(),
+            1,
+            "an id too long to name whole is left out"
+        );
+        let minimap = &view.mods[0];
+        assert_eq!(minimap.id.as_str(), "schbrongx_minimap");
+        assert_eq!(minimap.class, LobbyModClass::Personal);
+        assert!(minimap.chosen && minimap.choosable);
+        assert_eq!(view.room_mods.len(), MAX_LOBBY_ROOM_MODS);
+        assert_eq!(view.room_mods[0].have, LobbyHave::No);
+        assert_eq!(view.room_mods_more, 8);
+        assert_eq!(
+            action(
+                LobbyAction::ChooseMod {
+                    id: Text::new("schbrongx_minimap").unwrap(),
+                    chosen: false
+                },
+                &state()
+            ),
+            Action::ChooseMod {
+                id: "schbrongx_minimap".into(),
+                chosen: false
+            }
+        );
     }
 
     #[test]
@@ -387,9 +627,18 @@ pub(crate) mod tests {
         let view = view(&state());
         assert_eq!(view.connection, LobbyConnection::Connected);
         assert_eq!(view.server.as_str(), "EU", "as players see it");
+        assert_eq!(view.server_address.as_str(), "tpf3mp.example.org:29470");
+        assert_eq!(view.server_default.as_str(), "tpf3mp.example.org:29470");
         assert_eq!(view.error.as_ref().unwrap().as_str(), "that room is full");
         assert_eq!(view.notice.as_ref().unwrap().as_str(), "new", "the newest");
-        assert!(encode(&ToHook::Lobby(view.clone())).is_ok());
+        let mut started = state();
+        started.notices.push(super::super::GAME_STARTED.into());
+        assert_eq!(
+            super::view(&started).notice.unwrap().as_str(),
+            "new",
+            "the launcher's own notice stays in the launcher"
+        );
+        assert!(encode(&ToHook::Lobby(Box::new(view.clone()))).is_ok());
         let room = view.room.unwrap();
         assert!(!room.running && room.you_own);
         assert_eq!(room.invite.unwrap().as_str(), "K7QM2X");
@@ -400,6 +649,21 @@ pub(crate) mod tests {
             view.chat.last().unwrap().text.as_str(),
             "line 49",
             "the newest"
+        );
+        assert_eq!(view.rules[0].name.as_str(), "native");
+        let saves: Vec<&str> = view.saves.iter().map(Text::as_str).collect();
+        assert_eq!(saves, ["mptest", "older"], "a name too long is left out");
+        assert_eq!(view.start_save.as_ref().unwrap().as_str(), "mptest");
+        assert_eq!(
+            view.world,
+            LobbyWorld::Fetching {
+                bytes: 10,
+                total: 40
+            }
+        );
+        assert_eq!(
+            view.differences.as_ref().unwrap().as_str(),
+            "you lack stations 3"
         );
     }
 
@@ -424,6 +688,13 @@ pub(crate) mod tests {
                     room: Text::lossy("Alps"),
                     max_players: 4,
                     password: None,
+                    rules: Some(Text::lossy("native")),
+                    start_save: Some(Text::lossy("mptest")),
+                    listing: Some(tpf3mp_bridge::LobbyListing {
+                        map: Text::lossy("dry"),
+                        year: 1900,
+                    }),
+                    competitive: false,
                 },
                 &state
             ),
@@ -431,7 +702,28 @@ pub(crate) mod tests {
                 room: "Alps".into(),
                 max_players: 4,
                 password: None,
-                rules: None,
+                rules: Some("native".into()),
+                start_save: Some("mptest".into()),
+                listing: Some(api::Listing {
+                    map: "dry".into(),
+                    year: 1900,
+                }),
+                competitive: false,
+            }
+        );
+        assert_eq!(
+            action(LobbyAction::ListRooms { page: 2 }, &state),
+            Action::ListRooms { page: 2 }
+        );
+        assert_eq!(
+            action(
+                LobbyAction::SetBanner {
+                    banner: Some(Text::lossy("dry"))
+                },
+                &state
+            ),
+            Action::SetBanner {
+                banner: Some("dry".into())
             }
         );
         let bo = PlayerId(FixedBytes([2; 32]));
@@ -443,6 +735,17 @@ pub(crate) mod tests {
         );
         assert_eq!(action(LobbyAction::Start, &state), Action::Start);
         assert_eq!(action(LobbyAction::Leave, &state), Action::Leave);
+        assert_eq!(
+            action(
+                LobbyAction::SetServer {
+                    server: Text::lossy("play.example.net:29470")
+                },
+                &state
+            ),
+            Action::SetServer {
+                server: "play.example.net:29470".into()
+            }
+        );
     }
 
     #[test]

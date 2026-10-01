@@ -60,11 +60,12 @@ use std::{
 
 use ring::digest::{SHA256, digest};
 use tpf3mp_bridge::{
-    Begin, Game, LobbyAction, LobbyView, Notice, SaveOrder, Session, SessionError, StepGate,
+    Begin, Game, LobbyAction, LobbyView, ModLists, Notice, SaveOrder, Session, SessionError,
+    StepGate,
 };
 use tpf3mp_proto::{
-    ChatText, Cursor, Event, EventBody, FixedBytes, LaneDigest, Payload, PlayerId, Speed,
-    action::Action,
+    ChatText, Cursor, Event, EventBody, FixedBytes, LaneDigest, Payload, PlayerId, Seal, Secret,
+    Speed, action::Action,
 };
 
 use crate::lanedump::{self, DumpOrder, LaneDumps};
@@ -94,7 +95,9 @@ pub trait RoomGate {
     fn after_step(&mut self, game: &mut HookGame) -> Result<u64, SessionError>;
     fn loaded(&mut self, next_step: u64) -> Result<(), SessionError>;
     fn request_speed(&mut self, speed: Speed) -> Result<(), SessionError>;
-    fn command(&mut self, payload: Payload) -> Result<u64, SessionError>;
+    /// Hands the room a player's action, with the password it needs, if
+    /// any, which the room seals.
+    fn command(&mut self, payload: Payload, secret: Option<Secret>) -> Result<u64, SessionError>;
     /// Says `text` to the room for the player.
     fn chat(&mut self, text: ChatText) -> Result<(), SessionError>;
     /// Before the room begins: the game's world number `world` is up. Says
@@ -157,6 +160,8 @@ pub trait GameControl: Send {
     fn room_notice(&mut self, notice: &Notice);
     /// Tells the game's Multiplayer window which player is this game's.
     fn set_me(&mut self, player: PlayerId);
+    /// The mods the room's worlds load with (`ToHook::Begin`'s `mods`).
+    fn set_mods(&mut self, mods: Option<ModLists>);
     /// The number of a world whose GUI started with the mod linked, since
     /// the last call, if one did: the latest. Once.
     fn world_up(&mut self) -> Option<u64>;
@@ -207,8 +212,8 @@ impl RoomGate for Session {
     fn request_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
         Session::request_speed(self, speed)
     }
-    fn command(&mut self, payload: Payload) -> Result<u64, SessionError> {
-        Session::command(self, payload)
+    fn command(&mut self, payload: Payload, secret: Option<Secret>) -> Result<u64, SessionError> {
+        Session::command_with(self, payload, secret)
     }
     fn chat(&mut self, text: ChatText) -> Result<(), SessionError> {
         Session::chat(self, text)
@@ -251,8 +256,9 @@ pub struct HookGame {
     /// as the actor of the player's own commands.
     pub me: Option<PlayerId>,
     /// The actions the room ordered for the next step to run, in order,
-    /// each with its client sequence number when the local player sent it.
-    pub actions: Vec<(Action, Option<u64>, PlayerId)>,
+    /// each with its client sequence number when the local player sent it,
+    /// its sender, and the seal of the password sent with it.
+    pub actions: Vec<(Action, Option<u64>, PlayerId, Option<Seal>)>,
     /// The player's commands the room refused: their sequence numbers, and
     /// why.
     pub refused: Vec<(u64, String)>,
@@ -273,11 +279,12 @@ impl Game for HookGame {
             player,
             client_seq,
             payload,
+            seal,
         } = &event.body
         {
             let own = (self.me == Some(*player)).then_some(*client_seq);
             match Action::from_payload(payload) {
-                Ok(action) => self.actions.push((action, own, *player)),
+                Ok(action) => self.actions.push((action, own, *player, *seal)),
                 Err(error) => {
                     self.fault.get_or_insert(format!(
                         "the room ordered an action this game cannot read (event {}): {error}",
@@ -321,12 +328,19 @@ pub struct Ordered {
     pub ticket: Option<u64>,
     /// The player who sent it: the mod books it to that player's company.
     pub player: PlayerId,
+    /// The seal of the password sent with it (a company's), which the mod
+    /// compares with the seal it keeps; never the password.
+    pub seal: Option<Seal>,
 }
+
+/// One of the player's actions as the mod handed it over: its ticket, its
+/// payload, and the password it needs, if any.
+pub type Handed = (u64, Payload, Option<Secret>);
 
 /// What the detour hands each call to: a [`StepDriver`] over any room.
 pub trait StepHandler: Send {
     /// See [`StepDriver::on_step`].
-    fn on_step(&mut self, commands: Vec<(u64, Payload)>, run: &mut RunStep<'_>) -> Outcome;
+    fn on_step(&mut self, commands: Vec<Handed>, run: &mut RunStep<'_>) -> Outcome;
     fn take_log(&mut self) -> Vec<String>;
     /// See [`StepDriver::take_refused`].
     fn take_refused(&mut self) -> Vec<(u64, String)>;
@@ -347,7 +361,7 @@ pub trait StepHandler: Send {
 }
 
 impl<G: RoomGate + Send> StepHandler for StepDriver<G> {
-    fn on_step(&mut self, commands: Vec<(u64, Payload)>, run: &mut RunStep<'_>) -> Outcome {
+    fn on_step(&mut self, commands: Vec<Handed>, run: &mut RunStep<'_>) -> Outcome {
         StepDriver::on_step(self, commands, run)
     }
     fn take_log(&mut self) -> Vec<String> {
@@ -640,7 +654,7 @@ impl<G: RoomGate> StepDriver<G> {
     /// the player handed over since the last call, for the room; `run` runs
     /// the game's own step, exactly once, with the updates given and the
     /// room's actions for the step the batch starts at.
-    pub fn on_step(&mut self, commands: Vec<(u64, Payload)>, run: &mut RunStep<'_>) -> Outcome {
+    pub fn on_step(&mut self, commands: Vec<Handed>, run: &mut RunStep<'_>) -> Outcome {
         // A world is up: the next time the menu drives, the game came back
         // to it.
         self.at_menu = false;
@@ -667,10 +681,11 @@ impl<G: RoomGate> StepDriver<G> {
         let actions: Vec<Ordered> = if runs {
             std::mem::take(&mut self.game.actions)
                 .into_iter()
-                .map(|(action, own, player)| Ordered {
+                .map(|(action, own, player, seal)| Ordered {
                     action,
                     ticket: own.and_then(|seq| self.tickets.remove(&seq)),
                     player,
+                    seal,
                 })
                 .collect()
         } else {
@@ -817,7 +832,7 @@ impl<G: RoomGate> StepDriver<G> {
     /// Hands the player's actions to the room, in the room's game only: an
     /// action handed over nowhere never happens, which is what the mod
     /// expects of one it could not hand over.
-    fn hand_over(&mut self, commands: Vec<(u64, Payload)>) {
+    fn hand_over(&mut self, commands: Vec<Handed>) {
         if commands.is_empty() {
             return;
         }
@@ -826,15 +841,15 @@ impl<G: RoomGate> StepDriver<G> {
                 "refused {} action(s) of the player: the game is not following a room's game",
                 commands.len()
             ));
-            for (ticket, _) in commands {
+            for (ticket, ..) in commands {
                 self.refused
                     .push((ticket, "the game is not following a room's game".into()));
             }
             return;
         }
         let mut commands = commands.into_iter();
-        for (ticket, payload) in commands.by_ref() {
-            match self.gate.command(payload) {
+        for (ticket, payload, secret) in commands.by_ref() {
+            match self.gate.command(payload, secret) {
                 Ok(number) => {
                     self.tickets.insert(number, ticket);
                     self.log
@@ -847,7 +862,7 @@ impl<G: RoomGate> StepDriver<G> {
                 }
             }
         }
-        for (ticket, _) in commands {
+        for (ticket, ..) in commands {
             self.refused
                 .push((ticket, "the game stopped following the room".into()));
         }
@@ -944,6 +959,18 @@ impl<G: RoomGate> StepDriver<G> {
         self.checkpoint_interval = u64::from(begin.checkpoint_interval).max(1);
         self.game.me = Some(begin.player);
         self.control.set_me(begin.player);
+        match &begin.mods {
+            Some(mods) => self.log.push(format!(
+                "the room's worlds load with the {} shared mods and this player's {} personal ones",
+                mods.shared.len(),
+                mods.personal.len()
+            )),
+            None => self.log.push(
+                "no mod lists from the launcher: the room's worlds load with their saves' mods"
+                    .into(),
+            ),
+        }
+        self.control.set_mods(begin.mods.clone());
         self.phase = Phase::Running;
     }
 
@@ -1077,8 +1104,9 @@ impl<G: RoomGate> StepDriver<G> {
 
     /// At the game's main menu, with no world up, on each of the menu's
     /// frames (the step's detour gets no call there; `crate::install` calls
-    /// this only while this game has never stepped a world, no world's GUI
-    /// has started, and the menu can load a save, `crate::menu`). It
+    /// this only while no world is loaded, after a world only once it closed
+    /// and nothing loads, `crate::at_menu`, and the menu can load a save,
+    /// `crate::menu`). It
     /// follows the room as the step does, but runs nothing:
     ///
     /// - before the room begins a game, it reads whether it did, and tells
@@ -1201,6 +1229,8 @@ pub(crate) mod tests {
         /// Events each poll applies before it answers, one list a poll.
         pub(crate) events: VecDeque<Vec<Event>>,
         pub(crate) commands: Vec<Payload>,
+        /// The password handed over with each command.
+        pub(crate) secrets: Vec<Option<Secret>>,
         pub(crate) saves: Vec<Result<(), String>>,
         /// Steps between checkpoints, from the begin handed out.
         pub(crate) interval: u64,
@@ -1298,8 +1328,13 @@ pub(crate) mod tests {
             self.speeds.push(speed);
             Ok(())
         }
-        fn command(&mut self, payload: Payload) -> Result<u64, SessionError> {
+        fn command(
+            &mut self,
+            payload: Payload,
+            secret: Option<Secret>,
+        ) -> Result<u64, SessionError> {
             self.commands.push(payload);
+            self.secrets.push(secret);
             Ok(self.commands.len() as u64 - 1)
         }
         fn chat(&mut self, text: ChatText) -> Result<(), SessionError> {
@@ -1364,6 +1399,7 @@ pub(crate) mod tests {
         pub(crate) load_failure: Option<String>,
         pub(crate) room_notices: Vec<Notice>,
         pub(crate) me: Option<PlayerId>,
+        pub(crate) mods: Option<ModLists>,
         pub(crate) world_up: Option<u64>,
     }
 
@@ -1398,6 +1434,9 @@ pub(crate) mod tests {
         fn set_me(&mut self, player: PlayerId) {
             self.state.lock().unwrap().me = Some(player);
         }
+        fn set_mods(&mut self, mods: Option<ModLists>) {
+            self.state.lock().unwrap().mods = mods;
+        }
         fn world_up(&mut self) -> Option<u64> {
             self.state.lock().unwrap().world_up.take()
         }
@@ -1411,6 +1450,7 @@ pub(crate) mod tests {
                 player: PlayerId(FixedBytes([1; 32])),
                 client_seq: seq,
                 payload: action.to_payload().unwrap(),
+                seal: None,
             },
         }
     }
@@ -1426,6 +1466,7 @@ pub(crate) mod tests {
             checkpoint_interval: 50,
             saves: PathBuf::from("saves"),
             player: ME,
+            mods: None,
         }
     }
 
@@ -1469,7 +1510,10 @@ pub(crate) mod tests {
         applied: &mut Vec<(Updates, Vec<Action>)>,
         applies: bool,
     ) -> Updates {
-        let commands = commands.into_iter().map(|payload| (0, payload)).collect();
+        let commands = commands
+            .into_iter()
+            .map(|payload| (0, payload, None))
+            .collect();
         let outcome = driver.on_step(commands, &mut |batch| {
             applied.push((
                 batch.updates,
@@ -1722,26 +1766,47 @@ pub(crate) mod tests {
         // The room orders, for step 2, another player's action and then this
         // player's first command (the gate numbers it 0).
         let mut own = command_event(2, 2, &depot_build());
+        // Ordered with the seal of the password it went with.
+        let seal = Seal {
+            scope: 3,
+            tag: FixedBytes([5; 32]),
+        };
         if let EventBody::Command {
-            player, client_seq, ..
+            player,
+            client_seq,
+            seal: sealed,
+            ..
         } = &mut own.body
         {
             *player = ME;
             *client_seq = 0;
+            *sealed = Some(seal);
         }
         script
             .events
             .extend([vec![], vec![command_event(1, 2, &depot_build()), own]]);
         let (mut d, _) = driver(script);
         let payload = depot_build().to_payload().unwrap();
+        let secret = Secret {
+            scope: 3,
+            password: tpf3mp_proto::Text::new("pw").unwrap(),
+        };
         let mut tickets = Vec::new();
-        for commands in [vec![(7, payload)], Vec::new()] {
+        let mut seals = Vec::new();
+        for commands in [vec![(7, payload, Some(secret.clone()))], Vec::new()] {
             d.on_step(commands, &mut |batch| {
                 tickets.extend(batch.actions.iter().map(|o| o.ticket));
+                seals.extend(batch.actions.iter().map(|o| o.seal));
                 Ok(batch.lanes.then(Vec::new))
             });
         }
         assert_eq!(tickets, [None, Some(7)], "the ticket the mod was given");
+        assert_eq!(seals, [None, Some(seal)], "each action's seal beside it");
+        assert_eq!(
+            d.gate.secrets,
+            [Some(secret)],
+            "the password went to the room"
+        );
         assert!(d.take_refused().is_empty());
     }
 
@@ -1754,13 +1819,13 @@ pub(crate) mod tests {
         let (mut d, _) = driver(script);
         let payload = depot_build().to_payload().unwrap();
         // Before the room's game: refused at once.
-        d.on_step(vec![(3, payload.clone())], &mut |_| Ok(None));
+        d.on_step(vec![(3, payload.clone(), None)], &mut |_| Ok(None));
         assert_eq!(
             d.take_refused(),
             [(3, "the game is not following a room's game".to_owned())]
         );
         // Handed over as the gate's command 0, then refused by the room.
-        d.on_step(vec![(4, payload)], &mut |_| Ok(None));
+        d.on_step(vec![(4, payload, None)], &mut |_| Ok(None));
         d.game.notice(Notice::Refused {
             command: 0,
             reason: tpf3mp_proto::IntentRejection::RateLimited,

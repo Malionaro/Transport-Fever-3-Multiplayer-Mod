@@ -5,13 +5,16 @@
 -- `print` one global table, so the mod prints before it looks for it:
 --
 --   tpf3mp_native = {
---     version = 11,                 -- bridge.VERSION; anything else is refused
---     command = function(action),   -- the player acted: an action table, for
---                                   -- the room to order -> true, ticket |
---                                   -- false, why
+--     version = 12,                 -- bridge.VERSION; anything else is refused
+--     command = function(action, password), -- the player acted: an action
+--                                   -- table, for the room to order, and a
+--                                   -- company's password for joining or
+--                                   -- locking it, which the room seals
+--                                   -- -> true, ticket | false, why
 --     take    = function(),         -- in a game script's update: the actions
 --                                   -- the room ordered for this update, or nil,
---                                   -- and who sent each (64 hex digits)
+--                                   -- who sent each (64 hex digits), and each
+--                                   -- one's seal, { scope =, tag = } or false
 --     log     = function(line),     -- a line for hook.log
 --     poll    = function(),         -- in the GUI, every frame: what the hook
 --                                   -- asks, { save = name } or { load = name }
@@ -55,6 +58,16 @@
 --                                   -- (no more taken)
 --     cursor  = function(x, y, b, l),  -- optional; reports pointer/build preview
 --     cursors = function(),         -- optional; other players' pointers/previews
+--     mods    = function(list),     -- optional; the mods to load a save
+--                                   -- whose mods are `list` (names, one a
+--                                   -- line) with -> list, left out, added
+--                                   -- (the same way) | nil without the
+--                                   -- room's lists; mods() alone -> true
+--                                   -- | nil: whether the room gave them
+--     personal = function(),        -- optional; this player's personal
+--                                   -- mods (names, one a line) | nil
+--     shared  = function(),         -- optional; the room's shared mods
+--                                   -- (names, one a line) | nil
 --     note    = function(key, value), -- a short string one of the game's
 --                                   -- Lua states notes for the others ("" to
 --                                   -- forget); note(key) reads it -> string
@@ -82,8 +95,11 @@
 
 local bridge = {}
 
--- 12: pointers and build preview cursor sync (`cursor`, `cursors`);
--- 11: notes between Lua states (`note`), for the stop tool;
+-- 13: pointers and build preview cursor sync (`cursor`, `cursors`);
+-- 12: company passwords: `command` takes a password beside the action,
+-- which the room seals, and `take` hands each action's seal third;
+-- 11: `note`, a short string one of the game's Lua states notes for the
+-- others (the two were each 11 on their own branches);
 -- 10: companies: `take` also names who sent each action, `status` each
 -- player's id (`id`, `me_id`);
 -- 9: the Multiplayer window: the room, its chat (`status`, `chat`, `say`);
@@ -112,7 +128,7 @@ function bridge.attach(native)
 	end
 	for _, name in ipairs({ "command", "take", "log", "poll", "saved", "world", "room",
 			"checkpoint", "lanes", "clicks", "replaying", "applied", "results", "status", "chat",
-			"say", "note" }) do
+			"say" }) do
 		if type(native[name]) ~= "function" then
 			return nil, "the hook has no " .. name .. "()"
 		end
@@ -133,10 +149,13 @@ end
 -- Hands an action table to the room. Returns true and the action's ticket,
 -- which results() names when this game applies the action or never will; or
 -- nil and why not: an action that was not handed over must not be applied
--- locally either.
-function Link:command(action)
+-- locally either. `password`, for joining or locking a company only, goes to
+-- the room beside it, which orders the action with the password's seal; it
+-- is never logged, and no answer quotes it.
+function Link:command(action, password)
 	if type(action) ~= "table" then return nil, "an action is a table" end
-	local ok, result, reason = pcall(self.native.command, action)
+	if password ~= nil and type(password) ~= "string" then return nil, "a password is text" end
+	local ok, result, reason = pcall(self.native.command, action, password)
 	if not ok then return nil, "the hook refused: " .. tostring(result) end
 	if result ~= true then
 		return nil, "the hook refused the action: " .. tostring(reason or "no reason given")
@@ -201,13 +220,15 @@ function Link:cursors()
 	return cursors
 end
 
--- The actions the room ordered for this update, as a list, or nil; and who
--- sent each, a list of player ids (64 hex digits) beside it.
+-- The actions the room ordered for this update, as a list, or nil; who
+-- sent each, a list of player ids (64 hex digits) beside it; and the seal of
+-- the password each was sent with, { scope =, tag = }, or false.
 function Link:take()
-	local ok, actions, origins = pcall(self.native.take)
+	local ok, actions, origins, seals = pcall(self.native.take)
 	if not ok or type(actions) ~= "table" then return nil end
 	if type(origins) ~= "table" then origins = {} end
-	return actions, origins
+	if type(seals) ~= "table" then seals = {} end
+	return actions, origins, seals
 end
 
 function Link:log(line)
@@ -308,6 +329,52 @@ function Link:dumped(lane, entry)
 	if type(self.native.dumped) ~= "function" then return false end
 	local ok, taken = pcall(self.native.dumped, lane, tostring(entry))
 	return ok and taken == true
+end
+
+-- Names in a text, one a line.
+local function lines(text)
+	local out = {}
+	if type(text) ~= "string" then return out end
+	for name in string.gmatch(text, "[^\n]+") do out[#out + 1] = name end
+	return out
+end
+
+-- Whether the room gave the mods its worlds load with (docs/MODS.md); false
+-- from a hook without `mods` (it is optional).
+function Link:hasMods()
+	if type(self.native.mods) ~= "function" then return false end
+	local ok, known = pcall(self.native.mods)
+	return ok and known == true
+end
+
+-- The mods to load a save whose mods are `names` with, as a list of names,
+-- then those left out and those added; nil when the room gave no lists (the
+-- save loads with its own).
+function Link:mods(names)
+	if type(self.native.mods) ~= "function" then return nil end
+	local ok, plan, dropped, added = pcall(self.native.mods, table.concat(names, "\n"))
+	if not ok or type(plan) ~= "string" then return nil end
+	return lines(plan), lines(dropped), lines(added)
+end
+
+-- This player's personal mods, by name, as a set; an empty set from a hook
+-- without `personal` or without the room's lists.
+function Link:personal()
+	local set = {}
+	if type(self.native.personal) ~= "function" then return set end
+	local ok, text = pcall(self.native.personal)
+	if not ok then return set end
+	for _, name in ipairs(lines(text)) do set[name] = true end
+	return set
+end
+
+-- The room's shared mods, as a list of names; nil from a hook without
+-- `shared` or without the room's lists.
+function Link:shared()
+	if type(self.native.shared) ~= "function" then return nil end
+	local ok, text = pcall(self.native.shared)
+	if not ok or type(text) ~= "string" then return nil end
+	return lines(text)
 end
 
 -- The game script begins (true) or ends applying the room's actions.

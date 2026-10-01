@@ -128,6 +128,7 @@ TPF3's commands, and the release-day measurements in
 | `crates/tpf3mp-bridge` | The messages and step gate between the agent and the hook. |
 | `crates/tpf3mp-hook` | The library the launcher loads into the game it starts. |
 | `crates/tpf3mp-launch` | Starts the game with the hook in that one process. |
+| `crates/tpf3mp-modscan` | Sorts mods into personal, carried and shared, with the reasons, and finds the mods a player has installed ([MODS.md](MODS.md)). |
 | `crates/tpf3mp-bigmap` | Big maps, prototype: the size ladder, the ceilings a size hits, the terms a room shares, which features a build can run ([BIGMAPS.md](BIGMAPS.md)). |
 | `crates/tpf3mp-testkit` | Toy game, bots, network emulator, load tester, regression harness. |
 | `mod/tpf3mp_1` | The game-side Lua mod, in Transport Fever 3's layout: captures builds as actions for the hook, linked to it by `tpf3mp/bridge.lua`. |
@@ -168,6 +169,12 @@ Or use the launcher window:
 ```sh
 cargo run -p tpf3mp-launcher -- --server 127.0.0.1:29470 --pin-cert runtime/dev-cert.der --name ann
 ```
+
+Without `--server`, every build of the launcher, a developer's too, plays
+on the player's server setting (Settings, **Server**), else on its default:
+`TPF3MP_DEFAULT_SERVER` when it was built with one, otherwise the project's
+relay (`setup::RELAY`). `--server` wins over both for the run, so playtests
+stay on the local server whatever the setting says.
 
 (`tpf3mp-agent launcher` with the same options serves it as a page in the
 browser instead.)

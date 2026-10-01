@@ -11,15 +11,17 @@ use std::{
 use ring::hmac;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tpf3mp_proto::{
-    Code, CreateRoom, FixedBytes, Invite, MAX_ROOM_MEMBERS, RequestError, RoomId, RoomView,
-    RulesOffer,
+    BoundedVec, Code, CreateRoom, FixedBytes, Invite, ListedRoom, MAX_ROOM_MEMBERS, ROOMS_PER_PAGE,
+    RequestError, RoomId, RoomPage, RoomPhase, RoomView, RulesOffer,
 };
 use tracing::{info, warn};
 
 use crate::{
     admission::RoomShare,
     metrics,
-    room::{NewMember, ROOM_QUEUE, Room, RoomEnv, RoomHandle, RoomSecrets, RoomSpec},
+    room::{
+        NewMember, ROOM_QUEUE, Room, RoomEnv, RoomHandle, RoomSecrets, RoomSpec, SharedSummary,
+    },
     ruleset::RulesMenu,
 };
 
@@ -48,12 +50,17 @@ impl Rooms {
     }
 }
 
-/// A room the directory knows: the way to reach it, its task, and the tag
-/// of its invite.
+/// A room the directory knows: the way to reach it, its task, the tag of
+/// its invite, and what the room list shows of it.
 struct Registered {
     handle: RoomHandle,
     task: JoinHandle<()>,
     invite_tag: Vec<u8>,
+    summary: SharedSummary,
+    /// A public room's invite, which the list gives anyone; `None` for a
+    /// private room, whose invite the server keeps only as its tag. Kept in
+    /// memory only: a room restored after a restart is private.
+    invite: Option<Invite>,
 }
 
 pub(crate) struct DirectoryConfig {
@@ -195,10 +202,13 @@ impl Directory {
                 ruleset: (rules.factory)(),
                 env: self.env.clone(),
                 share,
+                listing: request.listing.clone(),
+                competitive: request.competitive,
             },
             owner,
         );
         let view = room.view();
+        let summary = room.summary();
         let (commands, receiver) = mpsc::channel(ROOM_QUEUE);
         let handle = RoomHandle::new(commands);
         let task = tokio::spawn(room.run(receiver, Arc::clone(self)));
@@ -208,6 +218,8 @@ impl Directory {
                 handle: handle.clone(),
                 task,
                 invite_tag,
+                summary,
+                invite: request.listing.is_some().then_some(invite),
             },
         );
         drop(rooms);
@@ -219,6 +231,7 @@ impl Directory {
         let (commands, receiver) = mpsc::channel(ROOM_QUEUE);
         let id = room.id();
         let invite_tag = room.invite_tag();
+        let summary = room.summary();
         let task = tokio::spawn(room.run(receiver, Arc::clone(self)));
         self.rooms
             .lock()
@@ -229,6 +242,8 @@ impl Directory {
                     handle: RoomHandle::new(commands),
                     task,
                     invite_tag,
+                    summary,
+                    invite: None,
                 },
             );
     }
@@ -270,6 +285,57 @@ impl Directory {
             if tokio::time::timeout(ROOM_SHUTDOWN, task).await.is_err() {
                 warn!("a room did not stop in time");
             }
+        }
+    }
+
+    /// Page `page` of the public rooms, [`ROOMS_PER_PAGE`] a page: those in
+    /// their lobby first, then the fuller, then by name. A private room is
+    /// never in it.
+    pub(crate) fn list(&self, page: u16) -> RoomPage {
+        let mut listed: Vec<ListedRoom> = {
+            let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+            rooms
+                .by_id
+                .values()
+                .filter_map(|registered| {
+                    let invite = registered.invite?;
+                    let summary = registered
+                        .summary
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let listing = summary.listing.clone()?;
+                    Some(ListedRoom {
+                        invite,
+                        name: summary.name.clone(),
+                        rules: summary.rules.clone(),
+                        players: summary.players,
+                        max_players: summary.max_players,
+                        has_password: summary.has_password,
+                        phase: summary.phase,
+                        listing,
+                        competitive: summary.competitive,
+                    })
+                })
+                .collect()
+        };
+        listed.sort_by(|a, b| {
+            (a.phase != RoomPhase::Lobby)
+                .cmp(&(b.phase != RoomPhase::Lobby))
+                .then(b.players.cmp(&a.players))
+                .then_with(|| a.name.as_str().cmp(b.name.as_str()))
+                .then_with(|| a.invite.0.cmp(&b.invite.0))
+        });
+        let start = usize::from(page).saturating_mul(ROOMS_PER_PAGE);
+        let more = listed.len() > start.saturating_add(ROOMS_PER_PAGE);
+        let rooms: Vec<ListedRoom> = listed
+            .into_iter()
+            .skip(start)
+            .take(ROOMS_PER_PAGE)
+            .collect();
+        RoomPage {
+            page,
+            rooms: BoundedVec::new(rooms).unwrap_or_default(),
+            more,
         }
     }
 

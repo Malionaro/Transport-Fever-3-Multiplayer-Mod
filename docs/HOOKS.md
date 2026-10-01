@@ -340,7 +340,10 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
     with canonical rules, the Lua mod shows the server's values instead. And
     the local player, as the room's events name the actor: the hook knows
     the player's own commands by it when the room orders them (bridge
-    version 5).
+    version 5). And the mods the room's worlds load with in this game:
+    the room's shared mods and this player's personal ones, or none when
+    the agent does not know this player's mods ([MODS.md](MODS.md);
+    bridge version 12).
   - `Load { file, next_step }`: load a world, then run `next_step`.
     Without a file, the game loads the world the player chose to start
     from: the owner's, or everyone's on a server that keeps no snapshots.
@@ -366,14 +369,29 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
     members, ready marks and owner, the newest 40 chat lines, the last
     error and notice), for the Multiplayer window on the game's main menu
     (D17): sent whenever it changes, before, during and after a room's
-    game; only the newest counts (bridge version 9).
+    game; only the newest counts (bridge version 9). Since bridge version
+    10 it also carries the rules the server offers, the player's saves
+    (newest 40, by name) and the one offered first (`start_save`), where
+    the room's world is in this game (`world`: none, fetching with its
+    bytes, loading, playing) and how the game differs from the room's.
+    Since bridge version 14 it carries the page of the server's public
+    rooms last asked for (`rooms`). Since version 16 each member carries the banner they
+    picked, and the view the player's own (`banner`); `SetBanner` sets it
+    (`set_banner` from the window, empty for the default). Since version 17 the room, the
+    room list and create carry the play style (`competitive`). Since bridge version 15 it carries the
+    server's address (`server_address`) and the launcher's default server
+    (`server_default`), for the server setting.
   - `End`: the session is over. Sent only once the room's game has begun:
     a room left before that ends nothing in the game, which keeps its link
     for the player's next room.
 - **From the hook (`ToAgent`):**
   - `Hello`: always first, with the game build.
   - `Loaded { next_step }`: the ordered world is loaded.
-  - `Command { payload }`: the player acted; the room orders it.
+  - `Command { payload, secret }`: the player acted; the room orders it.
+    `secret` is a company's password the action needs (joining or locking
+    a company), which the agent sends beside the intent and the room seals
+    (PROTOCOL.md, "Secrets"); the hook never logs it. Bridge version 11,
+    which also carries each ordered `Command`'s seal to the hook.
   - `Ran { step }`: the game ran this step.
   - `Checkpoint { step, lanes }`: digests at a checkpoint.
   - `Saved { event, lanes, file }`: the world as saved at a save event, and
@@ -409,7 +427,16 @@ link it. The agent's side is `tpf3mp_agent::bridge`.
     Multiplayer window: connect (a name; the server is the launcher's,
     D12), disconnect, create, join, ready, start, kick, chat or leave. The
     launcher carries it out as if its own window had asked (bridge
-    version 9).
+    version 9). Since version 10, create also names the rules and the save
+    the room starts from: one of the saves the window was offered, by name
+    only (never a path); absent for the launcher's own `--start-save`,
+    empty for none. Since version 14, create also carries a room's
+    listing (its climate and year, for a public room) and `ListRooms {
+    page }` asks for a page of the server's public rooms. Since version 15,
+    `SetServer { server }` is the player's server setting: a `host:port`,
+    or empty for the launcher's default; the launcher checks, remembers
+    and reconnects, and refuses it in a room (D12, proposed amendment).
+    Connect still names no server, and an invite never switches it.
   - `Log`: a line for the agent's log.
 - **The step gate.** The game asks the hook's `Gate` before every step. Until
   the step is released, the hook reads messages and applies each event the
@@ -614,7 +641,18 @@ call of the speed getter, as TPF2MP's speed hook
   nothing in the room's game but the display, until the room follows them.
   Nothing may send the debug step command during a room: its pending count
   would add updates to a call.
-- **The speed row asks the room.** The getter's detour only reads: the
+- **The speed row follows the room.** The Lua replacement
+  `gui/tpf3mp/speed_control.script.lua` highlights the accepted speed for guests from
+  the hook's room status, including pause. Guests see disabled buttons
+  with "Host controls speed" help; their keyboard speed shortcuts are
+  disabled through both `game.tl`'s internal `game_react_globals` table
+  and the public module that copies its functions. It copies feature
+  flags instead of changing the game's table, preserving mission/mod
+  restrictions. Becoming host or leaving the room restores the stock
+  recipe and shortcuts, including the host's keyboard hints. Updating the display
+  never sends `makeGameSetSpeedCmd`: feeding the room's speed back into
+  the game's local value would be mistaken for a player's request.
+- **The host's speed row asks the room.** The getter's detour only reads: the
   game's own speed, the speed row's value, every time the game asks
   (`CGame::Sync` and the game UI ask every frame, paused or not). When it
   changes in the room's game, the hook sends `ToAgent::Speed` and the agent
@@ -664,7 +702,7 @@ for the table (`bridge.find`). Its contract is in
   it); with only a key, what was noted, or nil. The GUI runs in more than
   one Lua state, and a game script's GUI half reads there what the
   construction menu knows (the stop tool's stop, "The build tools").
-- `tpf3mp_native.command(action)`: an action table, in the game's units.
+- `tpf3mp_native.command(action, password)`: an action table, in the game's units.
   The hook reads it into a `tpf3mp_proto::lua::LuaValue`, within
   `MAX_DEPTH` and `MAX_NODES` (a function, userdata or a table as a key is
   refused), converts it with `action_from_lua` and queues
@@ -672,11 +710,16 @@ for the table (`bridge.find`). Its contract is in
   the room's game only. It returns `true` and a ticket, or `false` and why.
   `false` or an error means refused, and the mod does not apply the action
   locally either: every game applies it when the room orders it. The
-  ticket comes back in `results()`.
+  ticket comes back in `results()`. `password`, optional, is a company's
+  password, 1 to 64 bytes of text: only joining or locking a company takes
+  one, scoped to that company (`tpf3mp_proto::Secret`); it goes to the room
+  with the action and is never logged, and no refusal quotes it (version
+  12).
 - `tpf3mp_native.take()`: the actions the room ordered for this simulation
   update, as `action_to_lua` tables, or `nil` (below), and second, who
   sent each, a list of player ids (64 hex digits) beside it ("Companies"
-  below). A list's items are
+  below), and third, each one's seal, `{ scope =, tag = }` (the tag as 64
+  hex digits), or `false` (version 12). A list's items are
   in its table's array part, so `next` walks them in order. The game
   copies a list it is handed (a stop's loading flags, a consist's groups)
   into its own vector in the order `next` gives, and what a game script's
@@ -743,6 +786,15 @@ for the table (`bridge.find`). Its contract is in
   position, and optional Hermite curve geometry for linear builds, and reads
   other room members' active cursors, carried as advisory datagrams. Optional
   in the contract.
+- `tpf3mp_native.mods(list)`: the mods to load a save with, given the
+  save's (names, one a line): that list, then those left out and those
+  added, the same way, from the room's `Begin` (`tpf3mp_bridge::mods::plan`);
+  `nil` without the room's lists. `mods()` alone: `true` when the room gave
+  them. Said in the hook's log ("the room's world loads with N mods: ...").
+  Optional, as `built` ([MODS.md](MODS.md)).
+- `tpf3mp_native.personal()`: this player's personal mods, names one a
+  line, or `nil`: the guards tell a personal mod's commands by it
+  ("The player's commands" below). Optional.
 
 The table's functions run on whichever thread runs their state (the GUI's
 the main thread, the game scripts' a pool of simulation threads) and share
@@ -880,7 +932,12 @@ stands still meanwhile:
 - **Loading.** A `Load` with a file (the room's save, fetched by the
   agent) is copied into the folder as `tpf3mp_room_<pid>.sav`, and the GUI
   asked to load it (`app.loadGame`, with a `SavegameId` in the game's save
-  namespace). The GUI tells the hook each time a world's GUI starts
+  namespace). With the room's mod lists (`Begin`), the GUI first reads the
+  save's details (`app.getSavegameInfo`, a few frames) and loads it with
+  their `mods` replaced: the save's shared mods, TPF3-MP, and this
+  player's personal mods, leaving out another player's
+  (`mod/tpf3mp_1/content/scripts/tpf3mp/worldload.lua`; [MODS.md](MODS.md)).
+  A shared mod not installed here fails the load, and says which. The GUI tells the hook each time a world's GUI starts
   (`tpf3mp_native.world`); the room's world is the first to start after
   the GUI took the request, never the one it was asked in, whose GUI may
   well report itself in between. Then `Session::loaded(next_step)`, and
@@ -909,18 +966,46 @@ checks are in `investigation/TPF3_MENU_JOIN_2026-09-30.md`):
   every finalizer at `lua_close`), so the hook never calls into a closed
   state. hook.log: `menu: Lua state 0x... has app; the main menu can load
   the room's world from it`.
+- **Knows whether a world is loaded.** `DoStep` runs at the menu and in
+  a world alike, so the hook reads the engine's own answer:
+  `CMenuUI::m_game`, the loaded world, which `CMenuUI::StartGame` asserts
+  clear and sets and `CMenuUI::StopGame` clears. `DoStep` tests it before
+  it hands its frame to the world's UI; that test is the optional profile
+  target `UI::CMenuUI::DoStep/m_game test` (`0x6a01c0`, `cmp [rsi+0x6b0],
+  r13`), and its displacement is the field's offset, which the menu's
+  frame reads in the `CMenuUI` it is handed. A state given `app` while
+  `m_game` is set is the world's GUI's: the menu never loads from it, and
+  forgets it when the world closes. Loading is the menu's own sign, the
+  progress monitor's task, asked through the chunk's `busy()`.
 - **Follows the room from the menu's frame.** `UI::CMenuUI::DoStep`
   (`0x6a0160`, the menu's per-frame update on the main thread) is
   detoured. After the game's own frame, the driver runs
-  `StepDriver::on_menu` only while this game's step has never run in this
-  process and no world's GUI has started (`tpf3mp_native.world`), and a
-  state adopted on that thread is open. A world that stops stepping,
-  while saving the room's world or held for another player, is no menu:
-  an earlier rule of "no step for 2 s" took the room's session inside the
-  owner's world and hung it, and the owner's menu frame once took it while
-  saving the room's world before that world's first step (both measured
-  2026-09-30). Back at the menu after a world, the player loads any save,
-  as before. Before the room begins, `on_menu` reads `Begin` and tells
+  `StepDriver::on_menu` only while the game is at its main menu with no
+  world, and a state of the menu's adopted on that thread is open
+  (`crates/tpf3mp-hook/src/at_menu.rs`):
+  - a game that has had no world up yet (never stepped, no world's GUI
+    started, `m_game` never set) is at its menu, loading or not;
+  - a world loaded blocks, before its first step and while it stops
+    stepping (saving the room's world, held for another player): an
+    earlier rule of "no step for 2 s" took the room's session inside the
+    owner's world and hung it, and the owner's menu frame once took it
+    while saving the room's world before that world's first step (both
+    measured 2026-09-30);
+  - after a world, the menu is back once `m_game` is clear and the
+    progress monitor has no task for 2 s with no step between. A load
+    blocks: the GUI's load stops the world first and loads after, and a
+    moment without a task restarts the 2 s;
+  - after a world, a game whose `m_game` the hook cannot read (the target
+    missing) or whose menu cannot say whether it loads is never taken for
+    the menu (fail closed): as before this rule, only a fresh game follows
+    the room from its menu.
+
+  hook.log says where the menu sees the game on each change:
+  `menu: a world is loaded (CMenuUI::m_game set)`, `menu: the world closed
+  (CMenuUI::m_game cleared); ...`, `menu: no world loaded, but the game is
+  loading one`, `menu: back at the main menu after a world (no world loaded
+  or loading for 2 s)`; and when the room begins there, `the room began at
+  the main menu; the menu sees: <where>`. Before the room begins, `on_menu` reads `Begin` and tells
   the agent `MenuUp` once per arrival, which marks a guest ready (and the
   room's owner, once the room has the save the owner named for it to start
   from: PROTOCOL.md, "The first world") and keeps the hook's heartbeat
@@ -939,10 +1024,19 @@ checks are in `investigation/TPF3_MENU_JOIN_2026-09-30.md`):
   the loaded world by itself. Confirmed in a two-game playtest on build
   40408: a guest at the main menu loaded the room's world by itself, with
   no Start Game click.
-- **Loads it with TPF3-MP active.** `info` is nil, so the save keeps its
-  own mod list, and the room's save was written by a game whose GUI had
-  TPF3-MP linked (only the mod saves for the room). A world whose mod
-  does not start never says it is up, and is held after `LOAD_PATIENCE`.
+- **Loads it with TPF3-MP active.** Without the room's mod lists `info`
+  is nil, so the save keeps its own mod list, and the room's save was
+  written by a game whose GUI had TPF3-MP linked (only the mod saves for
+  the room). With them (the room's `Begin`, [MODS.md](MODS.md)), the chunk,
+  handed the hook's `mods` as a third function, first reads the save's
+  details (`app.getSavegameInfo`, answered "busy" until the game has them)
+  and passes `info` as the menu's own Load Game page does when a player
+  changes a save's mods: `api.type.SaveGameDetails.new(data.info)` with
+  `mods` set to the save's shared mods, TPF3-MP and this player's
+  personal ones, each `api.type.ModId` checked with the user profile's
+  `ModRep:exists` (a shared mod not installed here fails the load and
+  holds the world). A world whose mod does not start never says it is up,
+  and is held after `LOAD_PATIENCE`.
 
 The loaded world's GUI says it started (`tpf3mp_native.world`), the step's
 detour takes the world at its first call (`Session::loaded`), and the
@@ -952,11 +1046,12 @@ What the menu leaves to a world up: a `Load` without a file (the owner's
 world, or everyone's on a server that keeps no worlds), and a `Save` the
 room orders. Without a save named to start from, the owner's game
 therefore still needs its world up to start the room: the menu logs `at the main menu: the room plays the world this
-game starts from ...` once, and takes nothing. Without the menu's targets
-(all five optional in the profile) or an adopted state, nothing of this
-runs: hook.log says `the main menu cannot load the room's world (fail
-closed): ...`, and a game needs a world up, any one, before it can load
-the room's.
+game starts from ...` once, and takes nothing. Without the menu's five
+function targets (all optional in the profile) or an adopted state,
+nothing of this runs: hook.log says `the main menu cannot load the room's
+world (fail closed): ...`, and a game needs a world up, any one, before it
+can load the room's. Without the `m_game` test, the install line says so
+and only a game that has had no world up follows the room from its menu.
 
 Tried on build 40408 through the deployed server, with two games on one PC
 (the rig, the fixture save): the owner's game saved its world for the room
@@ -987,7 +1082,36 @@ So the stock windows do send through `api.cmd.sendCommand`, as the mod's
 replays do (the question in PLAN.md, Part 2). What tells them apart is the
 Lua state, not a caller's address: the player's commands come from the
 GUI's state, the room's replays from the game script's states, whose
-`api.cmd` the mod leaves alone.
+`api.cmd` the mod leaves alone, but for one thing: what a player's
+personal mods send there (below, and [MODS.md](MODS.md)).
+
+A GUI mod only one player runs (a personal mod, [MODS.md](MODS.md)) sends
+through the same guard as the player's clicks: carried or refused alike.
+A refusal names the mod it came from, the nearest function on the stack
+whose source is a mod's file (`<modId>::/...`, `guard.callers`), so
+hook.log says `refused the player's makeTownCreateCmd in the room's game
+(1 so far), from the mod gw_big_city_1`. A personal mod's event to its own
+game script (`makeScriptingSendEventCmd` with an id that names the mod and
+neither an id nor a name the game's scripts or TPF3-MP listen to,
+`guard.ownEvent`) is sent here as it is: it reaches this game's game scripts
+only, where the mod's own game script runs. Any other of its events is
+carried or refused as the player's own would be.
+
+A personal mod's game script runs in its player's game only, in the
+simulation's states, where a command runs at once. There
+`tpf3mp/modguard.lua`, installed by the mod's game script in each state it
+links in, sits in front of `sendCommand` in the room's game: a command with
+a personal mod anywhere on its stack is not run; a vehicle's manual
+departure (`VehicleChange::ManualDeparture`), departure or stop, or a
+line's rename or update, for the player's own company's, goes to the room
+as an action, once per change within 5 s of game time; an event between
+game scripts is dropped; anything else is refused, each once in hook.log
+(`handed makeVehicleSetManualDepartureCmd from the personal mod
+celmi_timetables to the room (1 so far)`). Commands from the game's own
+scripts, TPF3-MP's and shared mods run as before. A state without
+`debug.getinfo` cannot tell them apart: it notes `personal-mods-unguarded`,
+after which the hook loads the room's worlds without the player's personal
+mods (docs/MODS.md).
 
 The mod guards the build tools in its game script, whose `guiHandleEvent`
 runs in the GUI's state. The street, track, station and depot, stop and
@@ -1036,8 +1160,11 @@ reference of its own to either. Once linked, the GUI wraps every
     event;
   - prospecting, the construction menu's `makeScriptingSendEventCmd("",
     "Companies", "spawnIndustry", …)`, as a `Prospect` action ("Prospecting"
-    below). The company's other events (taking a rank, `applyLevel`;
-    greening an industry, `MakeGreen`; a marketing campaign) stay refused;
+    below);
+  - taking a rank, the company window's `makeScriptingSendEventCmd("",
+    "Companies", "applyLevel", { level })`, as an `ApplyRank` action
+    ("Company ranks" below). The company's other events (greening an
+    industry, `MakeGreen`; a marketing campaign) stay refused;
   - vehicles: buying (`makeVehicleBuyCmd`: the depot by its construction's
     file and position, the consist part by part, as the store configured
     it), selling, putting on a line, and the vehicle window's stop, start,
@@ -1117,7 +1244,8 @@ state, which the game saves with the world:
 - *Who acted.* The hook hands each ordered action to the game script with
   the player who sent it (the Lua link's version 10, `tpf3mp_native.version`:
   `take()` answers the actions
-  and, second, each one's sender as 64 hex digits; `status()` names each
+  and, second, each one's sender as 64 hex digits, and since version 12
+  third, each one's seal; `status()` names each
   player's `id` and the local one's `me_id`). The game script books the
   action to that player's company: `apply.lua` puts the company's player
   entity where it put the save's player before (a build's `Context.player`
@@ -1178,9 +1306,66 @@ state, which the game saves with the world:
   (`hook.log`: `the GUI's company follows the player's in the HUD's
   state`).
 - *The Multiplayer window* lists the companies with their money and
-  players, the one the player plays for first with its colour to choose,
-  a name to change, loans to take and pay back, and each other company to
-  join.
+  players, the one the player plays for first with its colour to choose
+  (the game's colour chooser, `ColorChooserButton`, with the companies'
+  colours first and then the game's line colours and greys, as its vehicle
+  window offers them), a name to change, loans to take and pay back, and
+  each other company to join, with a password field (`passwordMode`, as
+  the game's own login form) for one that has a password. Each company
+  shows its head, and whether it has a password or has closed its
+  stations. The head of the player's company also sees its password to
+  set, change or remove, its stations to open or close, and a button to
+  send each other player out.
+- *The game's company window* renames the company by its title
+  (`game_mechanics/company/company.tl` sends `makeEntitySetNameCmd` on the
+  player entity `getPlayer()` answers, the player's company): the guard
+  captures a name or colour set on a company's player entity as that
+  company's `Rename` or `Recolor` (`capture.setName`, `setColor`, which
+  know companies by the GUI's roster), and every game checks it is the
+  player's own. The window has no extension point for more; the rest
+  stays in the Multiplayer window.
+- *Who may do what* (DECISIONS.md, D22, proposed), checked by every game
+  alike when the room orders it (`companies.run`): a company's players
+  build, buy, run lines, borrow, rename and recolour it (a colour of
+  fractions from 0 to 1 that no other company wears); its head, the
+  founder while they play for it and else the player who has played for
+  it longest (the roster's members are kept in the order they joined),
+  alone gives it a password (`CompanyOp::Lock`), takes it away
+  (`Unlock`), sends a player out (`Dismiss`: they play for the room's
+  first company again) and opens or closes its stations
+  (`ShareStations`). The room's first company is everyone's: no head, no
+  password, and its stations stay open. `hook.log` names why a refused
+  action was refused.
+- *Passwords.* The window hands the password to `command` beside the
+  action (`Join` or `Lock`), the hook sends it to the room beside the
+  intent (`tpf3mp_proto::Secret`, scoped to the company), and the server
+  orders the action with the password's seal, never the password
+  (PROTOCOL.md, "Secrets"). `take()` hands each action's seal third; a
+  `Lock` keeps it as the company's `lock`, and a `Join` of a company with a
+  lock needs a seal for that company equal to it ("joining X needs its
+  password", "the password for X is not right"). The roster keeps the seal
+  only, which is safe in a save: it cannot be checked against a guess
+  without the server's key. The window reads only whether a company has
+  one.
+- *Using another company's stations.* The game stops a line at any
+  station: build 40408's line and stop commands check that a stop names a
+  station and terminal the station group has, not who owns it (no owner
+  refusal among the exe's line errors; a stop is a station group, a
+  station index and a terminal, `api/tealdef/api/engine.d.tl`). Its line
+  manager offers only the player's own stations and those no one owns
+  (`gui/line_vehicle_mgmt/manager_window.tl`, at each click that adds or
+  moves a stop, asks `scripts/entity_util.tl`'s
+  `isOwnedByPlayerOrNotOwned`). In the GUI state the mod wraps that test so
+  it also takes a station group or station construction of a company that
+  keeps its stations open; `hook.log` says `the line manager offers other
+  companies' open stations`. That the line manager and the mod share one
+  `entity_util` table (one `ug_require` cache) is INFERRED. Every game
+  checks each stop of a new or changed line (`apply.lua`, `lineComponent`,
+  `companies.mayUse`) and refuses one at a closed company's station, naming
+  it. TPF2 had to patch a native station filter for this (TPF2MP's shared
+  stations); on TF3 the filter is Lua, and no native patch looks needed
+  (INFERRED: not seen in a game). A company's vehicles still use its own
+  depots, as TPF2MP left `FindPathToDepot`'s owner check alone.
 
 ### Prospecting
 
@@ -1247,6 +1432,62 @@ prospecting ended: ::/cargos/coal/coal.cargo near town-3, begun at game time 540
 or `..., found nothing`. The entity in brackets on the first line is each
 game's own; the rest, the industry's id, file and place included, is the
 same in every game.
+
+The game's company script runs the prospections of the save's own player
+alone (`company.script.tl`, its update looks at `getPlayer()` only, in the
+engine state): a prospection of another company is kept and its permit
+used, but its outcome is never drawn (seen in the scripts; not carried yet,
+docs/PLAN.md).
+
+### Company ranks
+
+A company's rank gives it the game's permits: headquarters, marketing,
+prospecting and the rest
+([investigation/TPF3_PROGRESSION_2026-09-30.md](../investigation/TPF3_PROGRESSION_2026-09-30.md)).
+The game's growth script keeps one company, the save's player: its
+experience is the highest world population it has seen, the rank that
+reaches is its potential, and the company window takes a rank reached with
+`Companies` `applyLevel`.
+
+- **One company in the room**: the game's own score. The company window's
+  `applyLevel` goes to the room as an `ApplyRank` action, and every game
+  applies it at the same update through the growth script's own event. A
+  rank not reached, or taken already, is refused with why in `hook.log`.
+- **More than one** (D23, proposed): the mod's game script scores every
+  company four times a game month, at the same game time in every game
+  (`tpf3mp/progression.lua`): for each town, the town's population times
+  the company's share of what was carried for it (cargo delivered to it in
+  the last half year, passengers travelling to and from it on lines, from
+  the game's statistics per line and the lines' owners) times its rating
+  there over 100 (the town's rating, with the happiness of its own
+  passengers and the punctuality of its own cargo, by the game's formulas).
+  Experience is the highest score, the rank it reaches the game's own
+  thresholds. The records are the mod's game script's state, saved with
+  the world. `ApplyRank` takes a rank reached in that record; the room's
+  first company also takes it in the game's own state. In the GUI the
+  mod answers the game's windows' `getCompanyProgressionState` from the
+  record, so the company window and the permits show the player's
+  company's own rank (`the company window shows each company's own rank`
+  in `hook.log`; INFERRED that the game's windows share the module the mod
+  changes, to check in the game).
+
+Nothing is guessed: a sample whose statistics or game modules do not read
+is left out (`the companies' scores were not sampled: ...`), and a town
+with no rating counts for nobody.
+
+In `hook.log`, every game of a room of two companies writes at each
+sample, at the same game time and with the same numbers:
+
+```
+progression at game time 5400000: 12 towns, weights cargo 1 passengers 1
+progression at game time 5400000: town-3 population 1240: company-0 share 0.5500 rating 80.0000 part 545.6000, company-1 share 0.4500 rating 64.2859 part 358.7153
+progression at game time 5400000: company-0 score 3120.4000, experience 20514, rank 3 reached, 2 taken
+progression at game time 5400000: company-1 score 812.9000, experience 812, rank 0 reached, 1 taken
+```
+
+one line per town someone carried for, then one per company. Compare the
+lines of the same game time across the games: any difference is a
+divergence.
 
 ### The build tools
 
@@ -1350,8 +1591,8 @@ hook, and a construction's window its edits:
   - the game tells game scripts of the proposals of six tools only, under
     the ids `UI::CGameUI`'s constructor names them by:
     `constructionBuilder`, `streetTerminalBuilder`, `streetBuilder`,
-    `trackBuilder`, `streetTrackModifier` (the street and track upgrade
-    tool, not carried yet) and `bulldozer`. The **module editor**
+    `trackBuilder`, `streetTrackModifier` (the road and track modifiers,
+    "The road and track modifiers" below) and `bulldozer`. The **module editor**
     (`UI::ModuleBuilder`, opened from a station's window) is not among
     them: it queues its `WorldBuildProposal` itself and game scripts hear
     nothing of it (its click was stopped with "no proposal seen" in the
@@ -1499,6 +1740,118 @@ track across open ground ($22,054), a track across a street, and a bus
 depot snapped onto a town street, clearing three town buildings
 ($825,816): identical in both games, towns included.
 
+
+### The road and track modifiers
+
+The tools of the road menu's tools tab and the track menu's (tram tracks,
+bus lanes, noise barriers, alleys, the towns' lock, electrification, a
+track type) tell game scripts their builds as `streetTrackModifier`. Seen
+on build 40408 (a room, 2026-09-30; `hook.log` names the tool, e.g.
+`ACTION_TRAM_TRACK_TOOL ::/gui/construction/tools/tram_track_tool.res`,
+and what it changes): each rebuilds the stretch of road it is used on,
+edge by edge, between the same places (a node between two edges may be
+removed and added again at the same place), with its new template (a
+tram track or bus lane is the road's template on TF3), decorations
+(`edgeDecorations`: `barrier_b.edge` as `{ 3, false }`, `alley.edge` as `{
+0, false }`), `roadDevelopmentLocked` and owner (the player-owned tool:
+`false>true`, `nil>` the player), new node configurations at its ends, and
+the town buildings along it cleared and put back.
+
+The mod carries such a build as the `BuildRoad` or `BuildTrack` of the
+network of its first edge (`capture.modify`, `engine.captureModify`): each
+link names its template (`kind`), its decorations by name
+(`edgeDecorationRep.getName`; every game finds its own id with `find`), and
+whether it is locked and owned by the acting company. The town buildings it
+clears every game's build clears again (the build is the player's own,
+`ignoreErrors`). Junction changes in the tool's proposal now travel with
+the polyline; otherwise the replay preserves the endpoint configurations
+and remaps their edge references (BUILDING.md, "Junction edits").
+Stops and signals on the stretch stay: a new edge between the same
+places in the same direction as a removed one, listing exactly its objects,
+is the edge rebuilt in place, and every game's build gives it the objects
+of the edge it replaces under their own entities (`engine.keptInPlace`,
+`networkInto`); a stop moved onto another edge is refused. The same rule
+lets the road and track tools build through an edge with a stop on it.
+### Junction tools
+
+Build 40408's native lane/crosswalk tools do not emit a Lua proposal preview.
+At the existing `CommandList::Add` hook, `junctions.rs` reads junction-only
+WorldBuildProposals and stores them against the click number through the
+same `tpf3mp_native.built(n)` queue as the module editor. That snapshot
+overrides an older road/construction preview. The Lua command guard also
+captures a window's `createTrafficLightProposal` via `capture.windowBuild`.
+The original player command remains cancelled; each replica uses the
+ordinary ordered replay path. Mixed native geometry proposals keep their
+existing capture path, never a partial junction replacement.
+The reader classifies mixed geometry/construction proposals before imposing
+the standalone junction limit. A live eight-track station attempt generated
+392 node configs (another attempt generated 200); checking the 64-junction
+limit first incorrectly rejected the station before construction capture.
+The regression test covers both sizes and every mixed-proposal vector,
+while oversized standalone junction edits remain refused.
+The corrected reader was tested in two real games on the local server on
+2026-10-01: an eight-track, 320 m station placed and applied on both replicas.
+The same run exercised two module edits after correcting the ownership
+check for unfrozen station track ends (BUILDING.md, "Module edits and upgrades").
+
+Read-only binary evidence (Steam Windows 40408): StreetProposal config
+vectors at +0x60/+0x78; BaseNodeLaneConnectionAndEntity has the component
+at +0 and node at +0x78, stride 0x80. BaseNodeConfig connections/crosswalks
+are at +0/+0x18, double-slip at +0x48, preference at +0x4c, light states at
++0x50, light type at +0x68 and custom phases at +0x70. Connections have
+stride 0x14; phases have stride 0x28. Binding-registration signatures
+at RVAs 0x1768337 and 0x22c395f gate this reader in the profile; the
+static proof resolves both against the installed executable. Crosswalks
+are a `phmap::flat_hash_set<int>` occupying +0x18 through +0x47: control
+bytes and slot pointers, size, capacity and internal bookkeeping. The
+constructor at RVA 0xa4990d is a third profile anchor; the move/copy at
+0x1eda20/0x1fe1e0 and iteration at 0xa49f1a establish this layout. The
+reader checks the sentinel, occupied-slot count, bounds and unique edge
+IDs, skipping empty/deleted slots. The first real crosswalk click on
+2026-10-01 exposed and now regression-covers the earlier incorrect vector
+assumption. Every read, vector count and boolean is checked.
+The API declaration's `userModifiedLaneConnections` is absent from this
+build's binding registration; the adapter does not invent an offset.
+
+Two-game test on 2026-10-01 (Steam Windows 40408, local server, disposable
+copy of `tpf3mp_fixture2.sav`): the host removed a crosswalk, the guest
+restored it, then the guest changed a lane connection and enabled traffic
+lights at the same crossing. Both replicas logged each ordered replay;
+network checkpoint hashes agreed at steps 500, 750, 1000 and 1350. The
+crosswalk and traffic lights also changed visibly in the other game.
+Evidence is in the local `runtime/junction-live-20261001-01/` logs. This
+does not yet cover custom phases/reset, adjacent geometry changes,
+proposal field comparison or rejoining after an edit. The initial load
+also hit a native crash/Lua UI error; a later host-then-guest restart
+worked. That startup failure has not been diagnosed. A rejoined game's
+speed row showed 1x while the room was paused; pause then play resumed it.
+
+Full acceptance is still pending. Keep `junctions.strict_junctions` off in
+the normal mod. In matching disposable test mod copies, turn it on and:
+
+1. Start two games through the launcher into one room and the same save.
+   Use the actual tools to toggle crosswalks, lane turns and traffic lights;
+   edit phase timings and reset settings. Repeat from the other player.
+2. Confirm the native capture log names the clicked junction edit, and
+   the emitted action has positions/resource names, with no engine IDs.
+   Compare the engine's proposal against the replay's proposal field by
+   field before treating matching synthetic tests as gameplay evidence.
+3. Check both games' visible crossings, arrows and light settings, then
+   upgrade/split an adjacent road and check that the settings survive.
+   A change that removes a referenced lane must refuse without changing
+   either game, rather than silently replace the configuration.
+4. Compare network checkpoint dumps through subsequent updates and after
+   save/load or rejoin. One-sided edits to a crosswalk, turn or phase in a
+   disposable diagnostic test must cause a network-lane mismatch.
+
+`lua_mod.rs` runs portable capture → wire → replay against two different
+ID spaces and checks the native-click precedence, refusal cases and
+curved-road preservation. `hook/tests/junctions.rs` checks native layouts
+and malformed memory. These tests do not launch the game and do not
+complete the playtest above. AGENTS.md currently prohibits automated game
+launches/modifications; a human must run this check or explicitly override
+that restriction before an agent runs it.
+
 ### The world's lanes
 
 A room finds a game that drifted from the others by comparing the world's
@@ -1529,7 +1882,7 @@ matter:
 
 | lane | reads |
 |---|---|
-| 0 network | every street and track edge by its ends (0.1 m) and road template, from the street system's node map |
+| 0 network | street/track endpoints (0.1 m), template and per-lane modes/dimensions/direction; junction positions (1 mm), portable turn/crosswalk references, light preference/resource/phases and flags |
 | 1 constructions | every construction by its file and position (0.1 m) |
 | 2 lines | every line's number of stops |
 | 3 vehicles | each vehicle's state, stop and place on its path: the path edge, the distance along it (1 cm) and the speed (1 cm/s), the simulation's own (`MOVE_PATH.dyn`) |

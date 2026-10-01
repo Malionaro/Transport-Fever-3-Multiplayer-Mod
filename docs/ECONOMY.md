@@ -5,7 +5,7 @@ in [ARCHITECTURE.md](ARCHITECTURE.md)). This document describes the port of
 TPF2MP's deterministic economy core to Rust, and how it is proven identical
 to the Lua original.
 
-- **Source:** `tf2mod` (TPF2MP by Julian Cooper, MIT), commit
+- **Source:** `tf2mod` (TPF2MP by _Sep, MIT), commit
   `58da402ba144b2b5ad9f5615f7d686aadd34ffb2`, economy model version 10.
 - **Code:** `crates/tpf3mp-canon/src/economy/` and `crates/tpf3mp-canon/src/lua.rs`.
 - **Guarantee:** every ported function returns exactly what the Lua original

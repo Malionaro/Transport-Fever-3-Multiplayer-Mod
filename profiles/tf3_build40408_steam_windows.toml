@@ -346,6 +346,20 @@ offset = 0
 prologue = "48 89 5C 24 10 55 56 57 41 54 41 55 41 56"
 required = false
 
+# DoStep's test of CMenuUI::m_game (rva 0x6a01c0, DoStep + 0x60): `cmp
+# [rsi+0x6b0], r13; je; cmp [rsi+0x7d0], r13; je; mov rdx, r14; mov rcx,
+# [rsi+0x508]; call`, which hands the frame to the world's UI when a world is
+# loaded. m_game is the field CMenuUI::StartGame asserts clear ("!m_game") and
+# sets, and CMenuUI::StopGame clears. Read only: the hook takes the field's
+# offset from the displacement (bytes 3..7) and reads it in the menu's frame to
+# know whether a world is loaded (crates/tpf3mp-hook/src/at_menu.rs).
+[[target]]
+name = "UI::CMenuUI::DoStep/m_game test"
+signature = "4C 39 AE ?? ?? ?? ?? 74 ?? 4C 39 AE ?? ?? ?? ?? 74 ?? 49 8B D6 48 8B 8E"
+offset = 0
+prologue = "4C 39 AE"
+required = false
+
 # Lua 5.2 C API, address only (never detoured). (rva 0x2fbe0c0)
 [[target]]
 name = "lua_pcallk"
@@ -635,6 +649,30 @@ name = "TownDevelopAt::Apply"
 signature = "48 8B C4 48 89 58 18 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 48 FC FF FF 48 81 EC 80 04 00 00 C5 F8 29 70 B8 C5 F8 29 78 A8 C5 78 29 40 98"
 offset = 0
 prologue = "48 8B C4 48 89 58 18 55 56 57 41 54 41 55"
+required = false
+
+# Junction layout anchors from the Lua binding registration code. Read-only:
+# these instructions establish the field offsets used by junctions.rs.
+[[target]]
+name = "BaseNodeConfig/field offsets"
+signature = "C7 45 80 70 00 00 00 C7 45 84 50 00 00 00 C7 45 88 48 00 00 00 C7 45 98 4C 00 00 00 C7 45 94 18 00 00 00"
+offset = 0
+prologue = "C7 45 80 70 00 00 00"
+required = false
+
+[[target]]
+name = "StreetProposal/node configuration offsets"
+signature = "C7 45 A4 78 00 00 00 C7 45 BC 60 00 00 00 C7 45 CC 48 00 00 00 C7 45 D0 30 00 00 00"
+offset = 0
+prologue = "C7 45 A4 78 00 00 00"
+required = false
+
+# BaseNodeConfig constructs its 0x30-byte crosswalk hash set at +0x18.
+[[target]]
+name = "BaseNodeConfig/crosswalk set layout"
+signature = "49 8D 4F 18 48 89 4D 98 48 8D 35 ?? ?? ?? ?? 48 89 75 90 48 89 31 4C 89 61 08 4C 89 61 10 4C 89 61 18 4C 89 61 28 45 88 67 48"
+offset = 0
+prologue = "49 8D 4F 18 48 89 4D 98"
 required = false
 
 # Lua 5.2 C API, address only (never detoured). (rva 0x2fbdb90)

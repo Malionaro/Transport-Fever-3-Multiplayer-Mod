@@ -237,6 +237,82 @@ pub fn find_save_in(roots: &[PathBuf], active: Option<u32>, name: &str) -> Resul
     }
 }
 
+/// The saves in Transport Fever 3's save folder that [`find_save`] finds by
+/// name, newest first: of the account Steam names as playing, or, when it
+/// names none, those only one account on this machine has.
+pub fn list_saves() -> Vec<String> {
+    list_saves_in(&steam_roots(), active_account())
+}
+
+/// [`list_saves`] in the Steam installations at `roots`, `active` being the
+/// account playing, if known. Each name, with `.sav` added, is what
+/// [`find_save_in`] takes to find the same file.
+pub fn list_saves_in(roots: &[PathBuf], active: Option<u32>) -> Vec<String> {
+    // (account, name, modified)
+    let mut found: Vec<(Option<u32>, String, std::time::SystemTime)> = Vec::new();
+    for root in roots {
+        let Ok(accounts) = fs::read_dir(root.join("userdata")) else {
+            continue;
+        };
+        for account in accounts.flatten() {
+            let id = account.file_name().to_str().and_then(|id| id.parse().ok());
+            let folder = account
+                .path()
+                .join(TRANSPORT_FEVER_3.to_string())
+                .join("local")
+                .join("save");
+            let Ok(files) = fs::read_dir(&folder) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let Ok(meta) = file.metadata() else {
+                    continue;
+                };
+                let name = file.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Some(stem) = name
+                    .len()
+                    .checked_sub(4)
+                    .filter(|&cut| name.is_char_boundary(cut))
+                    .filter(|&cut| name[cut..].eq_ignore_ascii_case(".sav"))
+                    .map(|cut| &name[..cut])
+                else {
+                    continue;
+                };
+                if !meta.is_file() || stem.is_empty() {
+                    continue;
+                }
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                found.push((id, stem.to_owned(), modified));
+            }
+        }
+    }
+    let playing = active.filter(|active| found.iter().any(|(id, ..)| *id == Some(*active)));
+    let mut saves: Vec<(String, std::time::SystemTime)> = match playing {
+        Some(active) => found
+            .into_iter()
+            .filter(|(id, ..)| *id == Some(active))
+            .map(|(_, name, modified)| (name, modified))
+            .collect(),
+        // Without an account playing, a name several accounts have is not
+        // found by name: it is not offered.
+        None => found
+            .iter()
+            .filter(|(id, name, _)| {
+                !found
+                    .iter()
+                    .any(|(other, again, _)| other != id && again.eq_ignore_ascii_case(name))
+            })
+            .map(|(_, name, modified)| (name.clone(), *modified))
+            .collect(),
+    };
+    saves.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    saves.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    saves.into_iter().map(|(name, _)| name).collect()
+}
+
 fn read_small(path: &Path) -> Option<String> {
     (fs::metadata(path).ok()?.len() <= MAX_FILE)
         .then(|| fs::read_to_string(path).ok())
@@ -564,6 +640,41 @@ mod tests {
         assert!(find_save_in(&roots, None, "mptest").is_err());
         assert_eq!(find_save_in(&roots, Some(222), "mptest").unwrap(), theirs);
         assert_eq!(find_save_in(&roots, Some(111), "mptest").unwrap(), mine);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_saves_found_by_name_are_listed_newest_first() {
+        let root = temp("save-list");
+        let older = put_save(&root, "111", "older.sav");
+        let newer = put_save(&root, "111", "newer.sav");
+        put_save(&root, "111", "notes.txt");
+        let set = |file: &Path, secs: u64| {
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set(&older, 1_000);
+        set(&newer, 2_000);
+        let roots = [root.clone()];
+        assert_eq!(list_saves_in(&roots, None), ["newer", "older"]);
+        // Every name listed is found by that name.
+        for name in list_saves_in(&roots, None) {
+            assert!(find_save_in(&roots, None, &name).is_ok(), "{name}");
+        }
+        // Another account's save: without an account playing, a name both
+        // have is not offered; with one, only its saves are.
+        let theirs = put_save(&root, "222", "older.sav");
+        set(&theirs, 3_000);
+        put_save(&root, "222", "only-theirs.sav");
+        let listed = list_saves_in(&roots, None);
+        assert!(!listed.contains(&"older".to_owned()), "{listed:?}");
+        assert!(listed.contains(&"only-theirs".to_owned()));
+        assert_eq!(list_saves_in(&roots, Some(111)), ["newer", "older"]);
+        assert_eq!(list_saves_in(&[], None), Vec::<String>::new());
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -288,6 +288,36 @@ same bookkeeping cannot handle.
   parameters, cancelled anyway, and the replay asserted in the engine's snap
   node lookup on all three instances at once.
 
+### TPF3: a depot placed onto existing track
+
+The 2026-10-01 relay playtest exposed a replay error for a rail depot
+placed with its entrance snapped to an existing track endpoint. The
+captured proposal correctly named that endpoint and six internal track
+segments arranged as a branching tree. Replay removed only the two
+outermost segments, then built the remaining four as standalone track
+alongside the depot's own generated track. Both games logged `Collision`;
+the subsequent `refreshConstruction` snapping command failed with
+`Construction Not Possible`. The depot remained built but disconnected.
+A later train purchase succeeded, while assignment to the line failed in
+both games: this was a placement failure, not a lost assignment message.
+
+Construction replay now removes complete branches ending at new vertices
+before building the external network. Existing-node and split references
+are anchors: they are retained, along with the paths between them, so a
+road rebuilt through a station junction still travels. The construction
+generates its own internal track, then its refresh snaps the entrance.
+Ordinary road and track builds do not use this branch removal.
+
+`lua_mod.rs` reproduces the recorded depot topology: before the fix its
+first build contains four duplicate nodes and edges; afterwards it contains
+none, and the stand-in engine accepts the refresh. A longer station
+entrance test preserves the external road junction, and a refused refresh
+still reports failure. These are Lua regression tests, not a successful
+real-game replay. The PC crashed after the original test session; the
+remaining acceptance check is a fresh two-game placement onto existing
+track, followed by buying and assigning a train and verifying its route
+in both games. The change does not repair already broken placements.
+
 ### Module edits and upgrades
 
 The old construction and the new parameters come off the proposal; every
@@ -318,8 +348,25 @@ proposals on build 40408 (read from the binary: `UI::CGameUI` forwards
 `builder.proposalCreate` for six other tools only), so the hook reads its
 proposal natively at its call of `CommandList::Add` and hands the GUI the
 same table a tool's proposal would be ([HOOKS.md](HOOKS.md), "The module
-editor"). What TPF3 shows of an edit's proposal is INFERRED from TPF2's
-shape and a static reading until an edit is seen in the game.
+editor"). A real module edit was captured on Steam build 40408 on
+2026-10-01: it replaces the old construction and rebuilds its own tracks.
+The two-track station removes 50 nodes and 48 edges, but its component
+lists only 46 frozen nodes. Its four unfrozen track ends each touch one
+of its frozen edges. Capture accepts an unfrozen removed node only when
+every incident edge is frozen in that construction and also removed by
+the edit. An endpoint shared with external track, an empty incidence
+list, or an unreadable list is refused. The regression test covers those
+boundaries; capture evidence alone does not prove replay in both games.
+
+The corrected capture was then exercised in two launcher-started games on
+the local server, from a save containing that station: a platform extension
+from the guest was applied in both games and was visible in the host.
+Read-only queries of the resulting station's flattened parameters matched
+exactly. A second module edit and an eight-track, 320 m station placement
+also applied in both games; all 54 shared network checkpoints through step
+2700 agreed. This proves those edits, not every module type or an edit that
+also rebuilds external connecting track. One host startup failed before
+testing and succeeded on rejoin; that loading failure remains unresolved.
 
 ### Demolish
 
@@ -410,7 +457,7 @@ replaces another, signals and waypoints stay refused.
 ## The action schema
 
 What an intent's payload carries: `tpf3mp_proto::action`, version
-`ACTION_SCHEMA_VERSION` (9; 8 had no two-sided stop (`PlaceStop::two_sided`) and no notification sound (`NotificationSeen`), 7 had no company colour (`CompanyOp::Recolor`), 6 had no prospecting, 5 always named a first stop, 4 had no construction connections, 3 TPF2's
+`ACTION_SCHEMA_VERSION` (10; 9 had no manual departure (`VehicleChange::ManualDeparture`), no signals (`PlaceStop::object`, `one_way`) and no link decorations, lock, owner or lanes (`Link::decorations`, `locked`, `owned`, `lanes`), 8 had no two-sided stop (`PlaceStop::two_sided`), no notification sound (`NotificationSeen`), no company ranks (`ApplyRank`) and no company head's operations (`CompanyOp::Lock`, `Unlock`, `Dismiss`, `ShareStations`), 7 had no company colour (`CompanyOp::Recolor`), 6 had no prospecting, 5 always named a first stop, 4 had no construction connections, 3 TPF2's
 vehicles and lines, 2 no edge kinds or removed nodes, 1 no road style). The Lua mod builds an action from a captured
 command, the payload travels opaque through the server, and every replica
 resolves it against its own world by the rules above. Everything a TPF2
@@ -440,7 +487,7 @@ appended.
 
 | action | carries |
 |---|---|
-| `BuildRoad` | street type (TF3: its road template), road style (TF3), bus lane, tram track (none, plain, electric), a polyline |
+| `BuildRoad` | street type (TF3: its road template), road style (TF3), bus lane, tram track (none, plain, electric), a polyline whose links may each name their own kind, decorations, the towns' lock and the company's ownership (the road modifiers) |
 | `BuildTrack` | track type (TF3: its road template), road style (TF3), catenary, a polyline |
 | `Bulldoze` | edges of one network by their ends; or a construction by file and position; or a stop, signal or waypoint by its edge, position and model |
 | `BuildConstruction` | file, transform, every parameter (`seed` included), name, the construction it replaces for a module edit, and its connection: the streets and tracks its tool built with it, as a polyline whose every link names its kind |
@@ -449,7 +496,7 @@ appended.
 | `CreateLine` | name, colour, the line as the game keeps it: stops (station group, terminal, other terminals, load mode, waiting times, loading rules per cargo), transport modes, settings |
 | `EditLine` | a line and one change: rename, recolour, the whole line anew, or delete |
 | `AssignLine` | vehicles, the line or none, the first stop or none for the game's choice ("Next Reachable Stop") |
-| `PlaceStop` | the edge (network and ends), the position along it, the engine's `left` flag, the originator's unit direction there, the stop's construction, and whether it is two-sided |
+| `PlaceStop` | a stop, waypoint or signal (`object`): the edge (network and ends), the position along it, the engine's `left` flag, the originator's unit direction there, its construction, whether a stop is two-sided and whether a signal is one-way |
 | `Terraform` | the grid: corner, cell size, columns, and each cell's target and previous height |
 | `CompanyOp` | create, join, rename or delete a company |
 | `Loan` | take a loan (the offer taken and the offer the game drew to follow it) or pay one back, each on its terms as TF3's loan script keeps them, the interest in millionths |
@@ -457,6 +504,7 @@ appended.
 | `ReplaceVehicle` | a vehicle and its new consist, as `BuyVehicle` carries one, each part also saying which of the vehicle's own parts it keeps (by index, same model), or none for a part bought new; its groups and multiple units. One vehicle each: a group edit is one action per vehicle, as the game sends it |
 | `NotificationSeen` | a notification's popup played its first sound: every game's Notifications script marks it (its `initialSound` event), so no game plays it again |
 | `Prospect` | prospecting near a town: the town, the cargo, the industry types that may be found in the originator's menu's order, and the company permit it uses. The outcome is not in it: every game's company script draws it from the game time, months later, alike ([investigation](../investigation/TPF3_PROSPECTING_2026-09-30.md)) |
+| `ApplyRank` | a company rank to take, as the company window sends the game's growth script (`applyLevel`); the acting player's company takes it ([HOOKS.md](HOOKS.md), "Company ranks") |
 
 **Polylines.** A road or track build is a polyline: the tool's proposal by
 positions, the originator's decisions included:
@@ -540,15 +588,45 @@ on build 40408 the game cannot read a script proposal that removes an edge
 a configuration still names (`makeProposalData` raises "Unknown exception"
 from its worker threads): the replay removes the configurations at the ends
 of the edges it removes (`nodeConfigsToRemove`), except at a node it removes,
-which takes its own along and may not be named for both, and the game makes
-new ones. A node's own settings (traffic lights, lane connections set by
-hand) go back to the game's defaults there. Before sending, the replay asks
+which takes its own along and may not be named for both. The replay now
+adds preserved configurations back with references to the replacement
+edges (`tpf3mp/junctions.lua`). A split matches the unique replacement
+with the old edge's tangent at that endpoint, including curved roads.
+Missing lanes or an ambiguous replacement refuse the build instead of
+resetting the player's settings. Before sending, the replay asks
 the game's verdict (`makeProposalData`) and refuses a build it calls
 critical, with its reasons.
 The tests `tpf3mp-proto/tests/lua_capture.rs` (a junction rebuilt around a
 new street, a level crossing, a bridge, a tunnel, an upgrade, the TF3
 proposal's shape) and `lua_mod.rs` (the replay) run it in Lua and decode
 the bytes with the Rust schema.
+
+### Junction edits (action schema 11)
+
+`EditJunctions` carries node positions and connected edge endpoints in
+millimetres, lane indices counted from the junction, crosswalk edges,
+the Auto/Yes/No traffic-light preference, a light resource name, ordered
+phases, their locked-lane indices, duration/minimum in milliseconds,
+skip flags, double-slip and custom-phase flags. No engine entity or
+resource integer crosses the wire. A missing configuration is an explicit
+reset. Road/track polylines also carry the junction updates in their
+proposal; construction entrance polylines use the same representation.
+
+The adapter resolves references in three dimensions within 2 mm, refusing
+ambiguity, missing resources, missing lanes and changes to another
+company's edges. Lists are rebuilt in index order before assigning the
+engine's vectors. It preserves the phase-to-connection relationship.
+The schema caps an edit at 64 junctions, each with 256 connections,
+256 crosswalks and 64 phases, and validates locked indices and durations.
+
+Standalone edits are behind `strict_junctions` in `junctions.lua`, **off
+by default** under PLAN.md Part 3. For the acceptance test, set it true
+in matching mod copies on both test games and use the new hook/profile.
+The capture and replay both refuse edits with it off. Tests cover native
+memory decoding, portable round trips into replicas with different IDs,
+curved-edge preservation, refusal cases and checkpoint differences. This
+is adapter evidence, not a completed real-game playtest. Follow the
+two-game checklist in HOOKS.md before changing the default.
 
 Not in version 1: companion spans (an unchanged bridge span the engine
 re-adds), construction street pieces (`ROADC`), paint and the asset brush,

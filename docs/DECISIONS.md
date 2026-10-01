@@ -83,7 +83,7 @@ regional VPS nodes.
 
 ## D5 (2026-09-18): one team, both TPF2 codebases as input
 
-Julian Cooper (TPF2MP, `tf2mp-relay`) and silver2127 (`tpf2-multiplayer`)
+_Sep (TPF2MP, `tf2mp-relay`) and silver2127 (`tpf2-multiplayer`)
 work on this repository together. Both TPF2 codebases are MIT licensed. Code
 or test vectors taken from them are credited in the file that uses them.
 
@@ -311,6 +311,9 @@ Rejected:
 
 ## D12 (2026-09-27): the launcher plays on the project's server alone
 
+*A proposed amendment below, not decided, lets players change the server in
+the launcher's settings; invites still never switch servers.*
+
 A package's launcher plays on the one server it was built for, the
 project's own (D4), set when the release is built
 (`TPF3MP_DEFAULT_SERVER`). Players do not type a server and cannot choose
@@ -342,6 +345,43 @@ Rejected:
   name any server, and a typo ends in a lonely room.
 - **Following an invite to its server** (as until now): the fail-closed
   reason above.
+
+### D12 amendment (PROPOSED amendment, not decided, 2026-09-30): a default server players may change
+
+**Proposed, for the owner (Juliansgith) to approve or refuse in the pull
+request. D12 above stays in force until then.**
+
+Asked about D12, the user answered after talking with the mod's
+co-developer: "its supposed to be changable". The project's relay,
+`tpf3mp.213-133-98-90.sslip.io:29470`, is the server "everyone more or
+less should be using", so it becomes the default rather than the only one:
+
+- **The launcher defaults to the project's relay.** A package plays on the
+  server it was built for (`TPF3MP_DEFAULT_SERVER`, the release's choice);
+  a build without one, a developer's included, plays on the relay, shown
+  as **EU**. `--server` on the command line still overrides it for one run,
+  for playtests.
+- **Players may change the server in Settings.** The launcher's Settings
+  (and the browser page, and the game's Multiplayer window through
+  `LobbyAction::SetServer`) show the server played on, take another as
+  `host:port` only, and offer **Reset to default**. The choice is
+  remembered in `launcher.json` (`chosen_server`); changing it disconnects
+  and connects to the new server; it is refused while in a room.
+- **Invites still never switch servers.** D12's fail-closed reason stands:
+  an invite that names another server is refused, and Connect with an
+  invite joins on the player's own server. Only the player's own setting
+  changes where they play, so a message cannot send anyone to a server
+  they did not choose. Friends on another server all set it the same.
+- **Trust is unchanged** (D4): a server must have a certificate from a
+  public authority, as the relay does (Let's Encrypt, for its sslip.io
+  name); `--pin-cert` remains for development servers.
+
+This replaces "Players do not type a server and cannot choose another"
+and the rejection of "a server field players can change"; the rejection
+of following an invite to its server stays. The release workflow still
+drafts no release without `TPF3MP_DEFAULT_SERVER`, so each release names
+its server on purpose; the relay in the code is the fallback for builds
+without it.
 
 ## D13 (2026-09-27): invites and support codes are six letters and digits
 
@@ -668,3 +708,256 @@ Rejected:
 - **A company chosen only in the lobby, before the game** (TpF2
   Multiplayer's chips): choosing in the game lets a player change their
   mind, and a player who joins late chooses when they arrive.
+
+## D22 (PROPOSED, not decided, 2026-09-30): who may do what to a company, company passwords and shared stations
+
+**Status: proposed.** Written on feature branch `feat/company-play` on top
+of D21's pull request; it is not a decision until the owner (Juliansgith)
+approves it (AGENTS.md, "Decisions are the owner's").
+
+The ask, on 2026-09-30: "lets work some more on the ingame ui company
+switching picking colors company passwords, access control use other
+companies stations".
+
+- **A company's head.** The player who founded a company is its head while
+  they play for it; after that, the player who has played for it longest.
+  The room's first company is everyone's: it has no head.
+- **Who may do what.** Any of a company's players builds, buys, runs
+  lines, borrows and pays back, renames and recolours it (as D21). Its
+  head alone gives it a password, changes it or takes it away, sends a
+  player out of it (they play for the room's first company again; what
+  they built stays the company's), and opens or closes its stations to
+  other companies' lines. Its last player dissolves it once it owns
+  nothing (as D21). Anyone joins a company without a password, the room's
+  first always.
+- **A password to join.** Joining a company with a password needs it. The
+  player types it in the game; it travels beside the action to the server
+  and no further. The server orders the action with the password's seal,
+  an HMAC under its key bound to the room and the company, and every game
+  compares that seal with the one the company keeps. No game, log or save
+  ever holds the password, and the seal gives nothing away without the
+  server's key (as D13 keeps room passwords). A player may send 20
+  passwords in 10 minutes, as D13 holds room passwords to guessing.
+- **Enforced where every game checks the same way.** Every rule is checked
+  by every game when the room orders the action (`tpf3mp/companies.lua`),
+  so one game's window deciding otherwise changes nothing; the server
+  checks only what only it can, the password.
+- **Using another company's stations.** A company's lines may stop at
+  another company's stations: stopping changes nothing the station's
+  company owns (D21 forbids changing or removing it). Stations start
+  open; a company's head may close them to other companies' lines, and
+  every game then refuses a new or changed line that stops there. The
+  station's upkeep stays its owner's, and a line's fares and costs its
+  company's, as TPF2MP's shared stations kept them. A company's vehicles
+  still use its own depots.
+
+Rejected:
+
+- **The password in the action, hashed by the player's game**: a hash
+  every game can check is one any player can replay, or guess against
+  offline.
+- **The server tracking who plays for which company**: it would need the
+  game's own refusals (a company that still owns something cannot be
+  dissolved) to keep its copy right; the games know that, the server does
+  not.
+- **Every player a say, or only the founder for good**: a vote needs
+  rounds a room does not have; a founder who left would lock the company
+  forever.
+- **Sharing always on, or chosen station by station** (TPF2MP had always
+  on, with a list of companies per company): one switch per company is
+  what a player can see and understand; a list per company or station can
+  follow if players ask.
+
+## D23 (proposed, 2026-09-30): a company's progression is its share of each town, by deliveries and rating
+
+**Proposed, not decided: the owner (Juliansgith) approves or changes it.**
+
+Asked for on 2026-09-30: "we need to split the population to rank up
+mechanic based on two factors, company rating and cargo + passengers
+delivered per town then after the split add it up and that is the
+company's score for progression", made precise the same day: "it should be
+more on company rating per town when summing them all up, after the split
+multiply by company rating/100".
+
+What the game does (investigation/TPF3_PROGRESSION_2026-09-30.md): its
+growth script keeps one company, the save's player. Its experience is the
+highest world population it has seen, every town's residents whoever
+serves them; its rank is the game's thresholds on that. There is no rating
+of a company: the rating is the town's (its authority score, the lowest of
+six parts), one for everyone.
+
+Proposed:
+
+- **One company, the game's own.** With one company in the room (co-op)
+  nothing changes: the game keeps its own score and rank, and a rank the
+  company window takes goes to the game's growth script as its own event,
+  in every game at the same update.
+- **More than one: each town split.** Each company's score is the sum over
+  the towns of
+
+  `population x share x rating / 100`
+
+  - *population*: the town's residents, as the game counts them for its
+    own score;
+  - *share*: the company's share of the cargo delivered to the town in the
+    last half year and of the passengers travelling to and from it on
+    lines (averaged over the same half year), both from the game's own
+    statistics per line, each line the company's that owns it. The two
+    shares are weighed cargo 1 : passengers 1 (`progression.WEIGHTS`), a
+    kind nobody carries there left out;
+  - *rating*: the company's rating in that town, 0 to 100: the game's town
+    rating with the two parts a company earns itself taken from its own
+    lines by the game's own formulas (its passengers' happiness, its
+    cargo on time), and the town's other parts (reputation, traffic,
+    noise, pollution) as they are, the same for every company.
+- **As the game's.** The score is taken four times a game month; the
+  experience is the highest score reached and never falls; the rank it
+  reaches is the game's own thresholds, and a company takes a rank it
+  reached through the company window, which then gives it the game's
+  permits (prospecting among them). The room's first company begins from
+  the rank it earned before there were two.
+- **The same in every game.** It is computed in the mod's game script
+  from the simulation's state only, at the same game time in every game,
+  and each town's parts and each score are written to `hook.log`.
+
+Open for the owner:
+
+- Split this way, the companies' scores add up to at most the world's
+  population times the ratings, while the game's thresholds are set for
+  one company holding the whole world: with two even companies each needs
+  roughly twice the world's growth for a rank. Scaling the thresholds by
+  the number of companies, or not, is the owner's call; nothing is scaled
+  now.
+- The room's first company keeps the experience the game gave it, which
+  is the whole world's; the others begin at nothing.
+- The game's own rank-up notices and its ticket price bonus follow the
+  save's player alone (the growth script's); the others' are not shown.
+
+Rejected:
+
+- **Two splits added up** (by rating, and by deliveries, each a share of
+  the population): the request's second wording multiplies by the rating
+  instead, so a well-served town that rates a company badly gives it
+  little.
+- **One rating per company over all towns**: the game has none, and the
+  request is for the rating in each town.
+
+## D24 (2026-09-30, proposed): the launcher's window opens with the lobby in the game
+
+*Proposed for the owner (Juliansgith) to decide; not in force until
+approved.* The user asked on 2026-09-30 for "a nice ui multiplayer button in
+game, join a lobby from a multiplayer button in game, move away from having
+all the lobby stuff in the launcher".
+
+- **The game is where players play the lobby.** The main menu's
+  Multiplayer cards and button open the window that connects, creates and
+  joins rooms (with the save the room starts from, its rules, players and
+  password), shows the players, chats, gets ready and starts (D17 as
+  amended; LOBBY.md).
+- **The launcher's window starts the game and shows where things stand.**
+  Its big button starts Transport Fever 3 with the hook (D11 stays: the
+  launcher is still the only way the hook runs), then follows the room's
+  world; the rest shows the server, the room and its players read-only,
+  the session log, the support code, updates and settings. It holds the
+  connection, as before.
+- **The page's lobby stays one click away** ("Lobby in this window
+  instead"), and in the browser page (`--browser`) as it is, for a game
+  whose menu the hook cannot reach, so that costs the player nothing
+  (D17's amendment). The launcher's backend keeps every lobby action; the
+  auto-room flags and tests use it as before.
+
+This touches D20, which says the window shows in each state what the
+page's `view.js` shows: by default it now shows less than the page
+(`view::present_in_game`), and the page's states are what it shows with
+the lobby in the window (`view::present`, rendered by
+`tests/screenshots.rs` as before, next to the `g*` screens of the default).
+
+Rejected:
+
+- **Removing the lobby from the launcher**: a game update that moves the
+  menu's code would leave players unable to play until TPF3-MP catches up.
+- **A pause-menu Multiplayer entry**: in the room's game the game bar's
+  Multiplayer window has the room, and a copy of the pause menu is one
+  more game file to carry over on every patch.
+
+## D25 (2026-09-30, *proposed*): players may differ in personal mods
+
+*Proposed, for the owner (Juliansgith) to approve or refuse. Nothing here is
+decided until then.*
+
+The user, on 2026-09-30: "scan a lua mod for what functions it calls and so
+long as it doesn't call any ones that could cause a desync, or if it does
+changes we cancel and replay them anyways", and of a timetable mod:
+"timetables would cancel and replay but only on the player's own vehicles,
+we just have to intercept certain lua functions."
+
+- A room's players must run the same **shared** mods, in the same version
+  and order, as now. They may differ in **personal** mods: mods that only
+  change what one player sees, whose every change to the world goes through
+  `api.cmd` from the GUI, where the room's guard carries it to every game or
+  refuses it ([MODS.md](MODS.md)).
+- A static scan (`tpf3mp-modscan`) sorts each listed mod, failing closed: a
+  mod it cannot read, or whose files it does not know, is shared. The room's
+  content check compares the shared mods alone.
+- Every game loads the room's world with the save's shared mods and its own
+  player's personal mods, leaving out other players' personal mods; nothing
+  is stripped from a save.
+- A game-script mod whose game scripts act only through commands the room
+  carries from them (a timetable mod, a line namer: **carried**) may be
+  personal once the measurements in MODS.md ("To measure in the game") pass:
+  its player's game alone runs it, its commands go to the room as actions
+  for that player's own company's vehicles and lines, and every game
+  applies them. Until then it is shared unless the player asks
+  (`--personal-game-scripts`).
+- `"cosmetic": true` in a mod's manifest decides nothing: mods that change
+  the world say it too.
+
+Rejected:
+
+- **Trust the scan alone**: Lua reaches anything by a name built at run
+  time; what the scan misses, the guards refuse.
+- **Trust "cosmetic"**: see above.
+- **Strip personal mods from the save before it is handed out**: the game
+  writes a save's mod list natively (`GameSaveCommandData.modDescs`); every
+  game choosing its own list at load needs no change to the save.
+- **Let a personal game-script mod act in its own game**: it would change
+  that world alone.
+
+Touches: PLAN.md, Part 3, "a rule for mods that send commands from the GUI",
+left open for the team: this proposes the guard's answer (carried, else
+refused), which the owner settles. "The room's required mods from Mod Hub
+IDs" stands. No "mods round" in which the host sends its mods to joiners was
+found in the code or the docs of `dev` (2026-09-30); if one is planned, it
+would send the shared mods only.
+
+## D26 (2026-09-30, *proposed*): a room's owner may list it publicly
+
+*Proposed for the owner (Juliansgith) to decide; not in force until
+approved.* The user asked on 2026-09-30 for a room browser in the game's
+Multiplayer window: "a scrollable list where the buttons are the map type
+the host picks, shows the lobby name, number of players/number of
+companies and what year it is".
+
+- **Private stays the default.** A room is joined by the invite its
+  members pass on, as D13 has it, unless its owner creates it **public**
+  (`CreateRoom::listing`). Nothing about a private room is ever listed.
+- **A public room's invite is public.** The server's list
+  (`ListRooms`, 20 a page) gives each public room's invite, name, rules,
+  players and limit, whether it has a password, its phase, and what its
+  owner declares: the map's climate, the game's year and its companies.
+  A password still guards a public room.
+- **Kept in memory only.** The server stores a public room's invite beside
+  the room, never in its log, so a room restored after a restart is
+  private again, and its log gives no invite away (D13).
+- **Bounded and rate-limited.** A page holds at most 20 rooms; a connection
+  asks for one page a second, with a burst of five.
+
+This narrows D13's "invites cannot be used to probe which rooms exist" to
+private rooms: a public room is meant to be found.
+
+Rejected:
+
+- **Public by default**: invites were private until now, and players who
+  shared one with friends did not agree to strangers joining.
+- **Listing without the invite, joining by room id**: a second way into a
+  room beside the invite, for the same result.

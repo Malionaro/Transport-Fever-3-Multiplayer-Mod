@@ -8,6 +8,7 @@ pub mod diagnostics;
 mod follower;
 pub mod launcher;
 pub mod logs;
+pub mod picker;
 mod playout;
 pub mod save_check;
 pub mod steam;
@@ -37,8 +38,8 @@ use tpf3mp_proto::{
     CONTROL_MAX_FRAME, ChatText, ClientMessage, ContentDiff, ContentManifest, CreateRoom,
     DATAGRAM_MAX_FRAME, Datagram, GameMessage, Hello, IntentRejection, Invite, JoinRoom,
     LaneDigest, PROTOCOL_VERSION, Payload, Platform, PlayerId, RejectReason, Request, RequestError,
-    Response, RoomView, SavedWorld, ServerMessage, SnapshotId, Speed, TURN_MAX_FRAME, Text, Turn,
-    TurnMessage, TurnStart, Welcome, decode_frame, encode_frame,
+    Response, RoomView, SavedWorld, Secret, ServerMessage, SnapshotId, Speed, TURN_MAX_FRAME, Text,
+    Turn, TurnMessage, TurnStart, Welcome, decode_frame, encode_frame,
 };
 
 pub use follower::{Action, FollowError, TurnFollower};
@@ -128,6 +129,9 @@ pub struct ConnectOptions {
     /// Where the lines of this player's log wait to go to the server
     /// ("Diagnostics" in PROTOCOL.md). `None` sends none.
     pub diagnostics: Option<diagnostics::Recorder>,
+    /// The banner this player shows in rooms, told the server on every
+    /// connection (`Request::SetBanner`); `None` for the default.
+    pub banner: Option<tpf3mp_proto::BannerId>,
 }
 
 impl ConnectOptions {
@@ -163,6 +167,7 @@ impl ConnectOptions {
             route: Route::Udp,
             fallback_after: FALLBACK_AFTER,
             diagnostics: None,
+            banner: None,
         }
     }
 }
@@ -526,6 +531,18 @@ async fn connect_within(
             },
         ));
     }
+    if let Some(banner) = options.banner.clone() {
+        // Before anything else this connection asks, on the same stream.
+        let requests = requests.clone();
+        tokio::spawn(async move {
+            if let Err(error) = requests
+                .request(tpf3mp_proto::Request::SetBanner(Some(banner)))
+                .await
+            {
+                tracing::debug!(%error, "the server did not take the banner");
+            }
+        });
+    }
     Ok((
         Client {
             endpoint,
@@ -627,6 +644,17 @@ impl Client {
         }
     }
 
+    /// Page `page` of the server's public rooms.
+    pub async fn list_rooms(&self, page: u16) -> Result<tpf3mp_proto::RoomPage, ClientError> {
+        match self
+            .request(tpf3mp_proto::Request::ListRooms { page })
+            .await?
+        {
+            tpf3mp_proto::Response::Rooms(page) => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn join_room(&self, join: JoinRoom) -> Result<RoomView, ClientError> {
         match self.request(Request::JoinRoom(join)).await? {
             Response::RoomJoined(room) => Ok(room),
@@ -671,9 +699,22 @@ impl Client {
     }
 
     pub async fn send_intent(&self, client_seq: u64, payload: Payload) -> Result<(), ClientError> {
+        self.send_intent_with(client_seq, payload, None).await
+    }
+
+    /// An intent with the password it needs, such as a company's: the room
+    /// orders it with the password's seal, never the password (PROTOCOL.md,
+    /// "Secrets").
+    pub async fn send_intent_with(
+        &self,
+        client_seq: u64,
+        payload: Payload,
+        secret: Option<Secret>,
+    ) -> Result<(), ClientError> {
         self.send(GameMessage::Intent {
             client_seq,
             payload,
+            secret,
         })
         .await
     }

@@ -49,10 +49,11 @@ with your friends in one world, each with your own company or sharing one.
    TPF3-MP.
 3. **Start the launcher**, `TPF3-MP.exe`. The first time, Windows may warn
    about an unknown app: choose **More info**, then **Run anyway**.
-4. **Connect** with the name others will see, then **create a room** and
-   send the invite, or **join** with the invite a friend sent you.
-5. **Start Transport Fever 3 from the launcher**, press **Ready**, and play
-   once the room's owner starts the game.
+4. **Start Transport Fever 3 from the launcher.**
+5. **Click Multiplayer** on the game's main menu: connect with the name
+   others will see, then **create a room** from one of your saves and send
+   the invite, or **join** with the invite a friend sent you. You are
+   ready by yourself; play once the room's owner starts the game.
 
 Only a game the launcher starts joins the room; started from Steam,
 Transport Fever 3 is the plain game, with nothing of TPF3-MP in it.
@@ -76,7 +77,7 @@ is in [docs/PLAYING.md](docs/PLAYING.md).
 - The launcher is **tearded's TPF2 Multiplayer Launcher**, brought to
   Transport Fever 3.
 - TPF3-MP builds on two Transport Fever 2 multiplayer mods by its team:
-  **TPF2MP** by Julian Cooper and **TpF2 Multiplayer** by silver2127.
+  **TPF2MP** by _Sep and **TpF2 Multiplayer** by silver2127.
 - The city in the launcher is a Transport Fever 2 screenshot, and the
   logo is Transport Fever 3's, both © Urban Games, used under their
   fan-content terms.

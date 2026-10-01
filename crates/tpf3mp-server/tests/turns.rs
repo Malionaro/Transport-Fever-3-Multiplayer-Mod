@@ -30,6 +30,7 @@ fn commands(player: &Player) -> Vec<(PlayerId, u64, Vec<u8>)> {
                 player,
                 client_seq,
                 payload,
+                ..
             } => Some((*player, *client_seq, payload.as_bytes().to_vec())),
             _ => None,
         })

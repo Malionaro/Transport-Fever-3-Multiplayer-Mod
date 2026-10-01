@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContentDiff, ContentManifest, Platform, Text,
+    BoundedVec, ContentDiff, ContentManifest, Platform, Text,
     bytes::{FixedBytes, Payload},
     ids::{Invite, PlayerId, RoomId, SessionId, Signature},
     snapshot::{SavedWorld, SnapshotId},
@@ -160,6 +160,100 @@ pub enum Request {
     /// every member loads it, the owner too. Declaring another replaces it.
     /// Only on a server that keeps snapshots.
     StartWorld(SavedWorld),
+    /// The server's list of public rooms (those created with a
+    /// [`CreateRoom::listing`]), [`ROOMS_PER_PAGE`] a page from `page` 0.
+    /// Answered with [`Response::Rooms`]. A private room is never listed.
+    ListRooms {
+        page: u16,
+    },
+    /// The owner of a public room says what the list shows of it now, such
+    /// as the game's year and its companies once it runs. A private room
+    /// stays private (`NotListed`).
+    DescribeRoom(RoomListing),
+    /// The picture this player shows in rooms, one of [`BANNERS`] by id;
+    /// `None` for their default. Kept for the connection, and shown to the
+    /// room this player is in at once. Unknown ids are refused
+    /// (`UnknownBanner`).
+    SetBanner(Option<BannerId>),
+}
+
+/// A player's banner: one of [`BANNERS`], by id.
+pub type BannerId = Text<16>;
+
+/// The banners players pick from: short ids, each standing for one of the
+/// game's own pictures (the window maps them; the server only checks the
+/// id). A player who picks none shows one chosen from their key.
+pub const BANNERS: &[&str] = &[
+    "m01",
+    "m02",
+    "m03",
+    "m04",
+    "m05",
+    "m06",
+    "m07",
+    "m08",
+    "temperate",
+    "subarctic",
+    "tropical",
+    "dry",
+    "mapeditor",
+    "mapeditor2",
+    "mod01",
+    "mod02",
+    "main",
+    "loadgame",
+    "loading1",
+    "loading2",
+    "loading3",
+    "loading4",
+];
+
+/// Whether `id` names one of [`BANNERS`].
+pub fn is_banner(id: &str) -> bool {
+    BANNERS.contains(&id)
+}
+
+/// Most rooms a page of the room list holds.
+pub const ROOMS_PER_PAGE: usize = 20;
+
+/// What the room list shows of a public room besides what the server knows
+/// itself: what its owner declares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomListing {
+    /// The world's map type: its climate, as the game names it, such as
+    /// `temperate` (`::/climates/temperate/temperate.clima`); empty when
+    /// the owner's game did not say.
+    pub map: Text<32>,
+    /// The game's year: the start year until the owner says another; 0
+    /// when unknown.
+    pub year: u16,
+    /// The companies playing in the room's game.
+    pub companies: u8,
+}
+
+/// One public room, as the room list shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedRoom {
+    /// The room's invite: a public room's is for anyone to join with.
+    pub invite: Invite,
+    pub name: Text<48>,
+    pub rules: RulesName,
+    pub players: u8,
+    pub max_players: u8,
+    pub has_password: bool,
+    pub phase: RoomPhase,
+    pub listing: RoomListing,
+    /// The room's play style, as its owner chose it ([`CreateRoom::competitive`]).
+    pub competitive: bool,
+}
+
+/// A page of the room list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomPage {
+    pub page: u16,
+    pub rooms: BoundedVec<ListedRoom, ROOMS_PER_PAGE>,
+    /// Whether a later page has more.
+    pub more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +265,16 @@ pub struct CreateRoom {
     /// One of the rules the server offers (see [`Welcome::rules`]), or its
     /// default.
     pub rules: Option<RulesName>,
+    /// `Some` lists the room in the server's room list, where anyone sees
+    /// it and its invite; `None`, the default, keeps it private: joined
+    /// only by an invite its members pass on.
+    pub listing: Option<RoomListing>,
+    /// The play style the owner means the room for: `false` co-op (every
+    /// player for the room's one company, as a room starts, D21), `true`
+    /// competitive (each player for a company of their own). The server
+    /// only carries it: players see it and found their companies in the
+    /// game as D21 lets them.
+    pub competitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +305,7 @@ pub enum Response {
     RoomCreated { invite: Invite, room: RoomView },
     RoomJoined(RoomView),
     Done,
+    Rooms(RoomPage),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +342,10 @@ pub enum RequestError {
     WorldsNotKept,
     /// The world the room starts from is still on its way to the server.
     StartWorldPending,
+    /// The room is private: it is in no list to describe.
+    NotListed,
+    /// No such banner (see [`BANNERS`]).
+    UnknownBanner,
 }
 
 impl fmt::Display for RequestError {
@@ -266,6 +375,8 @@ impl fmt::Display for RequestError {
             Self::StartWorldPending => {
                 "the save the room starts from is still being uploaded; start once it is there"
             }
+            Self::NotListed => "the room is private, so it is in no list",
+            Self::UnknownBanner => "there is no such banner",
         })
     }
 }
@@ -330,6 +441,8 @@ pub struct RoomView {
     pub phase: RoomPhase,
     pub settings: RoomSettings,
     pub members: Vec<MemberView>,
+    /// The play style ([`CreateRoom::competitive`]).
+    pub competitive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +459,8 @@ pub struct MemberView {
     pub ready: bool,
     pub content: Option<ContentFingerprint>,
     pub connected: bool,
+    /// The banner this player picked, if any.
+    pub banner: Option<BannerId>,
 }
 
 /// A client's game traffic, carried on the control stream.
@@ -354,6 +469,10 @@ pub enum GameMessage {
     Intent {
         client_seq: u64,
         payload: Payload,
+        /// A password the intent needs, such as a company's: the server
+        /// seals it ([`crate::Seal`]) into the event it orders, and neither
+        /// logs nor relays the password itself.
+        secret: Option<Secret>,
     },
     /// The last step this client has executed.
     Progress {
@@ -370,6 +489,30 @@ pub enum GameMessage {
         lanes: Vec<LaneDigest>,
         world: Option<SavedWorld>,
     },
+}
+
+/// A password a player typed for an intent: a company's, to join it or to
+/// set it (docs/PROTOCOL.md, "Secrets"). It goes to the server beside the
+/// intent and no further: the server orders the intent with a
+/// [`crate::Seal`] of it, an HMAC under the server's key, which every game
+/// compares with the seal it keeps. `Debug` never shows the password, so a
+/// log line of the message gives nothing away.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Secret {
+    /// What the password is for, as the intent names it (a company's id).
+    /// The seal binds it, so a password sealed for one company fits no
+    /// other.
+    pub scope: u64,
+    pub password: Text<64>,
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Secret")
+            .field("scope", &self.scope)
+            .field("password", &"<hidden>")
+            .finish()
+    }
 }
 
 /// The digest of one lane of world state at a checkpoint.

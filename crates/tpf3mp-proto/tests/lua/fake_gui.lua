@@ -15,6 +15,11 @@
 -- investigation/dayone-2026-09-29/probe/script_api_dump_gui.txt).
 package.preload = nil
 
+api = { gui = { StyleSheet = { new = function() return {} end } }, type = {
+	Vec2f = { new = function(x, y) return { x = x, y = y } end },
+	Vec4f = { new = function(x, y, z, w) return { x = x, y = y, z = z, w = w } end },
+} }
+
 LOG = {}
 function debugPrint(line)
 	LOG[#LOG + 1] = tostring(line)
@@ -62,14 +67,15 @@ end
 
 local builtin = { type = {
 	Orientation = { Horizontal = "Horizontal", Vertical = "Vertical" },
-	ScrollBarPolicy = { Simple = "Simple", AlwaysOff = "AlwaysOff" },
+	ScrollBarPolicy = { Simple = "Simple", AlwaysOff = "AlwaysOff", AsNeeded = "AsNeeded" },
 } }
 function builtin.BoxLayout(params)
 	return { layout = "BoxLayout", params = params }
 end
 -- A view is a recipe the game has: called, it gives the node; its name
 -- says which recipe a wrapper wraps.
-for _, view in ipairs({ "TextView", "Button", "ScrollArea", "Component", "TextInputField", "Window" }) do
+for _, view in ipairs({ "TextView", "Button", "ScrollArea", "Component", "TextInputField", "Window",
+		"ColorChooserButton" }) do
 	builtin[view] = setmetatable({ viewName = view }, {
 		__call = function(_, params) return { view = view, params = params } end,
 	})
@@ -111,7 +117,16 @@ hud_icon_toolbox.HudIconMasterGame = react.RegisterRecipe("HudIconMasterGame", f
 	return { view = "Marker", params = { entity = params.entity } }
 end)
 
+-- The game's ownership test, as its line manager asks it
+-- (scripts/entity_util.tl): here, whether OWN_OR_NO_ONES[entity] is set.
+local entity_util = {}
+OWN_OR_NO_ONES = {}
+function entity_util.isOwnedByPlayerOrNotOwned(entity)
+	return OWN_OR_NO_ONES[entity] == true
+end
+
 local GAME = {
+	["/scripts/entity_util.tl"] = entity_util,
 	["::/gui/main/react.lua"] = react,
 	["::/gui/main/builtin.lua"] = builtin,
 	["::/gui/game_bar/game_bar_widgets.tl"] = game_bar_widgets,
@@ -128,6 +143,8 @@ UG_REQUIRED = {}
 function ug_require(path)
 	UG_REQUIRED[#UG_REQUIRED + 1] = path
 	if GAME[path] then return GAME[path] end
+	-- A test's stand-ins for more of the game's modules, by their path.
+	if GAME_MODULES and GAME_MODULES[path] then return GAME_MODULES[path] end
 	if loaded[path] then return loaded[path] end
 	assert(path:sub(1, #MOD) == MOD, "ug_require of an unknown path " .. path)
 	local rel = path:sub(#MOD + 1)

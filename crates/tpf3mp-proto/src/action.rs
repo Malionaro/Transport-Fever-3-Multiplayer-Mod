@@ -34,12 +34,20 @@ use crate::{
 /// Version of the action schema, the first thing in an action's payload.
 /// Players in one room run the same mod, so their versions match; a payload
 /// of any other version is refused, never guessed at.
-pub const ACTION_SCHEMA_VERSION: u32 = 9;
+pub const ACTION_SCHEMA_VERSION: u32 = 11;
 
 /// Most vertices, and most links, in one road or track build. A 23-segment
 /// track was the longest single TPF2 build measured.
 pub const MAX_VERTICES: usize = 512;
 pub const MAX_LINKS: usize = 512;
+/// Decorations one edge carries.
+pub const MAX_DECORATIONS: usize = 8;
+/// Lanes one edge has.
+pub const MAX_LANES: usize = 32;
+/// Junctions changed by one tool stroke, and connections/phases per junction.
+pub const MAX_JUNCTIONS: usize = 64;
+pub const MAX_CONNECTIONS: usize = 256;
+pub const MAX_PHASES: usize = 64;
 /// Most edges one action removes or bulldozes.
 pub const MAX_EDGES: usize = 256;
 /// Most parameters of one construction, nested modules counted one by one.
@@ -181,6 +189,59 @@ pub struct NodeRef {
     pub at: Pos,
 }
 
+/// A turn through a junction. Lane indices are counted from the junction,
+/// as in TF3, so reversing an edge's local entity numbering changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneConnection {
+    pub incoming: EdgeRef,
+    pub lane_in: u16,
+    pub outgoing: EdgeRef,
+    pub lane_out: u16,
+    pub road: bool,
+    pub tram: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrafficPreference {
+    Auto,
+    Yes,
+    No,
+}
+
+/// Durations in milliseconds. Locked indices address connections followed
+/// by crosswalks, in the order carried by JunctionConfig (never entity ids).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficPhase {
+    pub locked: BoundedVec<u16, MAX_CONNECTIONS>,
+    pub duration: u32,
+    pub minimum: u32,
+    pub skip: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JunctionConfig {
+    pub connections: BoundedVec<LaneConnection, MAX_CONNECTIONS>,
+    pub crosswalks: BoundedVec<EdgeRef, MAX_CONNECTIONS>,
+    pub preference: TrafficPreference,
+    /// None is the game's default light type (-1); otherwise a resource name.
+    pub light: Option<ResName>,
+    pub phases: BoundedVec<TrafficPhase, MAX_PHASES>,
+    pub double_slip: bool,
+    pub custom_phases: bool,
+}
+
+/// None removes a configuration and restores the game's defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JunctionChange {
+    pub node: NodeRef,
+    pub config: Option<JunctionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JunctionEdit {
+    pub changes: BoundedVec<JunctionChange, MAX_JUNCTIONS>,
+}
+
 /// An existing construction, named by its file and its position (the
 /// transform's origin). Matched within 2 m.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -231,6 +292,28 @@ pub struct EdgeKind {
     pub style: Option<ResName>,
 }
 
+/// One lane of an edge, as TF3's `LaneConfig` has it: its speed (in the
+/// game's units, thousandths), width, height and offset in millimetres, its
+/// direction, and the transport modes it carries, a bit for each
+/// `TransportMode` value (a tram track or bus lane is a lane's modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lane {
+    pub speed: i32,
+    pub width: i32,
+    pub height: i32,
+    pub offset: i32,
+    pub forward: bool,
+    pub modes: u32,
+}
+
+/// A decoration along an edge (TF3's `BaseEdge.edgeDecorations`: a noise
+/// barrier, an alley of trees), by its resource, with the game's flag for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decoration {
+    pub name: ResName,
+    pub flag: bool,
+}
+
 /// One new edge between two vertices of its polyline, by index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
@@ -241,6 +324,20 @@ pub struct Link {
     pub structure: Structure,
     /// None for the build's own street or track, in the build's style.
     pub kind: Option<EdgeKind>,
+    /// Its decorations, as the tool left them.
+    #[serde(default)]
+    pub decorations: BoundedVec<Decoration, MAX_DECORATIONS>,
+    /// Locked against the towns' road development
+    /// (`roadDevelopmentLocked`).
+    #[serde(default)]
+    pub locked: bool,
+    /// Owned by the acting company (`PLAYER_OWNED`), as the tool made it.
+    #[serde(default)]
+    pub owned: bool,
+    /// Its lanes, as the tool made them (a tram track, a bus lane); empty
+    /// for its template's own.
+    #[serde(default)]
+    pub lanes: BoundedVec<Lane, MAX_LANES>,
 }
 
 /// The geometry of one road or track build, as the tool proposed it: new
@@ -262,6 +359,8 @@ pub struct Polyline {
     /// Existing nodes removed: TF3's tools move a junction that was near the
     /// new one onto it.
     pub removed_nodes: BoundedVec<NodeRef, MAX_EDGES>,
+    /// Full junction settings, including those a rebuilt edge must preserve.
+    pub junctions: BoundedVec<JunctionChange, MAX_JUNCTIONS>,
 }
 
 #[derive(Deserialize)]
@@ -270,6 +369,8 @@ struct PolylineFields {
     links: BoundedVec<Link, MAX_LINKS>,
     removals: BoundedVec<EdgeRef, MAX_EDGES>,
     removed_nodes: BoundedVec<NodeRef, MAX_EDGES>,
+    #[serde(default)]
+    junctions: BoundedVec<JunctionChange, MAX_JUNCTIONS>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -306,6 +407,7 @@ impl Polyline {
             links,
             removals,
             removed_nodes: BoundedVec::empty(),
+            junctions: BoundedVec::empty(),
         })
     }
 
@@ -315,6 +417,12 @@ impl Polyline {
         self.removed_nodes = nodes;
         self
     }
+
+    #[must_use]
+    pub fn with_junctions(mut self, changes: BoundedVec<JunctionChange, MAX_JUNCTIONS>) -> Self {
+        self.junctions = changes;
+        self
+    }
 }
 
 impl TryFrom<PolylineFields> for Polyline {
@@ -322,7 +430,8 @@ impl TryFrom<PolylineFields> for Polyline {
 
     fn try_from(fields: PolylineFields) -> Result<Self, PolylineError> {
         Ok(Self::new(fields.vertices, fields.links, fields.removals)?
-            .with_removed_nodes(fields.removed_nodes))
+            .with_removed_nodes(fields.removed_nodes)
+            .with_junctions(fields.junctions))
     }
 }
 
@@ -601,6 +710,12 @@ pub enum VehicleChange {
     Reverse,
     /// Leaves its terminal now.
     Depart,
+    /// Waits at its stops until told to leave (true), or leaves by the
+    /// line's own rules again (false): the game's manual departure, which a
+    /// timetable mod holds and releases vehicles with (docs/MODS.md).
+    /// Appended under schema version 10: the variants before it keep their
+    /// bytes.
+    ManualDeparture(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,6 +742,23 @@ pub struct PlaceStop {
     /// names the side the originator's tool put first.
     #[serde(default)]
     pub two_sided: bool,
+    /// What it is: a stop, or a waypoint or signal on a track (the game's
+    /// edge object category).
+    #[serde(default)]
+    pub object: EdgeObjectKind,
+    /// A one-way signal (the signal tool's "oneWay").
+    #[serde(default)]
+    pub one_way: bool,
+}
+
+/// What an edge object placed with the stop and signal tool is (TF3's
+/// `EdgeObject.category`: 0, 1, 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeObjectKind {
+    #[default]
+    Stop,
+    Waypoint,
+    Signal,
 }
 
 /// One terrain cell: the height it is set to and the height it had, in
@@ -716,7 +848,31 @@ pub enum CompanyOp {
         company: CompanyId,
         color: Tint,
     },
+    /// The company's head gives it the password the intent carries beside
+    /// it (a [`crate::Secret`] whose scope is the company), or a new one:
+    /// joining it then needs the password. Every game keeps only the
+    /// password's seal. Appended under schema version 9, as the variants
+    /// after it.
+    Lock(CompanyId),
+    /// The company's head takes its password away: anyone may join again.
+    Unlock(CompanyId),
+    /// The company's head sends a player out of it: they play for the
+    /// room's first company again.
+    Dismiss {
+        company: CompanyId,
+        /// The player, as the mod names players: 64 lowercase hex digits.
+        player: PlayerHex,
+    },
+    /// The company's head opens its stations to other companies' lines, or
+    /// closes them. A company's stations start open.
+    ShareStations {
+        company: CompanyId,
+        open: bool,
+    },
 }
+
+/// A player as the mod names one: their id's 64 lowercase hex digits.
+pub type PlayerHex = Text<64>;
 
 /// A loan on its terms, as Transport Fever 3's loan script keeps it
 /// (`game_mechanics/finance/loan.d.tl`), field for field. Nothing in it
@@ -801,10 +957,23 @@ pub enum Action {
     NotificationSeen {
         notification: u32,
     },
+    /// Taking a company rank the company has reached: what TF3's company
+    /// window sends the company growth script (`Companies` `applyLevel`,
+    /// `game_mechanics/company/company.tl`), the rank being `level` there.
+    /// The acting player's company takes it. Appended under schema version
+    /// 9, after `NotificationSeen`: the variants before it keep their bytes.
+    ApplyRank {
+        /// The rank to take, 1 to 15 in the game.
+        level: u8,
+    },
+    /// Crosswalks, turning lanes and the full traffic-light configuration.
+    EditJunctions(JunctionEdit),
 }
 
 #[derive(Debug, Error)]
 pub enum ActionError {
+    #[error("invalid junction configuration: {0}")]
+    Junction(&'static str),
     #[error("action schema {found}; this game speaks {ACTION_SCHEMA_VERSION}")]
     Schema { found: u32 },
     #[error("malformed action: {0}")]
@@ -816,9 +985,54 @@ pub enum ActionError {
 }
 
 impl Action {
+    /// Validate relationships within a junction, beyond the wire's bounds.
+    pub fn validate(&self) -> Result<(), ActionError> {
+        let changes = match self {
+            Self::EditJunctions(edit) => {
+                if edit.changes.is_empty() {
+                    return Err(ActionError::Junction("empty edit"));
+                }
+                &edit.changes
+            }
+            Self::BuildRoad(road) => &road.polyline.junctions,
+            Self::BuildTrack(track) => &track.polyline.junctions,
+            Self::BuildConstruction(build) => match &build.connection {
+                Some(line) => &line.junctions,
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        for (i, change) in changes.iter().enumerate() {
+            if changes[..i].iter().any(|other| other.node == change.node) {
+                return Err(ActionError::Junction("node changed twice"));
+            }
+            let Some(config) = &change.config else {
+                continue;
+            };
+            for turn in config.connections.iter() {
+                if usize::from(turn.lane_in) >= MAX_LANES || usize::from(turn.lane_out) >= MAX_LANES
+                {
+                    return Err(ActionError::Junction("lane index out of bounds"));
+                }
+            }
+            let count = config.connections.len() + config.crosswalks.len();
+            for phase in config.phases.iter() {
+                if phase.minimum > phase.duration || phase.duration > 86_400_000 {
+                    return Err(ActionError::Junction("invalid phase duration"));
+                }
+                for (j, lane) in phase.locked.iter().enumerate() {
+                    if usize::from(*lane) >= count || phase.locked[..j].contains(lane) {
+                        return Err(ActionError::Junction("invalid or duplicate locked lane"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     /// The payload of an intent carrying this action: the schema version,
     /// then the action, both postcard-encoded.
     pub fn to_payload(&self) -> Result<Payload, ActionError> {
+        self.validate()?;
         let mut bytes = postcard::to_stdvec(&ACTION_SCHEMA_VERSION)?;
         bytes.extend(postcard::to_stdvec(self)?);
         Ok(Payload::new(bytes)?)
@@ -831,10 +1045,11 @@ impl Action {
         if version != ACTION_SCHEMA_VERSION {
             return Err(ActionError::Schema { found: version });
         }
-        let (action, rest) = postcard::take_from_bytes(rest)?;
+        let (action, rest): (Self, _) = postcard::take_from_bytes(rest)?;
         if !rest.is_empty() {
             return Err(ActionError::TrailingBytes(rest.len()));
         }
+        action.validate()?;
         Ok(action)
     }
 }
@@ -855,6 +1070,10 @@ mod tests {
             tangent1: Tangent { x: 1, y: 0, z: 0 },
             structure: Structure::Ground,
             kind: None,
+            decorations: BoundedVec::default(),
+            locked: false,
+            owned: false,
+            lanes: BoundedVec::default(),
         }
     }
 
@@ -942,8 +1161,8 @@ mod tests {
         assert_eq!(
             payload.as_bytes(),
             [
-                9, // schema version
-                5, // Action::SellVehicle
+                11, // schema version
+                5,  // Action::SellVehicle
                 2, 3, 0xac, 0x02, // two ids, varints
             ]
         );
@@ -985,8 +1204,8 @@ mod tests {
         assert_eq!(
             track.to_payload().unwrap().as_bytes(),
             [
-                9, // schema version
-                1, // Action::BuildTrack
+                11, // schema version
+                1,  // Action::BuildTrack
                 1, b't', 1, 1, b's', 1, // track, style Some("s"), catenary
                 2, // two vertices
                 1, 2, 0, 1, 0, // (-1, 1, 0) zigzag, Resolve::Node(Street)
@@ -994,8 +1213,10 @@ mod tests {
                 1, // one link
                 0, 1, 2, 0, 0, 2, 0, 0, 0, // 0 -> 1, tangents, Structure::Ground
                 0, // the build's own kind
+                0, 0, 0, 0, // no decorations, not locked, not owned, no lanes of its own
                 1, 0, 2, 0, 0, 0, 2, 0, // a removal: Street, (1, 0, 0), (0, 1, 0)
                 1, 1, 0, 0, 2, // a removed node: Track, (0, 0, 1)
+                0, // no junction changes
             ]
         );
         // Appended with Prospect under schema version 7: the variants
@@ -1018,7 +1239,7 @@ mod tests {
         assert_eq!(
             replace.to_payload().unwrap().as_bytes(),
             [
-                9,  // schema version
+                11, // schema version
                 14, // Action::ReplaceVehicle
                 3,  // vehicle-3
                 1, 1, b'm', 1, 0, 2, 0, 0, // one part: model, reversed, no loads, colour
@@ -1036,7 +1257,7 @@ mod tests {
         assert_eq!(
             prospect.to_payload().unwrap().as_bytes(),
             [
-                9,  // schema version
+                11, // schema version
                 15, // Action::Prospect
                 3,  // town-3
                 1, b'c', // cargo
@@ -1051,12 +1272,63 @@ mod tests {
         assert_eq!(
             recolor.to_payload().unwrap().as_bytes(),
             [
-                9,  // schema version
+                11, // schema version
                 11, // Action::CompanyOp
                 4,  // CompanyOp::Recolor, appended under schema version 8
                 2,  // company-2
                 2, 0, 0, // the colour, zigzag
             ]
+        );
+        let rank = Action::ApplyRank { level: 6 };
+        assert_eq!(
+            rank.to_payload().unwrap().as_bytes(),
+            [
+                11, // schema version
+                17, // Action::ApplyRank, appended under schema version 9
+                6,  // the rank
+            ]
+        );
+        // Appended under schema version 9: the company's head's own.
+        let cases: [(CompanyOp, &[u8]); 4] = [
+            (CompanyOp::Lock(CompanyId(2)), &[5, 2]),
+            (CompanyOp::Unlock(CompanyId(2)), &[6, 2]),
+            (
+                CompanyOp::Dismiss {
+                    company: CompanyId(2),
+                    player: Text::new("ab").unwrap(),
+                },
+                &[7, 2, 2, b'a', b'b'],
+            ),
+            (
+                CompanyOp::ShareStations {
+                    company: CompanyId(2),
+                    open: false,
+                },
+                &[8, 2, 0],
+            ),
+        ];
+        for (op, bytes) in cases {
+            let payload = Action::CompanyOp(op).to_payload().unwrap();
+            assert_eq!(payload.as_bytes()[..2], [11, 11]);
+            assert_eq!(&payload.as_bytes()[2..], bytes);
+        }
+        let hold = Action::VehicleOp(VehicleOp {
+            vehicle: VehicleId(7),
+            change: VehicleChange::ManualDeparture(true),
+        });
+        assert_eq!(
+            hold.to_payload().unwrap().as_bytes(),
+            [
+                11, // schema version
+                13, // Action::VehicleOp
+                7,  // vehicle-7
+                4,  // VehicleChange::ManualDeparture, appended under schema version 10
+                1,  // held
+            ]
+        );
+        assert_eq!(
+            Action::from_payload(&hold.to_payload().unwrap()).unwrap(),
+            hold
         );
     }
 

@@ -171,6 +171,8 @@ unsafe extern "C" fn add_detour(
                 // Read before the game takes it: the command is the
                 // caller's until Add returns.
                 crate::modules::record(&crate::modules::Process, click, payload);
+            } else {
+                crate::junctions::record(&crate::modules::Process, click, payload);
             }
         }
     }

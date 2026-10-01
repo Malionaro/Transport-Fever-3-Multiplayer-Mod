@@ -18,11 +18,11 @@ use tokio::{
 };
 use tpf3mp_net::{bulk, close};
 use tpf3mp_proto::{
-    ChatText, ContentFingerprint, ContentManifest, Datagram, Event, EventBody, FRAME_HEADER_LEN,
-    IntentRejection, Invite, LaneDigest, MemberView, Payload, Platform, PlayerId, RequestError,
-    Resume, RoomId, RoomPhase, RoomSettings, RoomView, RulesName, SavedWorld, ServerMessage,
-    SnapshotId, Speed, TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, WorldOffer,
-    decode_frame, encode_frame,
+    BannerId, ChatText, ContentFingerprint, ContentManifest, Datagram, Event, EventBody,
+    FRAME_HEADER_LEN, FixedBytes, IntentRejection, Invite, LaneDigest, MemberView, Payload,
+    Platform, PlayerId, RequestError, Resume, RoomId, RoomListing, RoomPhase, RoomSettings,
+    RoomView, RulesName, SavedWorld, Seal, Secret, ServerMessage, SnapshotId, Speed,
+    TURN_MAX_FRAME, Text, Turn, TurnMessage, TurnStart, WorldOffer, decode_frame, encode_frame,
 };
 use tpf3mp_snapshot::{Manifest, ManifestId};
 use tracing::{debug, error, info, warn};
@@ -142,6 +142,8 @@ pub(crate) struct NewMember {
     pub(crate) link: MemberLink,
     /// What the player's game runs, if the player declared it.
     pub(crate) content: Option<Arc<Declared>>,
+    /// The banner the player picked (`Request::SetBanner`), if any.
+    pub(crate) banner: Option<BannerId>,
 }
 
 /// What a player's game runs, as the player declared it.
@@ -226,10 +228,23 @@ pub(crate) enum RoomCommand {
         player: PlayerId,
         datagram: Datagram,
     },
+    /// A member picked another banner.
+    SetBanner {
+        player: PlayerId,
+        banner: Option<BannerId>,
+        reply: Reply,
+    },
+    /// The owner of a public room says what the room list shows of it.
+    Describe {
+        player: PlayerId,
+        listing: RoomListing,
+        reply: Reply,
+    },
     Intent {
         player: PlayerId,
         client_seq: u64,
         payload: Payload,
+        secret: Option<Secret>,
     },
     Progress {
         player: PlayerId,
@@ -348,6 +363,35 @@ impl RoomSecrets {
         .concat()
     }
 
+    /// What a company password's seal signs: the room, the scope the player
+    /// named (the company) and the password, so a seal fits one company of
+    /// one room.
+    pub(crate) fn seal_input(room: &RoomId, scope: u64, password: &Text<64>) -> Vec<u8> {
+        [
+            b"company password".as_slice(),
+            &room.0.0,
+            &scope.to_le_bytes(),
+            password.as_str().as_bytes(),
+        ]
+        .concat()
+    }
+
+    /// The seal the room orders an intent with in place of its password
+    /// (`Secret`). Every game compares seals; only this server's key makes
+    /// or checks one.
+    fn seal(&self, room: &RoomId, secret: &Secret) -> Seal {
+        let tag = hmac::sign(
+            &self.key,
+            &Self::seal_input(room, secret.scope, &secret.password),
+        );
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(tag.as_ref());
+        Seal {
+            scope: secret.scope,
+            tag: FixedBytes(bytes),
+        }
+    }
+
     /// Checks the invite and password in constant time. Both are always
     /// checked; which one failed stays inside the server, and the client
     /// learns only `BadInvite`.
@@ -421,10 +465,63 @@ impl PasswordGuard {
     }
 }
 
+/// Passwords one player may send with intents in [`SECRET_WINDOW`]. The room
+/// cannot tell a right company password from a wrong one (every game
+/// compares the seals), so it counts them all: enough to set a password
+/// and join a few companies, and at most about 2,900 guesses a day, as
+/// D13 holds a room's own password to.
+const SECRETS_PER_WINDOW: u32 = 20;
+/// Passwords the whole room takes in [`SECRET_WINDOW`]: a new player key
+/// costs nothing, so a player's own count alone does not bound guesses.
+const ROOM_SECRETS_PER_WINDOW: u32 = 60;
+const SECRET_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Counts the room's passwords in the current window, by player and in all.
+/// It is the room's, not a membership's: leaving and joining again gives no
+/// password back. It holds at most one entry for each password taken.
+struct SecretBudget {
+    window_start: Instant,
+    room_used: u32,
+    used: BTreeMap<PlayerId, u32>,
+}
+
+impl SecretBudget {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            room_used: 0,
+            used: BTreeMap::new(),
+        }
+    }
+
+    /// Takes one for `player`, if the window has one left for them and for
+    /// the room.
+    fn take(&mut self, player: &PlayerId, now: Instant) -> bool {
+        if now.saturating_duration_since(self.window_start) >= SECRET_WINDOW {
+            self.window_start = now;
+            self.room_used = 0;
+            self.used.clear();
+        }
+        if self.room_used >= ROOM_SECRETS_PER_WINDOW {
+            return false;
+        }
+        let used = self.used.entry(*player).or_insert(0);
+        if *used >= SECRETS_PER_WINDOW {
+            return false;
+        }
+        *used += 1;
+        self.room_used += 1;
+        true
+    }
+}
+
 struct Member {
     player: PlayerId,
     name: Text<32>,
     platform: Platform,
+    /// The banner the player picked; not logged, so a restored room shows
+    /// the default until the player says again.
+    banner: Option<BannerId>,
     ready: bool,
     content: Option<ContentFingerprint>,
     /// The manifest behind `content`, when this connection declared it.
@@ -441,6 +538,7 @@ struct Member {
     intents: TokenBucket,
     payload_bytes: TokenBucket,
     chats: TokenBucket,
+    /// Passwords sent with intents.
     /// What this member must receive before it can follow the game.
     needs: Needs,
     /// The snapshot this member's connection may fetch.
@@ -612,6 +710,8 @@ pub(crate) struct Room {
     /// Since when no member has been connected, while the game runs.
     unattended_since: Option<Instant>,
     password_guard: PasswordGuard,
+    /// Company passwords sent with intents ([`SecretBudget`]).
+    secret_budget: SecretBudget,
     /// Players the owner removed, who cannot join again.
     banned: BTreeSet<PlayerId>,
     /// Counts this room against the address that created it until it
@@ -630,6 +730,11 @@ pub(crate) struct Room {
     /// from, if any.
     start_world: Option<StartWorld>,
     closed: bool,
+    /// What the room list shows of the room.
+    summary: SharedSummary,
+    /// The play style its owner chose; not logged, so a restored room is
+    /// co-op.
+    competitive: bool,
 }
 
 /// What every room of a server shares.
@@ -675,6 +780,27 @@ pub(crate) enum RecoverError {
     Rules(String),
 }
 
+/// What the room list shows of a room, kept current by the room (on every
+/// change its members see) for the directory to read without asking it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Summary {
+    pub(crate) name: Text<48>,
+    pub(crate) rules: RulesName,
+    pub(crate) owner: PlayerId,
+    pub(crate) players: u8,
+    pub(crate) max_players: u8,
+    pub(crate) has_password: bool,
+    pub(crate) phase: RoomPhase,
+    pub(crate) competitive: bool,
+    /// `Some` for a public room: what its owner declared. `None` keeps the
+    /// room out of every list. A room restored after a restart is private
+    /// until created again: its log keeps no listing and no invite.
+    pub(crate) listing: Option<RoomListing>,
+}
+
+/// A room's [`Summary`], shared with the directory.
+pub(crate) type SharedSummary = Arc<std::sync::Mutex<Summary>>;
+
 pub(crate) struct RoomSpec {
     pub(crate) id: RoomId,
     pub(crate) name: Text<48>,
@@ -685,6 +811,10 @@ pub(crate) struct RoomSpec {
     pub(crate) ruleset: Box<dyn Ruleset>,
     pub(crate) env: RoomEnv,
     pub(crate) share: RoomShare,
+    /// `Some` lists the room publicly.
+    pub(crate) listing: Option<RoomListing>,
+    /// The play style its owner chose (`CreateRoom::competitive`).
+    pub(crate) competitive: bool,
 }
 
 impl Room {
@@ -710,6 +840,7 @@ impl Room {
             compact_log_at: spec.env.compact_log_at,
             unattended_since: None,
             password_guard: PasswordGuard::new(),
+            secret_budget: SecretBudget::new(),
             banned: BTreeSet::new(),
             _share: Some(spec.share),
             content: None,
@@ -717,8 +848,21 @@ impl Room {
             snapshots: spec.env.snapshots,
             start_world: None,
             closed: false,
+            competitive: spec.competitive,
+            summary: Arc::new(std::sync::Mutex::new(Summary {
+                name: Text::lossy(""),
+                rules: Text::lossy(""),
+                owner: owner.player,
+                players: 0,
+                max_players: 0,
+                has_password: false,
+                phase: RoomPhase::Lobby,
+                competitive: false,
+                listing: spec.listing,
+            })),
         };
         room.members.push(Member::new(owner));
+        room.refresh_summary();
         room
     }
 
@@ -880,6 +1024,7 @@ impl Room {
                 player,
                 name,
                 platform,
+                banner: None,
                 ready: true,
                 content,
                 declared: None,
@@ -938,7 +1083,7 @@ impl Room {
         // A log compacted just before the restart is not compacted again at
         // once.
         let compact_at = next_compaction(log.written(), env.compact_log_at);
-        Ok(Some(Self {
+        let room = Self {
             id: start.id,
             name: start.name,
             rules: start.rules,
@@ -965,6 +1110,7 @@ impl Room {
             // from here.
             unattended_since: None,
             password_guard: PasswordGuard::new(),
+            secret_budget: SecretBudget::new(),
             banned,
             _share: None,
             content,
@@ -972,11 +1118,67 @@ impl Room {
             snapshots: env.snapshots,
             start_world: None,
             closed: false,
-        }))
+            competitive: false,
+            // Private after a restart: the log keeps no listing.
+            summary: Arc::new(std::sync::Mutex::new(Summary {
+                name: Text::lossy(""),
+                rules: Text::lossy(""),
+                owner,
+                players: 0,
+                max_players: 0,
+                has_password: false,
+                phase: RoomPhase::Running,
+                competitive: false,
+                listing: None,
+            })),
+        };
+        room.refresh_summary();
+        Ok(Some(room))
     }
 
     pub(crate) fn id(&self) -> RoomId {
         self.id
+    }
+
+    /// What the room list shows of this room, kept current.
+    pub(crate) fn summary(&self) -> SharedSummary {
+        Arc::clone(&self.summary)
+    }
+
+    /// Brings [`Self::summary`] up to date with the room.
+    fn refresh_summary(&self) {
+        let mut summary = self
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        summary.name.clone_from(&self.name);
+        summary.rules.clone_from(&self.rules);
+        summary.owner = self.owner;
+        summary.players = u8::try_from(self.members.len()).unwrap_or(u8::MAX);
+        summary.max_players = self.max_players;
+        summary.has_password = self.secrets.password_tag.is_some();
+        summary.competitive = self.competitive;
+        summary.phase = match self.phase {
+            Phase::Lobby => RoomPhase::Lobby,
+            Phase::Running(_) => RoomPhase::Running,
+        };
+    }
+
+    /// The owner of a public room updates what the list shows of it.
+    fn describe(&mut self, player: PlayerId, listing: RoomListing) -> Result<(), RequestError> {
+        if !self.members.iter().any(|member| member.player == player) {
+            return Err(RequestError::NotInRoom);
+        }
+        if player != self.owner {
+            return Err(RequestError::NotOwner);
+        }
+        let mut summary = self
+            .summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shown = summary.listing.as_mut().ok_or(RequestError::NotListed)?;
+        *shown = listing;
+        Ok(())
     }
 
     /// The tag of the room's invite, which the directory finds it by.
@@ -1015,8 +1217,10 @@ impl Room {
                     ready: member.ready,
                     content: member.content,
                     connected: member.link.is_some(),
+                    banner: member.banner.clone(),
                 })
                 .collect(),
+            competitive: self.competitive,
         }
     }
 
@@ -1116,6 +1320,26 @@ impl Room {
             RoomCommand::Advisory { player, datagram } => {
                 self.advisory(player, datagram);
             }
+            RoomCommand::SetBanner {
+                player,
+                banner,
+                reply,
+            } => {
+                let result = self
+                    .members
+                    .iter_mut()
+                    .find(|member| member.player == player)
+                    .map(|member| member.banner = banner)
+                    .ok_or(RequestError::NotInRoom);
+                self.answer_and_broadcast(reply, result);
+            }
+            RoomCommand::Describe {
+                player,
+                listing,
+                reply,
+            } => {
+                let _ = reply.send(self.describe(player, listing));
+            }
             RoomCommand::IsMember { player, reply } => {
                 let member = self.members.iter().any(|m| m.player == player);
                 let _ = reply.send(if member {
@@ -1128,7 +1352,8 @@ impl Room {
                 player,
                 client_seq,
                 payload,
-            } => self.intent(player, client_seq, payload),
+                secret,
+            } => self.intent(player, client_seq, payload, secret.as_ref()),
             RoomCommand::Progress { player, link, step } => self.progress(player, link, step),
             RoomCommand::Checkpoint {
                 player,
@@ -1783,7 +2008,16 @@ impl Room {
         Ok(())
     }
 
-    fn intent(&mut self, player: PlayerId, client_seq: u64, payload: Payload) {
+    /// Orders a member's intent. A password sent with it is sealed here
+    /// (`RoomSecrets::seal`) and goes no further: the event carries the seal,
+    /// never the password, and nothing logs either.
+    fn intent(
+        &mut self,
+        player: PlayerId,
+        client_seq: u64,
+        payload: Payload,
+        secret: Option<&Secret>,
+    ) {
         let now = Instant::now();
         let Some(index) = self.members.iter().position(|m| m.player == player) else {
             return;
@@ -1794,16 +2028,19 @@ impl Room {
                 let member = &mut self.members[index];
                 if !member.intents.take(now, 1)
                     || !member.payload_bytes.take(now, payload.len() as u64)
+                    || (secret.is_some() && !self.secret_budget.take(&player, now))
                 {
                     Some(IntentRejection::RateLimited)
                 } else if let Err(code) = self.ruleset.validate(&player, &payload) {
                     Some(IntentRejection::Refused { code })
                 } else {
+                    let seal = secret.map(|secret| self.secrets.seal(&self.id, secret));
                     game.append(
                         EventBody::Command {
                             player,
                             client_seq,
                             payload,
+                            seal,
                         },
                         self.ruleset.as_mut(),
                     );
@@ -2713,6 +2950,7 @@ impl Room {
     }
 
     fn broadcast_view(&mut self) {
+        self.refresh_summary();
         let view = self.view();
         for index in 0..self.members.len() {
             self.push(index, ServerMessage::RoomUpdate(view.clone()));
@@ -2806,6 +3044,7 @@ impl Member {
             player: new.player,
             name: new.name,
             platform: new.platform,
+            banner: new.banner,
             ready: false,
             content: new.content.as_ref().map(|declared| declared.fingerprint),
             declared: new.content,
@@ -3533,6 +3772,7 @@ mod tests {
             player: player(n),
             client_seq: u64::from(byte),
             payload: Payload::new(vec![byte]).unwrap(),
+            seal: None,
         }
     }
 
@@ -3998,6 +4238,34 @@ mod tests {
         );
     }
 
+    /// A player's company passwords are counted by the room, not by their
+    /// membership: leaving and joining again gives none back; and the room
+    /// takes only so many in all, however many player keys send them.
+    #[test]
+    fn passwords_are_counted_by_player_and_by_room() {
+        let mut budget = SecretBudget::new();
+        let now = Instant::now();
+        for _ in 0..SECRETS_PER_WINDOW {
+            assert!(budget.take(&player(1), now));
+        }
+        assert!(
+            !budget.take(&player(1), now),
+            "the player's share is spent, left and joined again or not"
+        );
+        // Fresh keys, each with a share of its own, until the room's is spent.
+        let mut taken = SECRETS_PER_WINDOW;
+        let mut key = 2;
+        while budget.take(&player(key), now) {
+            taken += 1;
+            if taken.is_multiple_of(SECRETS_PER_WINDOW) {
+                key += 1;
+            }
+        }
+        assert_eq!(taken, ROOM_SECRETS_PER_WINDOW);
+        // A new window gives them back.
+        assert!(budget.take(&player(1), now + SECRET_WINDOW));
+    }
+
     fn test_member() -> Member {
         // A link needs a live QUIC connection. Pacing only reads `streaming`,
         // which the room keeps false whenever the link is gone.
@@ -4005,6 +4273,7 @@ mod tests {
             player: PlayerId(FixedBytes([0; 32])),
             name: Text::new("t").unwrap(),
             platform: Platform::current(),
+            banner: None,
             ready: false,
             content: None,
             declared: None,

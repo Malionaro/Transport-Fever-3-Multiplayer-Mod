@@ -24,7 +24,10 @@ use std::{
 };
 
 use serde::Deserialize;
-use tpf3mp_bridge::{LobbyAction, LobbyConnection, LobbyView};
+use tpf3mp_bridge::{
+    LobbyAction, LobbyConnection, LobbyHave, LobbyListing, LobbyModClass, LobbyRoomList, LobbyView,
+    LobbyWorld, ModName,
+};
 use tpf3mp_proto::{FixedBytes, PlayerId, Text};
 
 use crate::step::StepHandler;
@@ -64,6 +67,8 @@ pub struct Member {
     /// Whether the player's game matches the owner's: `same`, `differs` or
     /// `unknown`.
     pub content: String,
+    /// The banner the player picked, if any: empty for their default.
+    pub banner: String,
 }
 
 /// The room the player is in.
@@ -77,6 +82,8 @@ pub struct Room {
     pub max_players: u32,
     pub has_password: bool,
     pub members: Vec<Member>,
+    /// Co-op (`false`) or competitive.
+    pub competitive: bool,
 }
 
 /// One line of the room's chat.
@@ -87,11 +94,48 @@ pub struct ChatLine {
     pub you: bool,
 }
 
+/// Rules a room can be played by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rules {
+    pub name: String,
+    pub description: String,
+}
+
+/// One mod the player has installed (docs/MODS.md, "Choosing mods").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModEntry {
+    /// What `choose_mod` names.
+    pub id: String,
+    pub name: String,
+    /// `personal`, `carried` or `shared`.
+    pub class: &'static str,
+    pub reason: String,
+    pub chosen: bool,
+    pub choosable: bool,
+}
+
+/// One of the room's shared mods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomMod {
+    pub id: String,
+    pub version: String,
+    /// `yes`, `no` or `other_version`: whether this player has it.
+    pub have: &'static str,
+}
+
 /// Everything the lobby window shows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LobbyState {
     pub connection: Connection,
+    /// The server as players see it: its name, or its address.
     pub server: String,
+    /// The server's address, `host:port`, for the server setting.
+    pub server_address: String,
+    /// The launcher's default server, which `set_server` with an empty
+    /// server goes back to; empty without one.
+    pub server_default: String,
+    /// The banner this player picked: empty for their default.
+    pub banner: String,
     pub name: String,
     /// The last thing that went wrong, for the window to show.
     pub error: Option<String>,
@@ -104,12 +148,34 @@ pub struct LobbyState {
     pub linked: bool,
     /// Whether the launcher has said anything yet.
     pub heard: bool,
+    /// The rules the server offers new rooms, its default first.
+    pub rules: Vec<Rules>,
+    /// The player's saves, newest first.
+    pub saves: Vec<String>,
+    /// The save offered first for a new room.
+    pub start_save: Option<String>,
+    /// The room's world in this game: `none`, `fetching`, `loading` or
+    /// `playing`, and while fetching, bytes of the total so far.
+    pub world: &'static str,
+    pub bytes: u64,
+    pub total: u64,
+    /// How this game differs from the room's, while it does.
+    pub differences: Option<String>,
+    /// The player's installed mods, the choosable first.
+    pub mods: Vec<ModEntry>,
+    /// The room's shared mods, and whether this player has each.
+    pub room_mods: Vec<RoomMod>,
+    /// The room's shared mods beyond `room_mods`.
+    pub room_mods_more: u32,
+    /// The page of public rooms last asked for.
+    pub rooms: Option<LobbyRoomList>,
 }
 
 /// What the window sends, as JSON: the tag `action` plus the fields, e.g.
 /// `{"action":"create","room":"Alps","password":"","max_players":8}`. A
-/// server the window names is not taken: the launcher plays on its own
-/// (D12).
+/// server the window names with Connect is not taken: the launcher plays on
+/// its own (D12). Only `set_server`, the player's server setting, changes
+/// it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum WindowAction {
@@ -124,6 +190,27 @@ enum WindowAction {
         max_players: u32,
         #[serde(default)]
         password: String,
+        /// Empty for the server's default.
+        #[serde(default)]
+        rules: String,
+        /// Absent for the launcher's own start save; empty for none.
+        #[serde(default)]
+        start_save: Option<String>,
+        /// Lists the room in the server's room list.
+        #[serde(default)]
+        public: bool,
+        /// The start save's climate and year, for the list.
+        #[serde(default)]
+        map: String,
+        #[serde(default)]
+        year: u16,
+        /// Competitive rather than co-op.
+        #[serde(default)]
+        competitive: bool,
+    },
+    ListRooms {
+        #[serde(default)]
+        page: u16,
     },
     Join {
         invite: String,
@@ -141,6 +228,21 @@ enum WindowAction {
         text: String,
     },
     Leave,
+    ChooseMod {
+        id: String,
+        chosen: bool,
+    },
+    /// The server setting: a `host:port`, or empty for the default. The
+    /// launcher checks it.
+    SetServer {
+        #[serde(default)]
+        server: String,
+    },
+    /// Empty for the default.
+    SetBanner {
+        #[serde(default)]
+        banner: String,
+    },
 }
 
 fn default_max_players() -> u32 {
@@ -196,11 +298,31 @@ pub fn parse_action(json: &str) -> Result<LobbyAction, String> {
             room,
             max_players,
             password: given,
+            rules,
+            start_save,
+            public,
+            map,
+            year,
+            competitive,
         } => LobbyAction::Create {
             room: text(&room, "room name")?,
             max_players: u8::try_from(max_players).unwrap_or(u8::MAX),
             password: password(&given)?,
+            rules: Some(text(&rules, "rules name")?).filter(|rules| !rules.as_str().is_empty()),
+            start_save: start_save
+                .map(|save| text::<{ tpf3mp_bridge::MAX_SAVE_NAME }>(&save, "save name"))
+                .transpose()?,
+            listing: public
+                .then(|| {
+                    Ok::<_, String>(LobbyListing {
+                        map: text(&map, "map")?,
+                        year,
+                    })
+                })
+                .transpose()?,
+            competitive,
         },
+        WindowAction::ListRooms { page } => LobbyAction::ListRooms { page },
         WindowAction::Join {
             invite,
             password: given,
@@ -217,6 +339,20 @@ pub fn parse_action(json: &str) -> Result<LobbyAction, String> {
             text: text(&said, "message")?,
         },
         WindowAction::Leave => LobbyAction::Leave,
+        WindowAction::ChooseMod { id, chosen } => LobbyAction::ChooseMod {
+            id: ModName::new(id.trim()).map_err(|_| "that mod's id is too long".to_owned())?,
+            chosen,
+        },
+        WindowAction::SetServer { server } => LobbyAction::SetServer {
+            server: text(&server, "server")?,
+        },
+        WindowAction::SetBanner { banner } => LobbyAction::SetBanner {
+            banner: match banner.trim() {
+                "" => None,
+                id if tpf3mp_proto::is_banner(id) => Some(text(id, "banner")?),
+                _ => return Err("there is no such banner".to_owned()),
+            },
+        },
     })
 }
 
@@ -233,6 +369,10 @@ pub fn kind(action: &LobbyAction) -> &'static str {
         LobbyAction::Kick { .. } => "kick",
         LobbyAction::Chat { .. } => "chat",
         LobbyAction::Leave => "leave",
+        LobbyAction::ChooseMod { .. } => "choose_mod",
+        LobbyAction::ListRooms { .. } => "list_rooms",
+        LobbyAction::SetServer { .. } => "set_server",
+        LobbyAction::SetBanner { .. } => "set_banner",
     }
 }
 
@@ -262,6 +402,12 @@ fn lua_opt(text: Option<&str>) -> String {
     text.map_or_else(|| "nil".to_owned(), lua_str)
 }
 
+impl Default for LobbyState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LobbyState {
     /// The empty lobby: not connected, no room, nothing said, no launcher.
     /// Usable in a `static`.
@@ -269,6 +415,9 @@ impl LobbyState {
         Self {
             connection: Connection::Disconnected,
             server: String::new(),
+            server_address: String::new(),
+            server_default: String::new(),
+            banner: String::new(),
             name: String::new(),
             error: None,
             notice: None,
@@ -276,6 +425,17 @@ impl LobbyState {
             chat: Vec::new(),
             linked: false,
             heard: false,
+            rules: Vec::new(),
+            saves: Vec::new(),
+            start_save: None,
+            world: "none",
+            bytes: 0,
+            total: 0,
+            differences: None,
+            mods: Vec::new(),
+            room_mods: Vec::new(),
+            room_mods_more: 0,
+            rooms: None,
         }
     }
 
@@ -294,6 +454,13 @@ impl LobbyState {
                 LobbyConnection::Connected => Connection::Connected,
             },
             server: view.server.as_str().to_owned(),
+            server_address: view.server_address.as_str().to_owned(),
+            server_default: view.server_default.as_str().to_owned(),
+            banner: view
+                .banner
+                .as_ref()
+                .map(|id| id.as_str().to_owned())
+                .unwrap_or_default(),
             name: view.name.as_str().to_owned(),
             error: view.error.as_ref().map(|text| text.as_str().to_owned()),
             notice: view.notice.as_ref().map(|text| text.as_str().to_owned()),
@@ -308,6 +475,7 @@ impl LobbyState {
                 you_own: room.you_own,
                 max_players: u32::from(room.max_players),
                 has_password: room.has_password,
+                competitive: room.competitive,
                 members: room
                     .members
                     .iter()
@@ -324,6 +492,11 @@ impl LobbyState {
                             None => "unknown",
                         }
                         .to_owned(),
+                        banner: member
+                            .banner
+                            .as_ref()
+                            .map(|id| id.as_str().to_owned())
+                            .unwrap_or_default(),
                     })
                     .collect(),
             }),
@@ -338,6 +511,72 @@ impl LobbyState {
                 .collect(),
             linked,
             heard: true,
+            rules: view
+                .rules
+                .iter()
+                .map(|rules| Rules {
+                    name: rules.name.as_str().to_owned(),
+                    description: rules.description.as_str().to_owned(),
+                })
+                .collect(),
+            saves: view
+                .saves
+                .iter()
+                .map(|save| save.as_str().to_owned())
+                .collect(),
+            start_save: view
+                .start_save
+                .as_ref()
+                .map(|save| save.as_str().to_owned()),
+            world: match view.world {
+                LobbyWorld::None => "none",
+                LobbyWorld::Fetching { .. } => "fetching",
+                LobbyWorld::Loading => "loading",
+                LobbyWorld::Playing => "playing",
+            },
+            bytes: match view.world {
+                LobbyWorld::Fetching { bytes, .. } => bytes,
+                _ => 0,
+            },
+            total: match view.world {
+                LobbyWorld::Fetching { total, .. } => total,
+                _ => 0,
+            },
+            differences: view
+                .differences
+                .as_ref()
+                .map(|text| text.as_str().to_owned()),
+            mods: view
+                .mods
+                .iter()
+                .map(|m| ModEntry {
+                    id: m.id.as_str().to_owned(),
+                    name: m.name.as_str().to_owned(),
+                    class: match m.class {
+                        LobbyModClass::Personal => "personal",
+                        LobbyModClass::Carried => "carried",
+                        LobbyModClass::Shared => "shared",
+                    },
+                    reason: m.reason.as_str().to_owned(),
+                    chosen: m.chosen,
+                    choosable: m.choosable,
+                })
+                .collect(),
+            room_mods: view
+                .room_mods
+                .iter()
+                .map(|m| RoomMod {
+                    id: m.id.as_str().to_owned(),
+                    version: m.version.as_str().to_owned(),
+                    have: match m.have {
+                        LobbyHave::Yes => "yes",
+                        LobbyHave::No => "no",
+                        LobbyHave::OtherVersion => "other_version",
+                    },
+                })
+                .collect(),
+            room_mods_more: view.room_mods_more,
+            rooms: view.rooms.clone(),
         }
     }
 
@@ -348,6 +587,12 @@ impl LobbyState {
         out.push_str(lua_str(self.connection.as_str()).as_str());
         out.push_str(", server = ");
         out.push_str(&lua_str(&self.server));
+        out.push_str(", server_address = ");
+        out.push_str(&lua_str(&self.server_address));
+        out.push_str(", server_default = ");
+        out.push_str(&lua_str(&self.server_default));
+        out.push_str(", banner = ");
+        out.push_str(&lua_str(&self.banner));
         out.push_str(", name = ");
         out.push_str(&lua_str(&self.name));
         out.push_str(", error = ");
@@ -358,6 +603,79 @@ impl LobbyState {
         out.push_str(if self.linked { "true" } else { "false" });
         out.push_str(", heard = ");
         out.push_str(if self.heard { "true" } else { "false" });
+        out.push_str(", start_save = ");
+        out.push_str(&lua_opt(self.start_save.as_deref()));
+        out.push_str(", differences = ");
+        out.push_str(&lua_opt(self.differences.as_deref()));
+        out.push_str(&format!(
+            ", world = {}, bytes = {}, total = {}",
+            lua_str(self.world),
+            self.bytes,
+            self.total
+        ));
+        out.push_str(", rules = {");
+        for rules in &self.rules {
+            out.push_str(&format!(
+                " {{ name = {}, description = {} }},",
+                lua_str(&rules.name),
+                lua_str(&rules.description)
+            ));
+        }
+        match &self.rooms {
+            None => out.push_str(" }, rooms = nil"),
+            Some(list) => {
+                out.push_str(&format!(
+                    " }}, rooms = {{ page = {}, more = {}, list = {{",
+                    list.page, list.more
+                ));
+                for room in list.rooms.iter() {
+                    out.push_str(&format!(
+                        " {{ invite = {}, name = {}, rules = {}, players = {}, max_players = {}, has_password = {}, running = {}, map = {}, year = {}, companies = {}, competitive = {} }},",
+                        lua_str(room.invite.as_str()),
+                        lua_str(room.name.as_str()),
+                        lua_str(room.rules.as_str()),
+                        room.players,
+                        room.max_players,
+                        room.has_password,
+                        room.running,
+                        lua_str(room.map.as_str()),
+                        room.year,
+                        room.companies,
+                        room.competitive
+                    ));
+                }
+                out.push_str(" } }");
+            }
+        }
+        out.push_str(", saves = {");
+        for save in &self.saves {
+            out.push(' ');
+            out.push_str(&lua_str(save));
+            out.push(',');
+        }
+        out.push_str(" }");
+        out.push_str(", mods = {");
+        for m in &self.mods {
+            out.push_str(&format!(
+                " {{ id = {}, name = {}, class = {}, reason = {}, chosen = {}, choosable = {} }},",
+                lua_str(&m.id),
+                lua_str(&m.name),
+                lua_str(m.class),
+                lua_str(&m.reason),
+                m.chosen,
+                m.choosable
+            ));
+        }
+        out.push_str(" }, room_mods = {");
+        for m in &self.room_mods {
+            out.push_str(&format!(
+                " {{ id = {}, version = {}, have = {} }},",
+                lua_str(&m.id),
+                lua_str(&m.version),
+                lua_str(m.have)
+            ));
+        }
+        out.push_str(&format!(" }}, room_mods_more = {}", self.room_mods_more));
         out.push_str(", chat = {");
         for line in &self.chat {
             out.push_str(&format!(
@@ -372,24 +690,26 @@ impl LobbyState {
             None => out.push_str(", room = nil"),
             Some(room) => {
                 out.push_str(&format!(
-                    ", room = {{ name = {}, invite = {}, phase = {}, you_own = {}, max_players = {}, has_password = {}, members = {{",
+                    ", room = {{ name = {}, invite = {}, phase = {}, you_own = {}, max_players = {}, has_password = {}, competitive = {}, members = {{",
                     lua_str(&room.name),
                     lua_str(&room.invite),
                     lua_str(&room.phase),
                     room.you_own,
                     room.max_players,
-                    room.has_password
+                    room.has_password,
+                    room.competitive
                 ));
                 for member in &room.members {
                     out.push_str(&format!(
-                        " {{ id = {}, name = {}, ready = {}, owner = {}, you = {}, connected = {}, content = {} }},",
+                        " {{ id = {}, name = {}, ready = {}, owner = {}, you = {}, connected = {}, content = {}, banner = {} }},",
                         lua_str(&member.id),
                         lua_str(&member.name),
                         member.ready,
                         member.owner,
                         member.you,
                         member.connected,
-                        lua_str(&member.content)
+                        lua_str(&member.content),
+                        lua_str(&member.banner)
                     ));
                 }
                 out.push_str(" } }");
@@ -485,8 +805,11 @@ pub(crate) fn reset() {
 }
 
 #[cfg(test)]
+mod window_tests;
+
+#[cfg(test)]
 mod tests {
-    use tpf3mp_bridge::{LobbyLine, LobbyMember, LobbyRoom};
+    use tpf3mp_bridge::{LobbyLine, LobbyMember, LobbyRoom, LobbyRules};
     use tpf3mp_proto::BoundedVec;
 
     use super::*;
@@ -506,7 +829,59 @@ mod tests {
                 room: Text::new("Alps").unwrap(),
                 max_players: 8,
                 password: None,
+                rules: None,
+                start_save: None,
+                listing: None,
+                competitive: false,
+            }),
+            "without a save named, the launcher's own, and private"
+        );
+        assert_eq!(
+            parse_action(
+                r#"{"action":"create","room":"Alps","max_players":4,"rules":"native","start_save":"mptest"}"#
+            ),
+            Ok(LobbyAction::Create {
+                room: Text::new("Alps").unwrap(),
+                max_players: 4,
+                password: None,
+                rules: Some(Text::new("native").unwrap()),
+                start_save: Some(Text::new("mptest").unwrap()),
+                listing: None,
+                competitive: false,
             })
+        );
+        assert!(matches!(
+            parse_action(r#"{"action":"create","room":"Alps","public":true,"map":"dry","year":1900}"#),
+            Ok(LobbyAction::Create { listing: Some(LobbyListing { ref map, year: 1900 }), .. }) if map.as_str() == "dry"
+        ));
+        assert_eq!(
+            parse_action(r#"{"action":"list_rooms","page":1}"#),
+            Ok(LobbyAction::ListRooms { page: 1 })
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"set_banner","banner":"dry"}"#),
+            Ok(LobbyAction::SetBanner {
+                banner: Some(Text::new("dry").unwrap())
+            })
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"set_banner","banner":""}"#),
+            Ok(LobbyAction::SetBanner { banner: None })
+        );
+        assert!(parse_action(r#"{"action":"set_banner","banner":"selfie"}"#).is_err());
+        assert!(
+            matches!(
+                parse_action(r#"{"action":"create","room":"Alps","start_save":""}"#),
+                Ok(LobbyAction::Create { start_save: Some(save), .. }) if save.as_str().is_empty()
+            ),
+            "an empty save: none"
+        );
+        let long = "s".repeat(tpf3mp_bridge::MAX_SAVE_NAME + 1);
+        assert!(
+            parse_action(&format!(
+                r#"{{"action":"create","room":"Alps","start_save":"{long}"}}"#
+            ))
+            .is_err()
         );
         assert_eq!(
             parse_action(r#"{"action":"join","invite":"K7QM2X","password":"pw"}"#),
@@ -527,9 +902,31 @@ mod tests {
             Ok(LobbyAction::Ready { ready: true })
         );
         assert_eq!(
+            parse_action(r#"{"action":"choose_mod","id":"schbrongx_minimap","chosen":true}"#),
+            Ok(LobbyAction::ChooseMod {
+                id: Text::new("schbrongx_minimap").unwrap(),
+                chosen: true,
+            })
+        );
+        assert_eq!(
             parse_action(r#"{"action":"leave"}"#),
             Ok(LobbyAction::Leave)
         );
+        assert_eq!(
+            parse_action(r#"{"action":"set_server","server":" eu.example:29470 "}"#),
+            Ok(LobbyAction::SetServer {
+                server: Text::new("eu.example:29470").unwrap()
+            })
+        );
+        assert_eq!(
+            parse_action(r#"{"action":"set_server"}"#),
+            Ok(LobbyAction::SetServer {
+                server: Text::new("").unwrap()
+            }),
+            "none named: back to the default"
+        );
+        let long = "s".repeat(129);
+        assert!(parse_action(&format!(r#"{{"action":"set_server","server":"{long}"}}"#)).is_err());
         assert!(parse_action(r#"{"action":"fly"}"#).is_err());
         assert!(parse_action(r#"{"action":"kick","player":"7"}"#).is_err());
         let long = "x".repeat(300);
@@ -554,6 +951,9 @@ mod tests {
         LobbyView {
             connection: LobbyConnection::Connected,
             server: Text::new("EU").unwrap(),
+            server_address: Text::new("eu.example.org:29470").unwrap(),
+            server_default: Text::new("relay.example.org:29470").unwrap(),
+            banner: None,
             name: Text::new("Ann").unwrap(),
             error: None,
             notice: Some(Text::new("created the room").unwrap()),
@@ -573,8 +973,10 @@ mod tests {
                     owner: true,
                     you: true,
                     same_content: None,
+                    banner: None,
                 }])
                 .unwrap(),
+                competitive: false,
             }),
             chat: BoundedVec::new(vec![LobbyLine {
                 from: Text::new("Bo").unwrap(),
@@ -582,6 +984,56 @@ mod tests {
                 you: false,
             }])
             .unwrap(),
+            rules: BoundedVec::new(vec![LobbyRules {
+                name: Text::new("native").unwrap(),
+                description: Text::new("The game's own economy").unwrap(),
+            }])
+            .unwrap(),
+            saves: BoundedVec::new(vec![
+                Text::new("mptest").unwrap(),
+                Text::new("Güterzug").unwrap(),
+            ])
+            .unwrap(),
+            start_save: Some(Text::new("mptest").unwrap()),
+            world: LobbyWorld::Fetching {
+                bytes: 5_000_000,
+                total: 20_000_000,
+            },
+            differences: None,
+            mods: tpf3mp_proto::BoundedVec::new(vec![tpf3mp_bridge::LobbyMod {
+                id: Text::new("schbrongx_minimap").unwrap(),
+                name: Text::new("Minimap").unwrap(),
+                class: LobbyModClass::Personal,
+                reason: Text::new("only what this player sees").unwrap(),
+                chosen: true,
+                choosable: true,
+            }])
+            .unwrap(),
+            room_mods: tpf3mp_proto::BoundedVec::new(vec![tpf3mp_bridge::LobbyRoomMod {
+                id: Text::new("vehicles_pack").unwrap(),
+                version: Text::new("3").unwrap(),
+                have: LobbyHave::OtherVersion,
+            }])
+            .unwrap(),
+            room_mods_more: 2,
+            rooms: Some(tpf3mp_bridge::LobbyRoomList {
+                page: 0,
+                more: false,
+                rooms: BoundedVec::new(vec![tpf3mp_bridge::LobbyPublicRoom {
+                    invite: Text::new("K7QM2X").unwrap(),
+                    name: Text::new("Open \"alps\"").unwrap(),
+                    rules: Text::new("native").unwrap(),
+                    players: 2,
+                    max_players: 4,
+                    has_password: true,
+                    running: false,
+                    map: Text::new("temperate").unwrap(),
+                    year: 1850,
+                    companies: 1,
+                    competitive: false,
+                }])
+                .unwrap(),
+            }),
         }
     }
 
@@ -613,6 +1065,14 @@ mod tests {
         let lua = mlua::Lua::new();
         let state: mlua::Table = lua.load(format!("return {literal}")).eval().unwrap();
         assert_eq!(state.get::<String>("connection").unwrap(), "connected");
+        assert_eq!(
+            state.get::<String>("server_address").unwrap(),
+            "eu.example.org:29470"
+        );
+        assert_eq!(
+            state.get::<String>("server_default").unwrap(),
+            "relay.example.org:29470"
+        );
         assert_eq!(state.get::<String>("name").unwrap(), "Ann \"the\" Bü\\");
         assert!(state.get::<bool>("linked").unwrap());
         let room: mlua::Table = state.get("room").unwrap();
@@ -623,6 +1083,32 @@ mod tests {
         let chat: mlua::Table = state.get("chat").unwrap();
         let line: mlua::Table = chat.get(1).unwrap();
         assert_eq!(line.get::<String>("text").unwrap(), "hi");
+        let saves: mlua::Table = state.get("saves").unwrap();
+        assert_eq!(saves.get::<String>(2).unwrap(), "Güterzug");
+        assert_eq!(state.get::<String>("start_save").unwrap(), "mptest");
+        let rules: mlua::Table = state.get("rules").unwrap();
+        let first: mlua::Table = rules.get(1).unwrap();
+        assert_eq!(first.get::<String>("name").unwrap(), "native");
+        assert_eq!(state.get::<String>("world").unwrap(), "fetching");
+        assert_eq!(state.get::<u64>("bytes").unwrap(), 5_000_000);
+        assert_eq!(state.get::<u64>("total").unwrap(), 20_000_000);
+        assert!(
+            state
+                .get::<Option<String>>("differences")
+                .unwrap()
+                .is_none()
+        );
+        let mods: mlua::Table = state.get("mods").unwrap();
+        let minimap: mlua::Table = mods.get(1).unwrap();
+        assert_eq!(minimap.get::<String>("id").unwrap(), "schbrongx_minimap");
+        assert_eq!(minimap.get::<String>("class").unwrap(), "personal");
+        assert!(
+            minimap.get::<bool>("chosen").unwrap() && minimap.get::<bool>("choosable").unwrap()
+        );
+        let room_mods: mlua::Table = state.get("room_mods").unwrap();
+        let pack: mlua::Table = room_mods.get(1).unwrap();
+        assert_eq!(pack.get::<String>("have").unwrap(), "other_version");
+        assert_eq!(state.get::<u32>("room_mods_more").unwrap(), 2);
     }
 
     /// A step driver that records what the window handed it and answers
@@ -636,7 +1122,7 @@ mod tests {
     impl StepHandler for Launcher {
         fn on_step(
             &mut self,
-            _commands: Vec<(u64, tpf3mp_proto::Payload)>,
+            _commands: Vec<crate::step::Handed>,
             _run: &mut crate::step::RunStep<'_>,
         ) -> crate::step::Outcome {
             unreachable!()

@@ -11,9 +11,15 @@ use crate::bridge::{Status, WorldStatus};
 /// What the launcher itself knows, next to the session's [`Status`].
 #[derive(Debug, Default)]
 pub(crate) struct View {
+    /// The banner this player picked, if any.
+    pub(crate) banner: Option<String>,
     pub(crate) server: Option<String>,
-    /// The server is the only one this launcher plays on (D12).
+    /// The server is the one this launcher plays on: no invite goes
+    /// elsewhere (D12).
     pub(crate) server_fixed: bool,
+    /// The launcher's default server, which "Reset to default" goes back to.
+    pub(crate) server_default: Option<String>,
+    /// What players see of the default server, such as `EU`.
     pub(crate) server_name: Option<String>,
     pub(crate) name: String,
     pub(crate) player: Option<PlayerId>,
@@ -37,6 +43,17 @@ pub(crate) struct View {
     /// Whether the player's log goes to the server; `None` when this
     /// launcher has no diagnostics to send.
     pub(crate) diagnostics: Option<bool>,
+    /// The player's saves, newest first, as last looked at.
+    pub(crate) saves: Vec<String>,
+    /// The save rooms this player creates start from, unless they pick
+    /// another.
+    pub(crate) start_save: Option<String>,
+    /// The player's installed mods, and whether each is chosen.
+    pub(crate) mods: Vec<ModRow>,
+    /// The room's shared mods, and whether this player has each.
+    pub(crate) room_mods: Vec<RoomModRow>,
+    /// The page of public rooms last asked for, while connected.
+    pub(crate) rooms: Option<RoomList>,
 }
 
 /// Something the player asks for.
@@ -55,6 +72,25 @@ pub enum Action {
         /// One of the server's rules; the default without.
         #[serde(default)]
         rules: Option<String>,
+        /// One of the player's saves (`State::saves`), by name, that the
+        /// room starts from: every game loads it from its menu. Without,
+        /// the launcher's own start save, if it has one; empty, none, and
+        /// the owner's game loads a world and saves it for the room.
+        #[serde(default)]
+        start_save: Option<String>,
+        /// `Some` lists the room in the server's room list for anyone to
+        /// see and join; `None`, the default, keeps it private.
+        #[serde(default)]
+        listing: Option<Listing>,
+        /// Competitive (each player for a company of their own) rather
+        /// than co-op, the default.
+        #[serde(default)]
+        competitive: bool,
+    },
+    /// Asks the server for page `page` of its public rooms
+    /// ([`State::rooms`]).
+    ListRooms {
+        page: u16,
     },
     Join {
         invite: String,
@@ -77,6 +113,86 @@ pub enum Action {
     },
     /// Starts Transport Fever 3 with TPF3-MP's hook in it, for this room.
     LaunchGame,
+    /// Plays with an installed personal mod, or not (docs/MODS.md).
+    ChooseMod {
+        id: String,
+        chosen: bool,
+    },
+    /// The player's server setting: play on `server`, a `host:port`, from
+    /// now on; empty goes back to the default ([`State::server_default`]).
+    /// Remembered; reconnects there if connected; refused in a room.
+    /// Shows this banner in rooms: one of `tpf3mp_proto::BANNERS`, or
+    /// `None` for the default. Remembered for next time.
+    SetBanner {
+        #[serde(default)]
+        banner: Option<String>,
+    },
+    SetServer {
+        server: String,
+    },
+}
+
+/// What a public room's list entry says of its world, as the creating
+/// player's game read it from the start save.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Listing {
+    /// The climate, such as `temperate`.
+    #[serde(default)]
+    pub map: String,
+    /// The start year; 0 unknown.
+    #[serde(default)]
+    pub year: u16,
+}
+
+/// A page of the server's public rooms.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RoomList {
+    pub page: u16,
+    pub rooms: Vec<PublicRoom>,
+    /// A later page has more.
+    pub more: bool,
+}
+
+/// One public room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicRoom {
+    pub invite: String,
+    pub name: String,
+    pub rules: String,
+    pub players: u8,
+    pub max_players: u8,
+    pub has_password: bool,
+    pub running: bool,
+    pub map: String,
+    pub year: u16,
+    pub companies: u8,
+    pub competitive: bool,
+}
+
+impl RoomList {
+    pub(crate) fn of(page: &tpf3mp_proto::RoomPage) -> Self {
+        Self {
+            page: page.page,
+            more: page.more,
+            rooms: page
+                .rooms
+                .iter()
+                .map(|room| PublicRoom {
+                    invite: room.invite.to_string(),
+                    name: room.name.as_str().to_owned(),
+                    rules: room.rules.as_str().to_owned(),
+                    players: room.players,
+                    max_players: room.max_players,
+                    has_password: room.has_password,
+                    running: room.phase == RoomPhase::Running,
+                    map: room.listing.map.as_str().to_owned(),
+                    year: room.listing.year,
+                    companies: room.listing.companies,
+                    competitive: room.competitive,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Everything a launcher front end shows: the web page reads it as JSON,
@@ -84,14 +200,21 @@ pub enum Action {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct State {
     pub name: String,
+    /// The banner this player picked, if any ([`Action::SetBanner`]).
+    pub banner: Option<String>,
     /// This player's short ID, as others see it.
     pub player: Option<String>,
     pub server: Option<String>,
-    /// Whether `server` is the only server this launcher plays on (D12):
-    /// the front ends then offer no other, and invites join on it.
+    /// Whether `server` is the server this launcher plays on (D12, as
+    /// amended): Connect then asks for no server, invites join on it and an
+    /// invite to another is refused; the server setting
+    /// ([`Action::SetServer`]) changes it.
     pub server_fixed: bool,
+    /// The launcher's default server, `host:port`: the package's, or the
+    /// project's relay. "Reset to default" goes back to it.
+    pub server_default: Option<String>,
     /// What players see of the server, such as `EU`, in place of its
-    /// address; `None` shows the address.
+    /// address, while it is the default one; `None` shows the address.
     pub server_name: Option<String>,
     pub server_version: Option<String>,
     /// What the player quotes to the server's operator: the connection's
@@ -121,6 +244,97 @@ pub struct State {
     /// Whether lines of this launcher's log, redacted, go to the server
     /// ("Diagnostics" in PROTOCOL.md); `None` when it sends none at all.
     pub diagnostics: Option<bool>,
+    /// The player's saves, newest first: what a room they create can start
+    /// from ([`Action::Create`]).
+    pub saves: Vec<String>,
+    /// The save rooms this player creates start from unless they pick
+    /// another: the launcher's `--start-save`, or the one last picked.
+    pub start_save: Option<String>,
+    /// The page of the server's public rooms last asked for
+    /// ([`Action::ListRooms`]).
+    pub rooms: Option<RoomList>,
+    /// The mods this player has installed, those they may choose first
+    /// ([`Action::ChooseMod`]; docs/MODS.md).
+    pub mods: Vec<ModRow>,
+    /// The room's shared mods, from its owner's start save, and whether this
+    /// player has each; empty while not known.
+    pub room_mods: Vec<RoomModRow>,
+}
+
+/// One installed mod, as the front ends list it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModRow {
+    pub id: String,
+    pub name: String,
+    pub class: ModClass,
+    /// Why it is of its class, in a line.
+    pub reason: String,
+    pub chosen: bool,
+    pub choosable: bool,
+}
+
+/// What the scan made of a mod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModClass {
+    Personal,
+    Carried,
+    Shared,
+}
+
+/// One of the room's shared mods, and whether this player has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoomModRow {
+    pub id: String,
+    pub version: String,
+    pub have: ModHave,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModHave {
+    Yes,
+    No,
+    OtherVersion,
+}
+
+/// The picker's mods as the front ends list them: those the player may
+/// choose first, then the rest, each group by name.
+pub(crate) fn mod_rows(mods: &crate::picker::Mods) -> (Vec<ModRow>, Vec<RoomModRow>) {
+    use tpf3mp_modscan::Class;
+    let mut rows: Vec<ModRow> = mods
+        .installed()
+        .iter()
+        .map(|m| ModRow {
+            id: m.id.clone(),
+            name: m.name.clone(),
+            class: match m.class {
+                Class::Personal => ModClass::Personal,
+                Class::Carried => ModClass::Carried,
+                Class::Shared => ModClass::Shared,
+            },
+            reason: m.reason.clone(),
+            chosen: mods.is_chosen(&m.id),
+            choosable: mods.is_choosable(&m.id),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        (!a.choosable, a.name.to_lowercase()).cmp(&(!b.choosable, b.name.to_lowercase()))
+    });
+    let room = mods
+        .required()
+        .into_iter()
+        .map(|r| RoomModRow {
+            id: r.id,
+            version: r.version,
+            have: match r.have {
+                crate::picker::Have::Yes => ModHave::Yes,
+                crate::picker::Have::No => ModHave::No,
+                crate::picker::Have::OtherVersion => ModHave::OtherVersion,
+            },
+        })
+        .collect();
+    (rows, room)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -210,6 +424,8 @@ pub struct Room {
     pub max_players: u8,
     pub has_password: bool,
     pub members: Vec<Member>,
+    /// Co-op (`false`) or competitive (`true`), as its owner chose.
+    pub competitive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,6 +447,8 @@ pub struct Member {
     pub you: bool,
     /// Whether this member's game matches the owner's.
     pub content: MemberContent,
+    /// The banner the member picked, if any (`tpf3mp_proto::BANNERS`).
+    pub banner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -324,8 +542,10 @@ pub(crate) fn snapshot(view: &View, status: &Status) -> State {
                         (Some(_), Some(_)) => MemberContent::Differs,
                         _ => MemberContent::Unknown,
                     },
+                    banner: member.banner.as_ref().map(|id| id.as_str().to_owned()),
                 })
                 .collect(),
+            competitive: room.competitive,
         }
     });
     let (world, bytes, total) = match status.world {
@@ -346,10 +566,19 @@ pub(crate) fn snapshot(view: &View, status: &Status) -> State {
     };
     State {
         name: view.name.clone(),
+        banner: view.banner.clone(),
         player: you.map(|player| player.to_string()),
         server: view.server.clone(),
         server_fixed: view.server_fixed,
-        server_name: view.server_name.clone(),
+        server_default: view.server_default.clone(),
+        // The name is the default server's: another shows its address.
+        server_name: view.server_name.clone().filter(|_| {
+            match (&view.server_default, &view.server) {
+                (Some(default), Some(server)) => super::same_server(default, server),
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+        }),
         server_version: view.server_version.clone(),
         support_id: status
             .session
@@ -394,6 +623,11 @@ pub(crate) fn snapshot(view: &View, status: &Status) -> State {
         notices: status.notices.iter().cloned().collect(),
         announcement: status.announcement.clone(),
         diagnostics: view.diagnostics,
+        saves: view.saves.clone(),
+        start_save: view.start_save.clone(),
+        mods: view.mods.clone(),
+        room_mods: view.room_mods.clone(),
+        rooms: view.rooms.clone().filter(|_| view.connected),
     }
 }
 
@@ -465,10 +699,29 @@ mod tests {
                 max_players: 4,
                 password: None,
                 rules: Some("native".into()),
+                start_save: None,
+                listing: None,
+                competitive: false,
             }
         );
+        let action: Action = serde_json::from_str(
+            r#"{"action":"create","room":"R","max_players":4,"password":null,"start_save":"mptest"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::Create { start_save: Some(save), .. } if save == "mptest"
+        ));
         let action: Action = serde_json::from_str(r#"{"action":"start"}"#).unwrap();
         assert_eq!(action, Action::Start);
+        let action: Action =
+            serde_json::from_str(r#"{"action":"set_server","server":"eu.example:29470"}"#).unwrap();
+        assert_eq!(
+            action,
+            Action::SetServer {
+                server: "eu.example:29470".into()
+            }
+        );
         assert!(serde_json::from_str::<Action>(r#"{"action":"format_disk"}"#).is_err());
     }
 
@@ -528,6 +781,32 @@ mod tests {
         assert_eq!(json["name"], "Ann");
         assert!(json["room"].is_null());
         assert_eq!(json["game"]["world"], "none");
+    }
+
+    #[test]
+    fn the_servers_name_is_shown_for_the_default_server_only() {
+        let mut view = View {
+            server: Some("tpf3mp.example.org:29470".into()),
+            server_fixed: true,
+            server_default: Some("TPF3MP.example.org:29470".into()),
+            server_name: Some("Relay".into()),
+            ..View::default()
+        };
+        let state = snapshot(&view, &Status::default());
+        assert_eq!(state.server_name.as_deref(), Some("Relay"));
+        assert_eq!(
+            state.server_default.as_deref(),
+            Some("TPF3MP.example.org:29470")
+        );
+        // The player chose another server: its address, not the name.
+        view.server = Some("play.example.net:29470".into());
+        assert_eq!(snapshot(&view, &Status::default()).server_name, None);
+        // Without a default, the name given is the server's.
+        view.server_default = None;
+        assert_eq!(
+            snapshot(&view, &Status::default()).server_name.as_deref(),
+            Some("Relay")
+        );
     }
 
     #[test]

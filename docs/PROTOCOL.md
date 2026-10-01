@@ -116,6 +116,39 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
   the same way (`BadInvite`), so invites cannot be used to probe which
   rooms exist. An address that sends 20 of those in 10 minutes gets
   `RateLimited` for every join until the 10 minutes are up.
+- **The room list** (protocol 9, D26 proposed). A room is **private**
+  unless its owner creates it with a `listing` (`CreateRoom::listing`):
+  the map type (the climate's name, such as `temperate`, up to 32 bytes),
+  the game's year and the number of companies, as the owner's client
+  declares them. `ListRooms { page }` answers `Rooms(RoomPage)`: up to 20
+  public rooms a page (`ROOMS_PER_PAGE`), those in their lobby first, then
+  the fuller, then by name, with `more` when a later page has more. Each
+  entry gives the room's **invite**, name, rules, players and limit,
+  whether it has a password, its phase and its listing: a public room's
+  invite is for anyone to join with, and its password still guards it. A
+  private room is never listed, and its invite never leaves the server
+  but as the answer to its creator. The server keeps a public room's
+  invite in memory only: a room restored after a restart is private. The
+  owner updates the listing with `DescribeRoom(RoomListing)`, such as the
+  year and companies once the game runs; anyone else gets `NotOwner`, and
+  a private room `NotListed`. A connection may ask for one page a second,
+  with a burst of five (`RateLimited` beyond), within its general request
+  limit.
+- **Banners** (protocol 10). A player shows a banner in rooms: one of a
+  fixed set of short ids (`tpf3mp_proto::BANNERS`, each standing for one
+  of the game's own pictures), or none for a default the game picks from
+  the player's key. `SetBanner(Some(id))` or `SetBanner(None)` sets it for
+  the connection, and for the room the player is in at once; the room view
+  gives each member's (`MemberView::banner`). An id not in the set is
+  refused (`UnknownBanner`). The launcher sends it on every connection.
+  Rooms do not log banners: a restored room shows the defaults until each
+  player says again.
+- **Play style** (protocol 11). The owner creates a room co-op (every
+  player for the room's one company, as a room starts, D21) or competitive
+  (`CreateRoom::competitive`: each player for a company of their own). The
+  server only carries it, in the room view and the room list; players
+  found their companies in the game as D21 lets them. Not logged: a
+  restored room is co-op.
 - **Updates.** Members receive the full room view (`RoomUpdate`) whenever it
   changes. Updates and responses are independent messages: a `RoomUpdate`
   caused by a request can arrive before that request's `Response`.
@@ -128,6 +161,8 @@ A room has a name, an owner, a player limit, settings, members, and a phase:
   a larger one (`InvalidContent`). The server derives the **content
   fingerprint** from the manifest, a SHA-256 that is equal only for the
   same build and the same mods in the same order, and rooms compare those.
+  The agent declares a player's shared mods only: those it scanned as
+  personal, which may differ between players, stay out ([MODS.md](MODS.md)).
   A room tells each member whose content differs from its own (the owner's
   in the lobby, the game's once it runs) how, with `ContentDiff`: the
   builds if they differ, the mods the member lacks, the mods the room
@@ -271,12 +306,31 @@ These travel on the control stream.
   opaque, size-capped payload. The game's actions are encoded in it by the
   action schema (`tpf3mp_proto::action`, described in "The action schema"
   in [BUILDING.md](BUILDING.md)), which has a version of its own.
+  Action schema 11 adds portable junction edits and junction changes in
+  road/track polylines. Its duration fields are milliseconds on the wire;
+  engine IDs remain local. Schema 10 payloads are refused by schema 11
+  clients. The enclosing control protocol and bridge layout are unchanged.
   - The server validates it: the room is running, the sender is a member,
     rate and size limits hold, and the ruleset accepts it.
   - Accepted: the intent enters the next turn as a `Command` event. The event
     names the player and the client sequence number, so the sender can match
     it.
   - Refused: only the sender gets `IntentRejected` with a reason.
+  - **Secrets** (version 8). An intent may carry a `Secret` beside its
+    payload: a password the action needs, such as a company's to join or
+    lock it (DECISIONS.md, D22, proposed), with a `scope`, the thing it is
+    for (the company's id). The server never orders, logs or relays the
+    password. It orders the intent with a `Seal` in its `Command` event
+    instead: HMAC-SHA256 under the server's key (`invite.key`'s) of the
+    room, the scope and the password, with the scope beside it. The same
+    password for the same company of the same room gives the same seal, so
+    every game compares the seal with the one it keeps; without the
+    server's key a seal can be neither reversed nor checked against a
+    guess, so it may stand in the room's log and in saves. Only the server
+    makes seals: a client's intent has no field for one. A `Secret`'s
+    `Debug` shows `<hidden>`. The server cannot tell a right password from
+    a wrong one, so it counts them all: 20 intents with a secret per member
+    in 10 minutes, then `IntentRejected(RateLimited)`.
 - **`Progress`**: the last step the client executed. It drives pacing.
 - **`Checkpoint`**: per-lane digests at every checkpoint step (a room
   setting). The server compares members' digests, as described in
@@ -513,8 +567,9 @@ players' diagnostics the same way.
   - a checkpoint with too many lanes.
 - **Rate limits.**
   - Intents, per player: 20 per second with a burst of 40, and 32 KiB of
-    payload per second with a burst of 256 KiB. Excess intents are answered
-    with `IntentRejected(RateLimited)`.
+    payload per second with a burst of 256 KiB, and 20 intents with a
+    secret in 10 minutes. Excess intents are answered with
+    `IntentRejected(RateLimited)`.
   - Requests, per connection: 10 per second with a burst of 20, of which
     joins 1 per second with a burst of 5. Excess requests are answered with
     `RateLimited`.

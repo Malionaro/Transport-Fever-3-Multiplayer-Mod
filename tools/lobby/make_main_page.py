@@ -2,9 +2,11 @@
 """Builds the mod's gui/menu/main_page.tl from the game's own file.
 
 The mod's copy is the game's main_page.tl plus the Multiplayer entry
-(docs/LOBBY.md): a card, a top-bar button and the window they open. Each
-addition is applied at an anchor that must match exactly once, so a game
-patch that moves things fails loudly here rather than in the game.
+(docs/LOBBY.md): a column of two cards right of the game's own
+(Multiplayer, and Join a friend), a top-bar button and the window they
+open. Each addition is applied at an anchor that must match exactly once,
+so a game patch that moves things fails loudly here rather than in the
+game.
 
     python tools/lobby/make_main_page.py <the game's gui/menu/main_page.tl> [--install <mods folder>]
 
@@ -34,19 +36,22 @@ LOBBY_WINDOW = '''-- TPF3-MP: the Multiplayer window, opened from the main menu 
 -- own window container (as DeluxeContentWindow is). Its content is the mod's
 -- gui/menu/lobby.lua: the lobby, talking to the hook.
 local record LobbyModule
-	content : function(onClose : function()) : TreeNodeId
+	content : function(onClose : function(), focus : string) : TreeNodeId
+	CardLine : function(params : any) : TreeNodeId
+	joinLine : function(state : any) : string
 end
 local lobby = ug_require "tpf3mp_1::/gui/menu/lobby.lua" as LobbyModule
 
 local record Tpf3mpLobbyWindowParam
 	onClose : function()
 	pos : Vec2f
+	focus : string
 end
 
 -- TPF3-MP: the lobby's content, or, should its Lua fail, the error and a way
 -- out - never a window that cannot be closed.
-local function safeContent(onClose : function()) : TreeNodeId
-	local ok, result = pcall(lobby.content, onClose)
+local function safeContent(onClose : function(), focus : string) : TreeNodeId
+	local ok, result = pcall(lobby.content, onClose, focus)
 	if ok then
 		return result as TreeNodeId
 	end
@@ -66,25 +71,31 @@ local function safeContent(onClose : function()) : TreeNodeId
 end
 
 local Tpf3mpLobbyWindow = react.RegisterWrapperRecipe("Tpf3mpLobbyWindow", builtin.Window, function(param : Tpf3mpLobbyWindowParam) : TreeNodeId
+	-- Centred on the screen at any resolution, as the game centres its mod
+	-- validation report (mod_manager_react_util.tl): by that window's class,
+	-- whose rule in the game's style sheet (mod_browser.css.lua,
+	-- "Window!validation-report-dialog") sets anchorPoint and gravity to
+	-- 0.5, 0.5 and nothing else. A wrapper recipe may pass meta only for its
+	-- class: a styleSheet with anchorPoint made the game assert and close
+	-- ("Wrapper recipe must return child", 2026-09-30). initialX and
+	-- initialY are shares of the screen for the window's anchor point, so
+	-- none is given: the class's gravity places it.
 	return builtin.Window{
 		title = _("Multiplayer"),
 		id = "window.tpf3mp.lobby",
-		meta = {
-			class = "fade-in"
-		},
-		initialX = param.pos and param.pos.x or nil,
-		initialY = param.pos and param.pos.y or nil,
+		meta = { class = "fade-in, validation-report-dialog" },
 		movable = false,
 		closable = true,
 		onClose = param.onClose,
-		content = safeContent(param.onClose),
+		content = safeContent(param.onClose, param.focus),
 	}
 end)
 
 '''
 
-SHOW = '''	-- TPF3-MP: open the Multiplayer window, as showDeluxeContent opens its window.
-	local showMultiplayer = function()
+SHOW = '''	-- TPF3-MP: open the Multiplayer window, as showDeluxeContent opens its
+	-- window; `focus` "join" puts joining by invite first.
+	local showMultiplayer = function(focus : string)
 		local pos = api.type.Vec2f.new(0.5, 0.5)
 		titleIconOnlyState:set(true)
 		local wc = mainPageParams.commonParams.windowContainer:get():getApi()
@@ -96,38 +107,129 @@ SHOW = '''	-- TPF3-MP: open the Multiplayer window, as showDeluxeContent opens i
 				mainPageParams.commonParams.windowContainer:get():getApi().removeAllWindows(Tpf3mpLobbyWindow)
 			end,
 			pos = pos,
+			focus = focus,
 		})
 	end
 
 	if titleIconOnlyState:old() then
 		react.setStyleClasses("title-icon-only")'''
 
-TOPBAR_BUTTON = '''	-- TPF3-MP: the Multiplayer button in the top bar.
-	local multiplayer = button_react_util.makeIconButton(nil, "tpf3mp_1::/gui/tpf3mp/icons/button_multiplayer.tga", function()
+TOPBAR_BUTTON = '''	-- TPF3-MP: the Multiplayer button in the top bar, a glyph drawn as the
+	-- game's own top-bar icons are (tools/art/icons/menu_icon.py).
+	local multiplayer = button_react_util.makeIconButton(nil, "tpf3mp_1::/gui/tpf3mp/icons/menu_multiplayer_50.tga", function()
 		if clickAllowed("TopBar") then
-			showMultiplayer()
+			showMultiplayer(nil)
 		end
 	end, _("Multiplayer"))
 
 	local settings = button_react_util.makeIconButton(nil, "::/gui/menu/icons/settings_50.tga", function()'''
 
-CARD = '''	-- TPF3-MP: the Multiplayer card. Placeholder art until the mod has its own.
-	local multiplayerCard = menu_icon_react_util.makeCardButton(
-		_("Multiplayer"),
-		function()
+CARD = '''	-- TPF3-MP: the Multiplayer cards, a column right of the game's own cards:
+	-- Multiplayer (connect, create or join) and Join a friend (the window with
+	-- the invite first). Each card's line under its title is live, from the
+	-- lobby the hook has (lobby.CardLine). The label is the game's own
+	-- (menu_icon_react_util.makeCardLabelBottomComponent), with that line in
+	-- place of the fixed description.
+	local tpf3mpCardLabel = function(title : string, line : function(any) : string) : TreeNodeId
+		return builtin.FloatingLayout{
+			children = {
+				builtin.FloatingLayoutChild{
+					item = builtin.ShaderQuad{
+						meta = {
+							mouseTransparent = true,
+						},
+						scaling = builtin.type.ImageViewScaling.AutoZoom,
+						path0 = "::/gui/menu/design/blackOpaque_effects.tga",
+						path1 = nil, -- nrm
+						path2 = "::/gui/menu/design/allgreen_masks.tga",
+						path3 = "::/gui/menu/design/allwhite_main.tga",
+						specularColor = api.type.Vec3f.new(0.42, 0.75, 0.87),
+						specularMixAmount = 1.0,
+						animatedRippleStrength = 0.18,
+						mouseGradDist = 360.0,
+						mouseGradBaseStr = 0.34,
+						mouseClickStr = 0.51,
+						useFullOpacity = false,
+						rippleEffectOnClick = true,
+						useNormalMap = true,
+						mouseGradAdditional = true,
+					},
+				},
+				builtin.FloatingLayoutChild{
+					item = builtin.Component{
+						layout = builtin.BoxLayout{
+							orientation = builtin.type.Orientation.Horizontal,
+							children = {
+								builtin.Component{
+									meta = { class = "title-and-description", },
+									layout = builtin.BoxLayout{
+										orientation = builtin.type.Orientation.Vertical,
+										children = {
+											builtin.TextView{
+												meta = { class = "font-scale-main-card-title" },
+												text = title,
+											},
+											lobby.CardLine{ line = line },
+										},
+									},
+								},
+								gui_react_util.makeHorizontalSpacer(),
+							},
+						},
+					},
+				},
+			},
+		}
+	end
+
+	local multiplayerCard = menu_icon_react_util.CardButton{
+		bottomComponent = tpf3mpCardLabel(_("Multiplayer"), nil),
+		onClick = function()
 			if clickAllowed("Cards") then
-				showMultiplayer()
+				showMultiplayer(nil)
 			end
 		end,
-		function(x : number, y : number) -- onAttention
+		onAttention = function(x : number, y : number)
 			mainPageParams.commonParams.triggerBackgroundEvent(api.type.Vec2f.new(x, y))
 		end,
-		"",
-		{ "::/gui/menu/images/m03_ingame.tga" },
-		1,
-		nil,
-		nil
-	)
+		tooltip = _("Play together online: connect, create a room or join one"),
+		images = { "::/gui/menu/images/m02_ingame.tga", "::/gui/menu/images/m07_ingame.tga" },
+		initialImageIndex = 1,
+		imageSwapOffsetSeconds = 0.41 * 36.0,
+		displayDurationSeconds = 36.0,
+		class = "small-card, top-right",
+		extraChildren = {
+			builtin.FloatingLayoutChild{
+				h = 0.06,
+				v = 0.08,
+				item = builtin.ImageView{
+					meta = { mouseTransparent = true },
+					path = "tpf3mp_1::/gui/tpf3mp/icons/menu_multiplayer_50.tga",
+				},
+			},
+		},
+	}
+
+	local joinCard = menu_icon_react_util.CardButton{
+		bottomComponent = tpf3mpCardLabel(_("Join a friend"), lobby.joinLine),
+		onClick = function()
+			if clickAllowed("Cards") then
+				showMultiplayer("join")
+			end
+		end,
+		onAttention = function(x : number, y : number)
+			mainPageParams.commonParams.triggerBackgroundEvent(api.type.Vec2f.new(x, y))
+		end,
+		tooltip = _("Join a friend's room with the invite code they send you"),
+		images = { "::/gui/menu/images/m05_ingame.tga" },
+		initialImageIndex = 1,
+		class = "small-card",
+	}
+
+	local multiplayerColumn = vBox({
+		vBox({ multiplayerCard }, "level2b"),
+		vBox({ joinCard }, "level2b"),
+	}, "level1")
 
 	local saveId = api.type.SavegameId.new()'''
 
@@ -159,8 +261,13 @@ def build(source_text):
     edit('					gui_react_util.makeHorizontalSpacer(),\n					settings, ',
          '					gui_react_util.makeHorizontalSpacer(),\n					multiplayer, -- TPF3-MP\n					settings, ')
     edit('	local saveId = api.type.SavegameId.new()', CARD)
-    edit('			}, "level2b")\n		}, "level1"),',
-         '			}, "level2b"),\n			multiplayerCard, -- TPF3-MP\n		}, "level1"),')
+    # The Multiplayer column has the grid's top-right corner now.
+    edit('		mapEditorDisplayDuration,\n		"small-card, top-right"\n',
+         '		mapEditorDisplayDuration,\n		"small-card" -- TPF3-MP: was "small-card, top-right"; the Multiplayer card has that corner\n')
+    edit('	local cardWrap = vBox({\n		hBox({\n			newGameCard, ',
+         '	local cardWrap = vBox({\n		hBox({ vBox({ -- TPF3-MP: the game\'s cards, then the Multiplayer column\n		hBox({\n			newGameCard, ')
+    edit('			campaignCard\n		}, "level1"),\n	}, "card-wrap", cardWrapRef)',
+         '			campaignCard\n		}, "level1"),\n		}), multiplayerColumn }), -- TPF3-MP\n	}, "card-wrap", cardWrapRef)')
 
     # A leading-slash path is resolved against the requiring file's root, which
     # for the mod's copy is tpf3mp_1::/; name the game's root explicitly.
@@ -183,7 +290,8 @@ def main():
 
     content = os.path.join(MOD, "_content.json")
     listing = json.load(open(content, encoding="utf-8"))
-    for path in ("gui/menu/main_page.tl", "gui/menu/lobby.lua", "tpf3mp/state.lua", "tpf3mp/act.lua"):
+    for path in ("gui/menu/main_page.tl", "gui/menu/lobby.lua", "tpf3mp/state.lua", "tpf3mp/act.lua",
+                 "gui/tpf3mp/icons/menu_multiplayer_50.tga", "gui/tpf3mp/icons/menu_multiplayer_50@2x.tga"):
         if path not in listing["files"]:
             listing["files"].insert(0, path)
             print(f"listed {path} in _content.json")

@@ -33,10 +33,12 @@ use std::{
 
 use tpf3mp_hookcore::profile::{BuildIdentity, Profile, ProfileError};
 
+pub mod at_menu;
 pub mod autoload;
 pub mod builds;
 pub mod image;
 mod install;
+pub mod junctions;
 pub mod lanedump;
 pub mod log;
 pub mod lua;
@@ -76,6 +78,9 @@ pub fn bootstrap() {
     // Only a game TPF3-MP's launcher started runs the hook: the launcher
     // names its link in the game's environment. Loaded any other way, the
     // hook writes, hashes and opens nothing (D11).
+    // The launcher keeps the game suspended until the hook says it is
+    // ready: on every way out of here, at the latest.
+    let ready = platform::Ready::new();
     let Some(link_name) = launched_link() else {
         return;
     };
@@ -94,6 +99,15 @@ pub fn bootstrap() {
                 profile.targets.len(),
                 profiles.len()
             ));
+            // The main menu's Multiplayer entry first, and then the game may
+            // run: it loads its main menu soon after it starts, and a menu
+            // loaded before the entry is armed stays the game's own (seen
+            // 2026-09-30, when the slower installs below came first). The
+            // entry stands on its own: without the step gate it still
+            // opens, and says the launcher is not answering; without its
+            // own targets the menu is the game's.
+            install_menu(&profiles, &mut log, data_dir.as_deref());
+            ready.signal(&mut log);
             match install::install(&profile, &link_name, Logger::open(data_dir.as_deref())) {
                 install::Installed::Yes { step_rva } => log.line(&format!(
                     "step gate installed on {} at {step_rva:#x}; the session is attached to {link_name:?}",
@@ -103,10 +117,6 @@ pub fn bootstrap() {
                     log.line(&format!("multiplayer disabled (fail-closed): {reason}"));
                 }
             }
-            // The main menu's Multiplayer entry stands on its own: without
-            // the step gate it still opens, and says the launcher is not
-            // answering; without its own targets the menu is the game's.
-            install_menu(&profiles, &mut log, data_dir.as_deref());
         }
         BuildOutcome::FailedClosed(reason) => {
             log.line(&format!("multiplayer disabled (fail-closed): {reason}"));

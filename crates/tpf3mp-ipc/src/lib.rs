@@ -58,6 +58,16 @@ pub const AUTO_LOAD_ENV: &str = "TPF3MP_AUTO_LOAD";
 /// per-user one: one per game when several run on one PC.
 pub const DATA_DIR_ENV: &str = "TPF3MP_DATA_DIR";
 
+/// The name of the Windows event the hook in the game with process id `pid`
+/// sets once it has armed what must be in place before the game runs its
+/// first line, the main menu's Multiplayer entry above all. The launcher
+/// creates it before it loads the hook into the suspended game and waits
+/// for it before it lets the game run: otherwise the game can load its main
+/// menu before the entry is armed, and the menu is the game's own.
+pub fn hook_ready_event(pid: u32) -> String {
+    format!(r"Local\tpf3mp.hook-ready.{pid}")
+}
+
 /// Default size of each ring's data area (1 MiB).
 pub const DEFAULT_RING_CAPACITY: u32 = 1 << 20;
 /// Default maximum payload per message (60 KiB), leaving headroom in the ring.
@@ -258,6 +268,27 @@ impl Link {
         })
     }
 
+    /// Another live agent's process id, if one holds the link `name`: its
+    /// header names an agent other than this process, whose heartbeat moves
+    /// within `wait`. Creating the link would reset it under that agent, and
+    /// two launchers would serve one game (the "crossed links" of two
+    /// launchers started without their own `--game-link`). `None` when no
+    /// such link exists, it is this process's, or its agent is gone.
+    pub fn held_by_another_agent(name: &str, wait: std::time::Duration) -> Option<u32> {
+        let region = SharedRegion::open(name, HEADER_SIZE).ok()?;
+        let probe = Layout::over(&region, 0, 0);
+        if probe.magic() != header::MAGIC || probe.abi() != ABI_VERSION {
+            return None;
+        }
+        let pid = probe.agent_pid();
+        if pid == 0 || pid == std::process::id() {
+            return None;
+        }
+        let before = probe.agent_heartbeat();
+        std::thread::sleep(wait);
+        (probe.agent_heartbeat() != before && probe.agent_pid() == pid).then_some(pid)
+    }
+
     pub fn role(&self) -> Role {
         self.role
     }
@@ -389,6 +420,41 @@ mod tests {
         hook.send(b"to-agent").unwrap();
         assert_eq!(agent.recv_into(&mut buf).unwrap(), Some(8));
         assert_eq!(&buf[..8], b"to-agent");
+    }
+
+    #[test]
+    fn a_link_another_live_agent_holds_is_told_apart() {
+        let wait = std::time::Duration::from_millis(60);
+        let name = unique_name("held");
+        assert_eq!(Link::held_by_another_agent(&name, wait), None, "no link");
+        let agent = Link::create(&Config::new(name.clone()), Role::Agent).unwrap();
+        assert_eq!(
+            Link::held_by_another_agent(&name, wait),
+            None,
+            "this process's own"
+        );
+        // Another launcher's: its process id, and a heartbeat that moves.
+        agent.layout.set_agent_pid(4242);
+        let beating = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let beat = {
+            let beating = std::sync::Arc::clone(&beating);
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let other = Link::open(&name, Role::Hook).unwrap();
+                while beating.load(std::sync::atomic::Ordering::Relaxed) {
+                    other.layout.bump_agent_heartbeat();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        assert_eq!(Link::held_by_another_agent(&name, wait), Some(4242));
+        beating.store(false, std::sync::atomic::Ordering::Relaxed);
+        beat.join().unwrap();
+        assert_eq!(
+            Link::held_by_another_agent(&name, wait),
+            None,
+            "an agent whose heartbeat stopped is gone"
+        );
     }
 
     #[test]

@@ -56,6 +56,10 @@ const REQUESTS_PER_SECOND: u32 = 10;
 const REQUEST_BURST: u32 = 20;
 /// Of those, attempts to join a room.
 const JOINS_PER_SECOND: u32 = 1;
+/// Pages of the room list a connection may ask for: one a second, with a
+/// burst of five, so a browser can page ahead without scraping the server.
+const LISTS_PER_SECOND: u32 = 1;
+const LIST_BURST: u32 = 5;
 const JOIN_BURST: u32 = 5;
 /// Diagnostics requests, on a budget of their own so that they never make
 /// a player's other requests wait or fail.
@@ -333,11 +337,14 @@ struct Client {
     datagrams: Option<mpsc::Receiver<Datagram>>,
     requests: TokenBucket,
     joins: TokenBucket,
+    lists: TokenBucket,
     progress: TokenBucket,
     intents: TokenBucket,
     diagnostics: TokenBucket,
     /// Bytes of diagnostics this session has had kept.
     diagnostics_kept: u64,
+    /// The banner this player picked, for the rooms it joins.
+    banner: Option<tpf3mp_proto::BannerId>,
 }
 
 impl Client {
@@ -377,10 +384,12 @@ impl Client {
             datagrams: Some(datagram_rx),
             requests: TokenBucket::new(REQUESTS_PER_SECOND, REQUEST_BURST),
             joins: TokenBucket::new(JOINS_PER_SECOND, JOIN_BURST),
+            lists: TokenBucket::new(LISTS_PER_SECOND, LIST_BURST),
             progress: TokenBucket::new(PROGRESS_PER_SECOND, PROGRESS_BURST),
             intents: TokenBucket::new(INTENTS_PER_SECOND, INTENT_BURST),
             diagnostics: TokenBucket::new(DIAGNOSTICS_PER_SECOND, DIAGNOSTICS_BURST),
             diagnostics_kept: 0,
+            banner: None,
         }
     }
 
@@ -478,13 +487,17 @@ impl Client {
                 ClientMessage::Hello(_) => return Err(Violation::SecondHello),
                 ClientMessage::Request { id, request } => {
                     let joining = matches!(request, Request::JoinRoom(_));
+                    let listing = matches!(request, Request::ListRooms { .. });
                     let result = if let Request::Diagnostics(batch) = &request {
                         if self.diagnostics.take(now, 1) {
                             self.keep_diagnostics(batch)
                         } else {
                             Err(RequestError::RateLimited)
                         }
-                    } else if !self.requests.take(now, 1) || (joining && !self.joins.take(now, 1)) {
+                    } else if !self.requests.take(now, 1)
+                        || (joining && !self.joins.take(now, 1))
+                        || (listing && !self.lists.take(now, 1))
+                    {
                         Err(RequestError::RateLimited)
                     } else {
                         self.request(request).await
@@ -519,6 +532,7 @@ impl Client {
             platform: self.hello.platform,
             link: self.link.clone(),
             content: self.content.clone(),
+            banner: self.banner.clone(),
         }
     }
 
@@ -643,6 +657,39 @@ impl Client {
                 .await
             }
             Request::Diagnostics(batch) => self.keep_diagnostics(&batch),
+            Request::SetBanner(banner) => {
+                if banner
+                    .as_ref()
+                    .is_some_and(|id| !tpf3mp_proto::is_banner(id.as_str()))
+                {
+                    return Err(RequestError::UnknownBanner);
+                }
+                self.banner.clone_from(&banner);
+                if self.room.is_none() {
+                    return Ok(Response::Done);
+                }
+                match self
+                    .in_room(|player, reply| RoomCommand::SetBanner {
+                        player,
+                        banner,
+                        reply,
+                    })
+                    .await
+                {
+                    // The room closed meanwhile: kept for the next.
+                    Err(RequestError::NotInRoom) => Ok(Response::Done),
+                    result => result,
+                }
+            }
+            Request::ListRooms { page } => Ok(Response::Rooms(self.shared.directory.list(page))),
+            Request::DescribeRoom(listing) => {
+                self.in_room(|player, reply| RoomCommand::Describe {
+                    player,
+                    listing,
+                    reply,
+                })
+                .await
+            }
             Request::StartWorld(world) => {
                 if self.shared.snapshots.is_none() {
                     return Err(RequestError::WorldsNotKept);
@@ -723,11 +770,13 @@ impl Client {
             GameMessage::Intent {
                 client_seq,
                 payload,
+                secret,
             } => {
                 let queued = room.notify(RoomCommand::Intent {
                     player: self.player,
                     client_seq,
                     payload,
+                    secret,
                 });
                 if !queued {
                     self.reject_intent(client_seq, IntentRejection::RateLimited);

@@ -8,11 +8,11 @@ use tpf3mp_proto::{
     BoundedVec, Text,
     action::{
         Action, AssignLine, Bulldoze, BuyVehicle, CompanyId, CompanyOp, ConsistPart,
-        ConstructionBuild, ConstructionRef, CreateLine, EdgeEnds, EdgeRef, EditLine, LineChange,
-        LineData, LineId, LineStop, Link, LoadMode, Network, Param, ParamValue, PlaceStop,
-        Polyline, Pos, Pos2, Prospect, ReplaceVehicle, ReplacedPart, Resolve, RoadBuild, StationId,
-        StopRules, Structure, Tangent, Terminal, Terraform, TerrainCell, Tint, TownId, TrackBuild,
-        Tram, Transform, UnitDir, VehicleId, Vertex,
+        ConstructionBuild, ConstructionRef, CreateLine, EdgeEnds, EdgeObjectKind, EdgeRef,
+        EditLine, LineChange, LineData, LineId, LineStop, Link, LoadMode, Network, Param,
+        ParamValue, PlaceStop, Polyline, Pos, Pos2, Prospect, ReplaceVehicle, ReplacedPart,
+        Resolve, RoadBuild, StationId, StopRules, Structure, Tangent, Terminal, Terraform,
+        TerrainCell, Tint, TownId, TrackBuild, Tram, Transform, UnitDir, VehicleId, Vertex,
     },
 };
 
@@ -96,6 +96,10 @@ pub fn polyline(vertices: Vec<Vertex>, structure: &Structure) -> Polyline {
                 tangent1: tangent,
                 structure: structure.clone(),
                 kind: None,
+                decorations: BoundedVec::default(),
+                locked: false,
+                owned: false,
+                lanes: BoundedVec::default(),
             }
         })
         .collect();
@@ -303,6 +307,8 @@ pub fn place_stop(a: Pos, b: Pos, pos: Pos) -> Action {
         },
         model: text(STREET_STOP),
         two_sided: false,
+        object: EdgeObjectKind::Stop,
+        one_way: false,
     })
 }
 
@@ -920,11 +926,83 @@ fn crowd_scenario() -> Scenario {
         )
 }
 
+/// Junction settings through the room, with ownership refusal and reset.
+fn junctions_scenario() -> Scenario {
+    use tpf3mp_proto::action::{
+        JunctionChange, JunctionConfig, JunctionEdit, LaneConnection, NodeRef, TrafficPhase,
+        TrafficPreference,
+    };
+    let (a, b, c) = (at(0, 0), at(100, 0), at(100, 100));
+    let incoming = EdgeRef {
+        network: Network::Street,
+        ends: EdgeEnds { a, b },
+    };
+    let outgoing = EdgeRef {
+        network: Network::Street,
+        ends: EdgeEnds { a: b, b: c },
+    };
+    let node = NodeRef {
+        network: Network::Street,
+        at: b,
+    };
+    let edit = Action::EditJunctions(JunctionEdit {
+        changes: list(vec![JunctionChange {
+            node,
+            config: Some(JunctionConfig {
+                connections: list(vec![LaneConnection {
+                    incoming,
+                    lane_in: 0,
+                    outgoing,
+                    lane_out: 1,
+                    road: true,
+                    tram: true,
+                }]),
+                crosswalks: list(vec![incoming]),
+                preference: TrafficPreference::Yes,
+                light: None,
+                phases: list(vec![TrafficPhase {
+                    locked: list(vec![0, 1]),
+                    duration: 12_375,
+                    minimum: 4_125,
+                    skip: true,
+                }]),
+                double_slip: false,
+                custom_phases: true,
+            }),
+        }]),
+    });
+    Script::default()
+        .act(0, road(vec![new(a), new(b), new(c)]))
+        .act(0, edit.clone())
+        .expect_all([Check::Junctions(1), Check::Ignored(0)])
+        .run(100)
+        .act(1, edit)
+        .expect_all([Check::Junctions(1), Check::Ignored(1)])
+        .act(
+            0,
+            Action::EditJunctions(JunctionEdit {
+                changes: list(vec![JunctionChange { node, config: None }]),
+            }),
+        )
+        .expect_all([
+            Check::Junctions(0),
+            Check::StreetEdges(2),
+            Check::Ignored(1),
+        ])
+        .scenario(
+            "junctions",
+            "turns, crosswalks and timed lights; ownership refusal and reset",
+            true,
+            2,
+        )
+}
+
 /// Every scenario, the quick ones first.
 pub fn scenarios() -> Vec<Arc<Scenario>> {
     let mut all = vec![
         bus_line_scenario(),
         rail_line_scenario(),
+        junctions_scenario(),
         two_companies_scenario(),
         refusals_scenario(),
         prospecting_scenario(),

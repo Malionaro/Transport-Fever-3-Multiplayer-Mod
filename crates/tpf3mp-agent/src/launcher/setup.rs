@@ -27,6 +27,14 @@ pub fn game_build(given: Option<&str>, installed: Option<&steam::Installed>) -> 
     }
 }
 
+/// The project's public relay: the launcher's default server when its
+/// package names none (`TPF3MP_DEFAULT_SERVER`), for every build, a
+/// developer's too. It has a certificate from a public authority, so the
+/// launcher trusts it as it trusts any server, without a pin.
+pub const RELAY: &str = "tpf3mp.213-133-98-90.sslip.io:29470";
+/// What players see of [`RELAY`] in place of its address.
+pub const RELAY_NAME: &str = "EU";
+
 /// Where the per-user files live: `TPF3-MP` in the user's local data
 /// directory.
 pub fn data_dir() -> Result<PathBuf> {
@@ -135,18 +143,21 @@ pub struct LauncherArgs {
     #[arg(long, default_value = "127.0.0.1:47470")]
     pub listen: SocketAddr,
 
-    /// The server to play on, as host:port, and the only one (D12): for
-    /// development and playtests. Without it, the package's own.
+    /// The server to play on this run, as host:port, over the player's
+    /// server setting: for development and playtests. Without it, the
+    /// player's setting, else the default server.
     #[arg(long)]
     pub server: Option<String>,
 
-    /// The server a package is built for: the only one its launcher plays
-    /// on. Without it and --server, as in a build for development, the
-    /// player types the server, and the last one is offered.
+    /// The launcher's default server, which its server setting's "Reset to
+    /// default" goes back to: the one the package is built for. Without it,
+    /// --server or a server setting, the player types the server, and the
+    /// last one is offered.
     #[arg(long)]
     pub default_server: Option<String>,
 
-    /// What players see of the server, such as EU, in place of its address.
+    /// What players see of the default server, such as EU, in place of its
+    /// address.
     #[arg(long)]
     pub server_name: Option<String>,
 
@@ -182,9 +193,16 @@ pub struct LauncherArgs {
     pub game_exe: Option<PathBuf>,
 
     /// A file listing the game's active mods in load order, one per line:
-    /// the mod's name, then its version.
+    /// the mod's name, then its version. Each is scanned: personal ones
+    /// (GUI mods) may differ between the room's players (docs/MODS.md).
     #[arg(long)]
     pub mods: Option<PathBuf>,
+
+    /// Count game-script mods whose commands the room carries (a timetable
+    /// mod, a line namer) as personal too. For playtests until the room
+    /// lets them differ (docs/MODS.md, proposed D25).
+    #[arg(long)]
+    pub personal_game_scripts: bool,
 
     /// Where worlds are kept. Defaults to the per-user data directory.
     #[arg(long)]
@@ -204,15 +222,70 @@ pub fn package_hook() -> Option<PathBuf> {
     hook.is_file().then_some(hook)
 }
 
-impl LauncherArgs {
-    /// The server this launcher plays on alone (D12): the one given, or the
-    /// package's.
-    fn fixed_server(&self) -> Option<String> {
-        self.server
-            .clone()
-            .or_else(|| self.default_server.clone())
-            .map(|server| server.trim().to_owned())
+/// This player's mods, sorted for the room (`content::split`): each listed
+/// mod looked for among those installed (Mod Hub's, the Steam accounts'
+/// local ones, the game's own) and scanned. What each mod was taken for
+/// goes to the log. `carried_personal`: game-script mods whose commands the
+/// room carries count as personal (`--personal-game-scripts`).
+pub fn split_mods(
+    game_build: &str,
+    mods: Option<&std::path::Path>,
+    installed: Option<&steam::Installed>,
+    carried_personal: bool,
+) -> Result<content::Split> {
+    let found = if mods.is_some() {
+        tpf3mp_modscan::roots::installed(&tpf3mp_modscan::roots::default_roots(
+            installed.map(|game| game.dir.as_path()),
+            &steam::steam_roots(),
+        ))
+    } else {
+        Vec::new()
+    };
+    let split = content::split(game_build, mods, &found, carried_personal)?;
+    for verdict in &split.verdicts {
+        tracing::info!(
+            "mod {} {} is {}: {}",
+            verdict.listed.id,
+            verdict.listed.version,
+            verdict.class,
+            verdict.why
+        );
+    }
+    if mods.is_some() && split.lists.is_none() {
+        tracing::warn!(
+            "more mods listed than the room's worlds can be loaded with; they load with their saves' mods"
+        );
+    }
+    Ok(split)
+}
+
+/// The server a launcher plays on (D12, as amended): the one `given` on its
+/// command line, else the player's `chosen` setting, else the `default`.
+/// A setting that is no `host:port` (an old or edited file) is passed over.
+pub fn plays_on(
+    given: Option<&str>,
+    chosen: Option<&str>,
+    default: Option<&str>,
+) -> Option<String> {
+    let named = |server: Option<&str>| {
+        server
+            .map(str::trim)
             .filter(|server| !server.is_empty())
+            .map(str::to_owned)
+    };
+    named(given)
+        .or_else(|| chosen.and_then(|chosen| super::server_address(chosen).ok()))
+        .or_else(|| named(default))
+}
+
+impl LauncherArgs {
+    /// The launcher's default server, if it has one.
+    fn default_server(&self) -> Option<String> {
+        self.default_server
+            .as_deref()
+            .map(str::trim)
+            .filter(|server| !server.is_empty())
+            .map(str::to_owned)
     }
 
     /// The launcher these options describe: the player's identity (created
@@ -225,6 +298,36 @@ impl LauncherArgs {
         // Next to the identity: the same player's last server and name.
         let remember = identity_file.with_file_name("launcher.json");
         let remembered = Remembered::load(&remember);
+        let build = game_build(self.game_build.as_deref(), installed.as_ref());
+        let split = split_mods(
+            &build,
+            self.mods.as_deref(),
+            installed.as_ref(),
+            self.personal_game_scripts,
+        )?;
+        // Without --mods, the launcher finds the player's mods itself and
+        // lets them choose their personal ones (docs/MODS.md).
+        let picker = self.mods.is_none().then(|| {
+            let found = crate::picker::discover(
+                installed.as_ref().map(|game| game.dir.as_path()),
+                &steam::steam_roots(),
+            );
+            for m in &found {
+                tracing::info!("mod {} {} is {}: {}", m.id, m.version, m.class, m.reason);
+            }
+            crate::picker::Mods::new(
+                tpf3mp_proto::Text::lossy(build.trim()),
+                found,
+                remembered.mods.clone().unwrap_or_default(),
+                self.personal_game_scripts,
+            )
+        });
+        let default_server = self.default_server();
+        let server = plays_on(
+            self.server.as_deref(),
+            remembered.chosen_server.as_deref(),
+            default_server.as_deref(),
+        );
         Ok(LauncherConfig {
             // The launcher window sets it: it records the player's log.
             diagnostics: None,
@@ -232,8 +335,9 @@ impl LauncherArgs {
             game_exe: self.game_exe.clone(),
             game_env: Vec::new(),
             listen: self.listen,
-            server: self.fixed_server().or(remembered.server),
-            server_fixed: self.fixed_server().is_some(),
+            server_fixed: server.is_some(),
+            server: server.or(remembered.server),
+            default_server,
             server_name: self
                 .server_name
                 .as_deref()
@@ -249,10 +353,9 @@ impl LauncherArgs {
                 .clone()
                 .or(remembered.name)
                 .unwrap_or_else(|| "player".to_owned()),
-            content: content::manifest(
-                &game_build(self.game_build.as_deref(), installed.as_ref()),
-                self.mods.as_deref(),
-            )?,
+            content: split.manifest,
+            mods: split.lists,
+            picker,
             installed,
             link: self.game_link.clone(),
             worlds: open_worlds(self.worlds.as_deref(), self.worlds_gib, &self.game_link)?,
@@ -279,5 +382,25 @@ mod tests {
         assert_eq!(game_build(Some("beta"), Some(&installed)), "beta");
         assert_eq!(game_build(None, Some(&installed)), "steam-20412345");
         assert_eq!(game_build(None, None), "tpf3");
+    }
+
+    #[test]
+    fn the_command_line_then_the_players_setting_then_the_default() {
+        let relay = Some(RELAY);
+        let chosen = Some("play.example.net:29470");
+        assert_eq!(
+            plays_on(Some(" 127.0.0.1:29470 "), chosen, relay).as_deref(),
+            Some("127.0.0.1:29470"),
+            "a playtest's --server"
+        );
+        assert_eq!(plays_on(None, chosen, relay).as_deref(), chosen);
+        assert_eq!(plays_on(None, None, relay).as_deref(), relay);
+        assert_eq!(
+            plays_on(Some(" "), Some("not a server"), relay).as_deref(),
+            relay,
+            "nothing given, and a setting that is no host:port"
+        );
+        assert_eq!(plays_on(None, None, None), None);
+        assert_eq!(super::super::server_address(RELAY).as_deref(), Ok(RELAY));
     }
 }

@@ -119,7 +119,9 @@ shape or analogy, to be seen in the game; **UNKNOWN** = open.
   and the owner's game hung. It is now: this game's step has never run,
   and no world's GUI has started (`tpf3mp_native.world`), measured on the
   same playtest (the owner's menu frame once took the session while
-  saving the room's world before its first step).
+  saving the room's world before its first step). That rule left a game
+  that had had any world up unable to take the room from its menu; the
+  rule now is the engine's own `m_game` (section 8).
 
 ## 5. What the room does with a game at its menu
 
@@ -183,3 +185,87 @@ varies):
 Failure lines to look for: `the main menu could not load the room's world: <why>`
 (then `holding the world (fail closed): the room's world could not be loaded: <why>`),
 and `holding the world (fail closed): the room's world did not load within 600 s`.
+
+## 8. Back at the menu after a world (added 2026-09-30)
+
+Seen in the game: host james's hook booted, logged `the game is at its
+main menu (arrival 1)`, then from 1790805418 its `perf:` lines show
+`GameSim::Step` running (a world without TPF3-MP in its GUI: no `mod: the
+GUI is linked`). The player went back to the main menu and hosted from
+the Multiplayer window; the launcher uploaded the start save, the room
+began and the launcher fetched the world, but the hook never logged `the
+room began a game while this game is at its main menu`. The menu frame
+returned at once: `GameSim::Step` had run (`LAST_STEP != 0`), so the old
+rule of section 4 never let the menu follow the room again.
+
+Static findings (tpfre over build 40408; the game was not launched):
+
+- **CONFIRMED-static.** `CMenuUI+0x6b0` is `m_game`. `sub_6a35e0` is
+  `UI::CMenuUI::StartGame` (its assert strings name it) and begins
+  `lea rax,[rcx+0x6b0]; cmp [rax],r15; jne <assert "!m_game">`
+  (`0x6a3662`); it sets the field (`0x6a4aee`) and passes it to the
+  `UI::CGameUI` constructor (`0x6a4f37`, `CGameUI(CMenuUI*, CGame*, ...)`
+  by RTTI). `sub_6a6d70` is `UI::CMenuUI::StopGame` (strings `Game is
+  stopped`, `Unloading`, `menuReady`, `UI::CMenuUI::StopGame`): it moves
+  `m_game` out (`0x6a73fc`: `mov r14,[rsi+0x6b0]; mov [rsi+0x6b0],r15`)
+  and deletes the game on a worker thread (`_beginthreadex`). The
+  constructor clears it (`0x691893`, before its call of
+  `RegisterAppUsertypes` at `0x6923a7`); the destructor too (`0x694f63`).
+- **CONFIRMED-static.** `DoStep` (`0x6a0160`) tests the field first:
+  `cmp [rsi+0x6b0],r13; je; cmp [rsi+0x7d0],r13; je; ... call
+  sub_9a8fe0; jmp <end>` (`0x6a01c0`): with a world loaded (and the react
+  menu, `+0x7d0`, set by `CreateReactMenu`) it hands its frame on and
+  returns; otherwise it runs the menu, which polls `m_loadGameResult`
+  (`+0x1bd0`, "m_loadGameResult.Valid()") and shows "Could not initialize
+  game.". So `DoStep` runs in a world too, and `m_game` is the engine's
+  own "a world is loaded". The byte signature of that test is unique in
+  `.text` (`tpfre q bytes`, and `tf3_static_proof.rs`).
+- **CONFIRMED-static.** `RegisterAppUsertypes` takes the `CMenuUI&` as
+  its second argument, `SetupAppScriptInterface` passes its own `this`;
+  the in-game GUI's states are given `app` from inside `StartGame`, after
+  `m_game` is set. So a state adopted while `m_game` is set is a world's.
+- **INFERRED.** A load started in a world (`app.loadGame` from the GUI)
+  goes through `StopGame` first and loads after, so `m_game` is clear for
+  the whole load. The progress monitor's task, the menu's own sign of a
+  load (section 1), covers it; the 2 s quiet stretch covers any frame
+  between the stop and the task.
+- **UNKNOWN.** Whether the world's GUI states are `lua_close`d when the
+  world goes (their `__gc` sentinels would then drop them): the hook does
+  not rely on it. It never loads from a state adopted while `m_game` was
+  set, and forgets those states once `m_game` clears.
+
+The rule (`crates/tpf3mp-hook/src/at_menu.rs`, docs/HOOKS.md "Loading from
+the main menu"): a fresh game is at its menu as before; `m_game` set
+blocks; after a world, the menu is back once `m_game` is clear and nothing
+loads for 2 s. Evidence the old hangs stay blocked: the owner's world
+saving or held keeps `m_game` set (the world is loaded, only not
+stepping), and a world saving before its first step has `m_game` set
+since `StartGame`, which comes before the world's GUI exists.
+
+In-game check (host after playing a world): expected hook.log lines, in
+order:
+
+1. At start: `the main menu can load the room's world: detours on
+   RegisterAppUsertypes and UI::CMenuUI::DoStep; a world is loaded while
+   CMenuUI::m_game (+0x6b0) is set, so it follows the room back at the menu
+   after a world`.
+2. `the game is at its main menu (arrival 1): ...` (fresh).
+3. Loading a world from the menu: `menu: a world is loaded
+   (CMenuUI::m_game set)`; its GUI states: `menu: Lua state 0x... has app,
+   in a loaded world: its GUI's, never used by the main menu`.
+4. Back to the main menu: `menu: the world closed (CMenuUI::m_game
+   cleared); the <n> Lua state(s) its GUI was given are never used by the
+   main menu`, then possibly `menu: the world just closed; waiting for the
+   menu to be quiet` (or `... the game is loading one`), then about 2 s
+   later `menu: back at the main menu after a world (no world loaded or
+   loading for 2 s)` and `the game is at its main menu (arrival 2): ...`.
+5. The room begins: `the room began a game while this game is at its main
+   menu: ...`, `the room began at the main menu; the menu sees: back at
+   the main menu after a world (no world loaded or loading for 2 s)`, then
+   `loading the room's world from ... from the game's main menu ...` and
+   `the main menu is loading the room's world (tpf3mp_room_<pid>); ...`.
+
+Failure lines: `menu: after a world, the hook cannot tell whether one is
+loaded (fail closed)` (the target or the menu's `busy` missing), and no
+`back at the main menu` line while the menu shows (the task never clears,
+or `m_game` stays set).

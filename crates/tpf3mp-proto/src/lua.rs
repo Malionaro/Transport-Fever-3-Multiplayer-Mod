@@ -152,10 +152,14 @@ impl ser::Error for LuaError {
 
 /// An action from the mod's table.
 pub fn action_from_lua(value: &LuaValue) -> Result<Action, LuaError> {
-    Action::deserialize(De {
+    let action = Action::deserialize(De {
         value,
         scale: Scale::One,
-    })
+    })?;
+    action
+        .validate()
+        .map_err(|error| LuaError::new(error.to_string()))?;
+    Ok(action)
 }
 
 /// An action as the table the mod applies. Fails only for a number Lua
@@ -192,6 +196,8 @@ impl Scale {
 fn field_scale(owner: &str, field: &str) -> Scale {
     match (owner, field) {
         ("Pos" | "Pos2" | "Tangent" | "TerrainCell", _) => Scale::Milli,
+        ("Lane", "speed" | "width" | "height" | "offset") => Scale::Milli,
+        ("TrafficPhase", "duration" | "minimum") => Scale::Milli,
         ("Terraform" | "TerraformFields", "cell") => Scale::Milli,
         ("UnitDir" | "Tint", _)
         | ("Transform", "basis")
@@ -1095,6 +1101,10 @@ mod tests {
                     tangent1: tangent,
                     structure: Structure::Bridge(Text::new("bridge/cement.lua").unwrap()),
                     kind: None,
+                    decorations: BoundedVec::default(),
+                    locked: false,
+                    owned: false,
+                    lanes: BoundedVec::default(),
                 }])
                 .unwrap(),
                 BoundedVec::<EdgeRef, 256>::empty(),
@@ -1280,7 +1290,7 @@ mod tests {
             "unknown variant `Nonsense`, expected one of `BuildRoad`, `BuildTrack`, \
              `Bulldoze`, `BuildConstruction`, `BuyVehicle`, `SellVehicle`, `CreateLine`, \
              `EditLine`, `AssignLine`, `PlaceStop`, `Terraform`, `CompanyOp`, `Loan`, `VehicleOp`, \
-             `ReplaceVehicle`, `Prospect`, `NotificationSeen`"
+             `ReplaceVehicle`, `Prospect`, `NotificationSeen`, `ApplyRank`, `EditJunctions`"
         );
     }
 

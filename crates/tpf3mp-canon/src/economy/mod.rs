@@ -1,6 +1,6 @@
 //! TPF2MP's deterministic economy core, ported from Lua.
 //!
-//! Ported from `tf2mod` (TPF2MP by Julian Cooper, MIT licence) at commit
+//! Ported from `tf2mod` (TPF2MP by _Sep, MIT licence) at commit
 //! `58da402ba144b2b5ad9f5615f7d686aadd34ffb2`, files
 //! `tpf2_mp_1/res/scripts/tpf2_mp/economy_*.lua` and the pure arithmetic of
 //! `economy.lua`. Each submodule names the Lua module it ports.

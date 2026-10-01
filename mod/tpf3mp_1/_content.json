@@ -1,6 +1,8 @@
 {
     "archives": null,
     "files": [
+        "gui/tpf3mp/icons/menu_multiplayer_50@2x.tga",
+        "gui/tpf3mp/icons/menu_multiplayer_50.tga",
         "tpf3mp/act.lua",
         "tpf3mp/state.lua",
         "gui/menu/lobby.lua",
@@ -9,6 +11,8 @@
         "gui/tpf3mp/company_markers.script.lua",
         "gui/tpf3mp/gui_state.res.lua",
         "gui/tpf3mp/gui_state.script.lua",
+        "gui/tpf3mp/speed_control.res.lua",
+        "gui/tpf3mp/speed_control.script.lua",
         "gui/tpf3mp/icons/button_chat.tga",
         "gui/tpf3mp/icons/button_chat_selected.tga",
         "gui/tpf3mp/icons/button_chat_unavailable.tga",
@@ -42,9 +46,13 @@
         "scripts/tpf3mp/follow.lua",
         "scripts/tpf3mp/geom.lua",
         "scripts/tpf3mp/guard.lua",
+        "scripts/tpf3mp/junctions.lua",
         "scripts/tpf3mp/lanes.lua",
+        "scripts/tpf3mp/modguard.lua",
+        "scripts/tpf3mp/progression.lua",
         "scripts/tpf3mp/registry.lua",
         "scripts/tpf3mp/roads.lua",
+        "scripts/tpf3mp/worldload.lua",
         "tpf3mp_sim/tpf3mp_sim.gs.lua",
         "tpf3mp_sim/tpf3mp_sim.script.lua"
     ]

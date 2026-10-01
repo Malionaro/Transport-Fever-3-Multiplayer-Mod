@@ -8,15 +8,19 @@
 //! the main thread and the game scripts' on a pool of simulation threads.
 //! So the table's functions share nothing but [`SHARED`], behind a lock:
 //!
-//! - `command(action)`: the player acted. The table is read into a
+//! - `command(action, password)`: the player acted. The table is read into a
 //!   [`LuaValue`] tree within [`MAX_DEPTH`] and [`MAX_NODES`], converted with
 //!   the schema ([`action_from_lua`]) and queued for the step gate, which
 //!   hands it to the room ([`take_commands`]). Returns `true` and a ticket,
 //!   or `false` and why: an action that was not queued must not happen at
 //!   all. The ticket comes back in `results()` when this game applies the
-//!   action, or when it never will.
+//!   action, or when it never will. A password, for joining or locking a
+//!   company only, goes with the action to the room, which seals it
+//!   ([`tpf3mp_proto::Secret`]); nothing here logs it.
 //! - `take()`: the actions the room ordered for this simulation update, as
-//!   tables ([`action_to_lua`]), or `nil`. The step gate begins a batch of
+//!   tables ([`action_to_lua`]), or `nil`; second, who sent each (64 hex
+//!   digits); third, each one's seal, `{ scope =, tag = }` (the tag as 64
+//!   hex digits), or `false`. The step gate begins a batch of
 //!   updates at the step the room ordered them for ([`begin_batch`]), and
 //!   the first update that asks gets them: the mod's game script asks in its
 //!   `update`, which the game runs once per simulation update, where a
@@ -87,14 +91,17 @@ use std::{
     },
 };
 
-use tpf3mp_bridge::{Notice, RoomInfo};
+use tpf3mp_bridge::{ModLists, Notice, Plan, RoomInfo};
 use tpf3mp_proto::{
-    ChatText, Cursor, FixedBytes, Payload, PlayerId, PreviewCurve,
-    action::Pos2,
+    ChatText, Cursor, FixedBytes, Payload, PlayerId, PreviewCurve, Seal, Secret, Text,
+    action::{Action, CompanyOp, Pos2},
     lua::{LuaValue, MAX_DEPTH, MAX_NODES, action_from_lua, action_to_lua},
 };
 
-use crate::{lanedump::DumpOrder, step::Ordered};
+use crate::{
+    lanedump::DumpOrder,
+    step::{Handed, Ordered},
+};
 
 /// A `lua_State`, never dereferenced here.
 pub type State = *mut c_void;
@@ -132,6 +139,11 @@ const MAX_LOG_LINE: usize = 1000;
 /// Keys `note()` keeps, the longest key and the longest value.
 const MAX_NOTES: usize = 16;
 const MAX_NOTE_KEY: usize = 64;
+/// The note a simulation state makes when it cannot read which mod sent a
+/// command (no `debug.getinfo`), so cannot guard this player's personal
+/// mods' game scripts (tpf3mp/modguard.lua): from then on [`plan_mods`]
+/// loads the room's worlds without them. Kept whatever else is noted.
+pub const PERSONAL_UNGUARDED: &str = "personal-mods-unguarded";
 const MAX_NOTE_VALUE: usize = 512;
 /// Most entries one checkpoint's lane dump writes, all its lanes together,
 /// and the longest entry kept.
@@ -205,6 +217,8 @@ struct Batch {
     actions: Option<Vec<LuaValue>>,
     /// Who sent each of them, as `crate::lobby::hex` names players.
     origins: Vec<String>,
+    /// The seal each was ordered with, if any.
+    seals: Vec<Option<Seal>>,
     /// Each action's ticket, for the player's own.
     tickets: Vec<Option<u64>>,
     /// The updates it runs, and those a game script has begun (`take`).
@@ -239,8 +253,9 @@ struct Answer {
 }
 
 struct Shared {
-    /// Actions handed over, for the room, oldest first, with their tickets.
-    commands: VecDeque<(u64, Payload)>,
+    /// Actions handed over, for the room, oldest first, with their tickets
+    /// and the password each needs, if any.
+    commands: VecDeque<Handed>,
     /// The next ticket `command()` gives.
     next_ticket: u64,
     /// What became of the player's actions, for the GUI, oldest first.
@@ -269,6 +284,9 @@ struct Shared {
     load_failure: Option<String>,
     /// The room, for the game's Multiplayer window ([`notice`]).
     room: RoomStatus,
+    /// The mods the room's worlds load with, from the room's `Begin`
+    /// ([`set_mods`]).
+    mods: Option<ModLists>,
     /// What one of the game's Lua states noted for the others (`note()`),
     /// by key, at most [`MAX_NOTES`].
     notes: Vec<(String, String)>,
@@ -307,6 +325,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     batch: Batch {
         actions: None,
         origins: Vec::new(),
+        seals: Vec::new(),
         tickets: Vec::new(),
         updates: 0,
         begun: 0,
@@ -335,6 +354,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     told: 0,
     menu_load: None,
     load_failure: None,
+    mods: None,
     notes: Vec::new(),
 });
 
@@ -357,8 +377,8 @@ pub fn in_room() -> bool {
 }
 
 /// The actions handed over since the last call, oldest first, with their
-/// tickets.
-pub fn take_commands() -> Vec<(u64, Payload)> {
+/// tickets and passwords.
+pub fn take_commands() -> Vec<Handed> {
     shared().commands.drain(..).collect()
 }
 
@@ -405,6 +425,7 @@ pub fn begin_batch(
             .iter()
             .map(|ordered| crate::lobby::hex(&ordered.player))
             .collect(),
+        seals: actions.iter().map(|ordered| ordered.seal).collect(),
         actions: (!tables.is_empty()).then_some(tables),
         updates,
         begun: 0,
@@ -642,6 +663,9 @@ pub unsafe fn register(api: &LuaApi, l: State) {
                 (b"say", native_say),
                 (b"dump", native_dump),
                 (b"dumped", native_dumped),
+                (b"mods", native_mods),
+                (b"personal", native_personal),
+                (b"shared", native_shared),
                 (b"note", native_note),
                 (b"cursor", native_cursor),
                 (b"cursors", native_cursors),
@@ -823,7 +847,7 @@ unsafe extern "C-unwind" fn native_command(l: State) -> c_int {
     .unwrap_or_else(|_| Err("the hook failed reading the action".into()));
     // SAFETY: as above.
     unsafe { (api.settop)(l, top) };
-    let queued = read.and_then(|payload| {
+    let queued = read.and_then(|(payload, secret)| {
         let mut shared = shared();
         if shared.commands.len() >= MAX_WAITING {
             return Err(format!(
@@ -832,7 +856,7 @@ unsafe extern "C-unwind" fn native_command(l: State) -> c_int {
         }
         let ticket = shared.next_ticket;
         shared.next_ticket += 1;
-        shared.commands.push_back((ticket, payload));
+        shared.commands.push_back((ticket, payload, secret));
         Ok(ticket)
     });
     // SAFETY: as above; a C function's call has room for its results.
@@ -856,7 +880,7 @@ unsafe extern "C-unwind" fn native_command(l: State) -> c_int {
 /// # Safety
 ///
 /// Lua's own state, on its thread.
-unsafe fn command_from(api: &LuaApi, l: State) -> Result<Payload, String> {
+unsafe fn command_from(api: &LuaApi, l: State) -> Result<(Payload, Option<Secret>), String> {
     // SAFETY: the caller's.
     unsafe {
         if (api.gettop)(l) < 1 || (api.type_of)(l, 1) != TTABLE {
@@ -865,8 +889,72 @@ unsafe fn command_from(api: &LuaApi, l: State) -> Result<Payload, String> {
         let mut nodes = 0;
         let tree = read(api, l, 1, 0, &mut nodes)?;
         let action = action_from_lua(&tree).map_err(|error| error.to_string())?;
-        action.to_payload().map_err(|error| error.to_string())
+        let password = password_arg(api, l, 2)?;
+        let secret = password
+            .map(|password| secret_for(&action, password))
+            .transpose()?;
+        let payload = action.to_payload().map_err(|error| error.to_string())?;
+        Ok((payload, secret))
     }
+}
+
+/// The password argument at `index`: `nil`, or a string of 1 to 64 bytes of
+/// UTF-8, taken whole. Never logged, and an error never quotes it.
+///
+/// # Safety
+///
+/// Lua's own state, on its thread.
+unsafe fn password_arg(api: &LuaApi, l: State, index: c_int) -> Result<Option<Text<64>>, String> {
+    // SAFETY: the caller's.
+    unsafe {
+        if (api.gettop)(l) < index || (api.type_of)(l, index) == TNIL {
+            return Ok(None);
+        }
+        if (api.type_of)(l, index) != TSTRING {
+            return Err("a password is a string".into());
+        }
+        let mut len = 0;
+        let text = (api.tolstring)(l, index, &raw mut len);
+        if text.is_null() {
+            return Err("a password is a string".into());
+        }
+        let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len);
+        let password = std::str::from_utf8(bytes).map_err(|_| "a password is text".to_owned())?;
+        if password.is_empty() {
+            return Err("a password needs at least one character".into());
+        }
+        Text::new(password)
+            .map(Some)
+            .map_err(|_| "a password is at most 64 bytes".into())
+    }
+}
+
+/// The secret a password makes for `action`: only joining or locking a
+/// company takes one, scoped to that company, so the room's seal fits it
+/// alone.
+fn secret_for(action: &Action, password: Text<64>) -> Result<Secret, String> {
+    match action {
+        Action::CompanyOp(CompanyOp::Join(company) | CompanyOp::Lock(company)) => Ok(Secret {
+            scope: u64::from(company.0),
+            password,
+        }),
+        _ => Err("a password goes only with joining or locking a company".into()),
+    }
+}
+
+/// A seal as the mod compares it: `{ scope =, tag = }`, the tag as 64
+/// lowercase hex digits, or `false` for an action ordered without one.
+fn seal_to_lua(seal: Option<&Seal>) -> LuaValue {
+    let Some(seal) = seal else {
+        return LuaValue::Boolean(false);
+    };
+    let tag: String = seal.tag.0.iter().map(|b| format!("{b:02x}")).collect();
+    #[allow(clippy::cast_precision_loss)]
+    let scope = seal.scope as f64;
+    LuaValue::Table(vec![
+        (LuaValue::string("scope"), LuaValue::Number(scope)),
+        (LuaValue::string("tag"), LuaValue::string(&tag)),
+    ])
 }
 
 /// `take()`.
@@ -874,11 +962,15 @@ unsafe extern "C-unwind" fn native_take(l: State) -> c_int {
     let Some(api) = API.get() else {
         return 0;
     };
-    let (batch, origins) = {
+    let (batch, origins, seals) = {
         let mut shared = shared();
         shared.batch.begun = shared.batch.begun.saturating_add(1);
         let batch = shared.batch.actions.take();
-        (batch, shared.batch.origins.clone())
+        (
+            batch,
+            shared.batch.origins.clone(),
+            shared.batch.seals.clone(),
+        )
     };
     let Some(tables) = batch else {
         // SAFETY: Lua calls this with its own state, on its thread.
@@ -901,17 +993,25 @@ unsafe extern "C-unwind" fn native_take(l: State) -> c_int {
     let list = numbered(tables.clone());
     // Who sent each: the second value, which a mod before companies ignores.
     let senders = numbered(origins.iter().map(|hex| LuaValue::string(hex)).collect());
+    // The seal each was ordered with: the third value.
+    let sealed = numbered(
+        seals
+            .iter()
+            .map(|seal| seal_to_lua(seal.as_ref()))
+            .collect(),
+    );
     // SAFETY: as above.
     let top = unsafe { (api.gettop)(l) };
     let pushed = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: as above.
         unsafe {
             push(api, l, &list, 0)?;
-            push(api, l, &senders, 0)
+            push(api, l, &senders, 0)?;
+            push(api, l, &sealed, 0)
         }
     }));
     if matches!(pushed, Ok(Ok(()))) {
-        return 2;
+        return 3;
     }
     // Not handed over: the step gate finds them untaken and holds.
     shared().batch.actions = Some(tables);
@@ -1058,6 +1158,137 @@ pub fn set_me(player: PlayerId) {
 /// the room.
 pub fn take_cursor() -> Option<Cursor> {
     shared().room.outbound_cursor.take()
+}
+
+/// The mods the room's worlds load with, as the room's `Begin` gives them:
+/// `mods()` plans each load with them (docs/MODS.md).
+pub fn set_mods(mods: Option<ModLists>) {
+    shared().mods = mods;
+}
+
+/// Longest list of a save's mods `mods()` reads, in bytes.
+const MAX_MOD_LIST: usize = 256 * 1024;
+/// What separates the names in `mods()`'s lists.
+const NEWLINE: &str = "\n";
+
+/// What to load a save listing `save` (one mod name a line) with, or `None`
+/// without the room's lists; said in the hook's log.
+pub fn plan_mods(save: &str) -> Option<Plan> {
+    let (mut lists, unguarded) = {
+        let shared = shared();
+        let unguarded = shared.notes.iter().any(|(k, _)| k == PERSONAL_UNGUARDED);
+        (shared.mods.clone()?, unguarded)
+    };
+    if unguarded && !lists.personal.is_empty() {
+        // Fail closed: a personal mod's game script would act in this game
+        // alone, unguarded; the room's resync loads this game's world anew
+        // without them.
+        log("this player's personal mods are left out: this game's game scripts cannot be told apart, so their guard cannot be on".to_owned());
+        lists.personal = tpf3mp_proto::BoundedVec::default();
+    }
+    let save: Vec<String> = save
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let plan = tpf3mp_bridge::mods::plan(&save, &lists);
+    let named = |list: &[String]| {
+        if list.is_empty() {
+            "none".to_owned()
+        } else {
+            list.join(", ")
+        }
+    };
+    log(format!(
+        "the room's world loads with {} mods: {}; left out, another player's or in no list: {}; this player's own added: {}",
+        plan.mods.len(),
+        named(&plan.mods),
+        named(&plan.dropped),
+        named(&plan.added)
+    ));
+    Some(plan)
+}
+
+/// `personal()`: this player's personal mods, one name a line, or nil
+/// without the room's lists: the guards keep their commands to the room.
+unsafe extern "C-unwind" fn native_personal(l: State) -> c_int {
+    // SAFETY: as `native_mod_names`'.
+    unsafe { native_mod_names(l, |mods| &mods.personal[..]) }
+}
+
+/// `shared()`: the room's shared mods, one name a line, or nil without the
+/// room's lists: a personal mod's event that one of them might hear too is
+/// not its own (tpf3mp/guard.lua).
+unsafe extern "C-unwind" fn native_shared(l: State) -> c_int {
+    // SAFETY: as `native_mod_names`'.
+    unsafe { native_mod_names(l, |mods| &mods.shared[..]) }
+}
+
+/// Pushes the names `pick` takes from the room's lists, one a line, or nil.
+///
+/// # Safety
+///
+/// Called by Lua as a C function, with `l` its state.
+unsafe fn native_mod_names(
+    l: State,
+    pick: impl Fn(&ModLists) -> &[tpf3mp_bridge::ModName],
+) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    let names = shared().mods.as_ref().map(|mods| {
+        pick(mods)
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(NEWLINE)
+    });
+    // SAFETY: a C function's call has room for its result.
+    unsafe {
+        match names {
+            Some(names) => push_str(api, l, names.as_bytes()),
+            None => (api.pushnil)(l),
+        }
+    }
+    1
+}
+
+/// `mods(list)`: the mods to load a save with, given the save's (one name a
+/// line): that list, then what it left out and what it added, the same way;
+/// `nil` when the room gave no lists, and the save then loads with its own.
+/// `mods()` alone says whether the room gave lists (`true` or `nil`). The
+/// main menu's load gets it too (`crate::menu`).
+pub(crate) unsafe extern "C-unwind" fn native_mods(l: State) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    // SAFETY: Lua calls this with its own state, on its thread; a C
+    // function's call has room for its results.
+    unsafe {
+        if (api.gettop)(l) < 1 {
+            if shared().mods.is_some() {
+                (api.pushboolean)(l, 1);
+            } else {
+                (api.pushnil)(l);
+            }
+            return 1;
+        }
+    }
+    // SAFETY: Lua calls this with its own state, on its thread.
+    let save = unsafe { string_arg(api, l, 1, MAX_MOD_LIST) }.unwrap_or_default();
+    let Some(plan) = plan_mods(&save) else {
+        // SAFETY: a C function's call has room for its results.
+        unsafe { (api.pushnil)(l) };
+        return 1;
+    };
+    // SAFETY: as above.
+    unsafe {
+        for list in [&plan.mods, &plan.dropped, &plan.added] {
+            push_str(api, l, list.join(NEWLINE).as_bytes());
+        }
+    }
+    3
 }
 
 /// What the player said in the Multiplayer window since the last call, for
@@ -1349,10 +1580,7 @@ fn parse_preview_curves(tree: &LuaValue) -> Vec<PreviewCurve> {
 /// not sent again, so a pointer that stands still costs nothing.
 pub fn report_cursor(at: Option<(f32, f32)>, curves: Option<Vec<PreviewCurve>>, building: bool) {
     let mut shared = shared();
-    let player = shared
-        .room
-        .me
-        .unwrap_or(PlayerId(FixedBytes([0u8; 32])));
+    let player = shared.room.me.unwrap_or(PlayerId(FixedBytes([0u8; 32])));
     let at = at.map(|(x, y)| {
         #[allow(clippy::cast_possible_truncation)]
         Pos2 {
@@ -1909,6 +2137,9 @@ unsafe extern "C-unwind" fn native_note(l: State) -> c_int {
     if let Some(value) = unsafe { string_arg(api, l, 2, MAX_NOTE_VALUE) } {
         let mut shared = shared();
         shared.notes.retain(|(k, _)| *k != key);
+        if !value.is_empty() && key == PERSONAL_UNGUARDED && shared.notes.len() >= MAX_NOTES {
+            shared.notes.remove(0);
+        }
         if !value.is_empty() && shared.notes.len() < MAX_NOTES {
             shared.notes.push((key, value));
         }
@@ -1946,9 +2177,9 @@ pub(crate) mod tests {
     use mlua::ffi;
     use tpf3mp_bridge::RoomMember;
     use tpf3mp_proto::action::{
-        Action, ConstructionBuild, Param, ParamValue, Pos, Transform, VehicleId,
+        CompanyId, ConstructionBuild, Param, ParamValue, Pos, Transform, VehicleId,
     };
-    use tpf3mp_proto::{BoundedVec, FixedBytes, Speed, Text};
+    use tpf3mp_proto::{BoundedVec, FixedBytes, Speed};
 
     use super::*;
 
@@ -2192,6 +2423,7 @@ pub(crate) mod tests {
             action,
             ticket,
             player: PlayerId(FixedBytes([7; 32])),
+            seal: None,
         }
     }
 
@@ -2226,6 +2458,40 @@ pub(crate) mod tests {
         }
         assert_eq!(shared().notes.len(), MAX_NOTES);
         shared().notes.clear();
+    }
+
+    /// A simulation state that cannot guard the personal mods says so, and
+    /// every load after leaves them out, however many other notes there are.
+    #[test]
+    fn personal_mods_are_left_out_once_their_guard_cannot_be_on() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        let name = |n: &str| tpf3mp_proto::Text::new(n).unwrap();
+        set_mods(Some(ModLists {
+            shared: tpf3mp_proto::BoundedVec::new(vec![name("vehicles_pack")]).unwrap(),
+            personal: tpf3mp_proto::BoundedVec::new(vec![name("my_timetables")]).unwrap(),
+        }));
+        let save = "vehicles_pack
+tpf3mp_1
+my_timetables";
+        assert_eq!(
+            plan_mods(save).unwrap().mods,
+            ["vehicles_pack", "tpf3mp_1", "my_timetables"]
+        );
+        let sim = Lua::new();
+        sim.register();
+        for i in 0..MAX_NOTES {
+            sim.run(&format!("tpf3mp_native.note('k{i}', 'v')"))
+                .unwrap();
+        }
+        sim.run(&format!("tpf3mp_native.note('{PERSONAL_UNGUARDED}', '1')"))
+            .unwrap();
+        let plan = plan_mods(save).unwrap();
+        assert_eq!(plan.mods, ["vehicles_pack", "tpf3mp_1"]);
+        assert_eq!(plan.dropped, ["my_timetables"]);
+        assert!(plan.added.is_empty());
+        shared().notes.clear();
+        set_mods(None);
     }
 
     #[test]
@@ -2468,7 +2734,7 @@ pub(crate) mod tests {
                  type(tpf3mp_native.dump), type(tpf3mp_native.dumped), type(tpf3mp_native.note), \
                  type(tpf3mp_native.cursor), type(tpf3mp_native.cursors)"
             ),
-            Ok("12|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
+                Ok("12|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
         );
         // A second print keeps the first table.
         lua.run("rawset(tpf3mp_native, 'mark', true)").unwrap();
@@ -2499,6 +2765,89 @@ pub(crate) mod tests {
             Ok("2".into())
         );
         take_commands();
+    }
+
+    /// A company's password goes with joining or locking it, scoped to that
+    /// company, and with nothing else; nothing the hook says quotes it.
+    #[test]
+    fn command_takes_a_password_for_a_company_alone() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        let lua = Lua::new();
+        lua.register();
+        assert_eq!(
+            lua.run("return tpf3mp_native.command({ CompanyOp = { Join = 3 } }, 'hunter2')")
+                .map(|r| r.starts_with("true|")),
+            Ok(true)
+        );
+        assert_eq!(
+            lua.run("return tpf3mp_native.command({ CompanyOp = { Lock = 4 } }, 'hunter3')")
+                .map(|r| r.starts_with("true|")),
+            Ok(true)
+        );
+        assert_eq!(
+            lua.run("return tpf3mp_native.command({ CompanyOp = { Join = 5 } })")
+                .map(|r| r.starts_with("true|")),
+            Ok(true),
+            "joining an open company needs none"
+        );
+        let commands = take_commands();
+        let secrets: Vec<(u64, String)> = commands
+            .iter()
+            .filter_map(|(_, _, secret)| secret.as_ref())
+            .map(|s| (s.scope, s.password.as_str().to_owned()))
+            .collect();
+        assert_eq!(
+            secrets,
+            [(3, "hunter2".to_owned()), (4, "hunter3".to_owned())]
+        );
+        assert!(commands[2].2.is_none());
+        for (call, why) in [
+            (
+                "{ CompanyOp = { Rename = { company = 3, name = 'x' } } }, 'hunter2'",
+                "only with joining or locking",
+            ),
+            ("{ CompanyOp = { Join = 3 } }, ''", "at least one character"),
+            (
+                "{ CompanyOp = { Join = 3 } }, string.rep('p', 65)",
+                "at most 64 bytes",
+            ),
+            ("{ CompanyOp = { Join = 3 } }, 7", "a password is a string"),
+        ] {
+            let result = lua
+                .run(&format!(
+                    "local ok, reason = tpf3mp_native.command({call}) return ok, reason"
+                ))
+                .unwrap();
+            assert!(result.starts_with("false|"), "{call}: {result}");
+            assert!(result.contains(why), "{call}: {result}");
+            assert!(!result.contains("hunter2"), "{result}");
+        }
+        assert!(take_commands().is_empty());
+        assert!(take_log().iter().all(|line| !line.contains("hunter")));
+    }
+
+    /// `take()`'s third value: each action's seal, or `false`.
+    #[test]
+    fn take_hands_each_actions_seal_beside_it() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        let lua = Lua::new();
+        lua.register();
+        let mut sealed = ordered(Action::CompanyOp(CompanyOp::Join(CompanyId(3))), None);
+        sealed.seal = Some(Seal {
+            scope: 3,
+            tag: FixedBytes([0xab; 32]),
+        });
+        begin_batch(&[sealed, ordered(depot_build(), None)], 1, false, None).unwrap();
+        assert_eq!(
+            lua.run(
+                "local actions, senders, seals = tpf3mp_native.take() \
+                 return #seals, seals[1].scope, seals[1].tag, tostring(seals[2])"
+            ),
+            Ok(format!("2|3|{}|false", "ab".repeat(32)))
+        );
+        assert_eq!(end_batch(), Ok(None));
     }
 
     fn player(n: u8) -> PlayerId {

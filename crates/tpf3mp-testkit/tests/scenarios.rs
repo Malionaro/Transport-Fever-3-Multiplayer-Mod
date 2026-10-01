@@ -11,6 +11,7 @@ use tpf3mp_net::tunnel::TunnelUrl;
 use tpf3mp_net::{ServerIdentity, ServerTrust};
 use tpf3mp_proto::{RoomSettings, Speed};
 use tpf3mp_server::{Server, ServerConfig, ServerError, ServerStats, SnapshotConfig, TunnelConfig};
+use tpf3mp_snapshot::StoreError;
 use tpf3mp_testkit::{
     bot::{BotConfig, BotReport},
     netem::{Impairment, Netem},
@@ -131,10 +132,10 @@ impl TestServer {
     }
 }
 
-/// Binds a server, waiting a little for its address when a server just
-/// stopped there. A real restart is a new process, which frees the port at
-/// once; one in the same process frees it when the old server's last task
-/// has dropped its socket.
+/// Binds a server, waiting a little for its address and its snapshot store
+/// when a server just stopped there. A real restart is a new process, which
+/// frees both at once; one in the same process frees them when the old
+/// server's last task has dropped its socket and its store's lock.
 async fn bind_retrying(config: ServerConfig) -> Server {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -143,6 +144,11 @@ async fn bind_retrying(config: ServerConfig) -> Server {
             Err(ServerError::Bind(error))
                 if error.kind() == std::io::ErrorKind::AddrInUse
                     && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(ServerError::Snapshots(StoreError::Locked(_)))
+                if tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

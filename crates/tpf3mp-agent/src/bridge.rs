@@ -23,8 +23,8 @@ use tokio::{
     task::AbortHandle,
 };
 use tpf3mp_bridge::{
-    BridgeError, LobbyAction, LobbyView, MAX_MESSAGE, MAX_PATH, RoomInfo, RoomMember, ToAgent,
-    ToHook, check_version, decode, encode,
+    BridgeError, LobbyAction, LobbyView, MAX_MESSAGE, MAX_PATH, ModLists, RoomInfo, RoomMember,
+    ToAgent, ToHook, check_version, decode, encode,
 };
 use tpf3mp_net::close;
 use tpf3mp_proto::{
@@ -112,6 +112,34 @@ pub struct BridgeOptions {
     /// it from its main menu when the game starts. Without it, the owner's
     /// game has the world up and saves it for the room once the game began.
     pub start_world: Option<PathBuf>,
+    /// This player's mods for the room's worlds: the shared ones it
+    /// declared and its personal ones (`crate::content::split`), handed to
+    /// the hook when the game begins. Without them a world loads with the
+    /// mods its save lists.
+    pub mods: Option<ModLists>,
+    /// The player's mods as they choose them in the lobby (`crate::picker`):
+    /// the lists at the moment the game begins, in place of `mods`, and what
+    /// to declare anew when the room says how this game differs.
+    pub picker: Option<PickerLink>,
+}
+
+/// The mods the room's worlds load with, now.
+pub type ListsNow = Arc<dyn Fn() -> Option<ModLists> + Send + Sync>;
+/// Takes in how the room says this game differs; returns what to declare
+/// anew, if that changed.
+pub type Learn = Arc<dyn Fn(&ContentDiff) -> Option<ContentManifest> + Send + Sync>;
+
+/// The launcher's mod picker, as a bridge asks it (`crate::picker::Mods`).
+#[derive(Clone)]
+pub struct PickerLink {
+    pub lists: ListsNow,
+    pub learn: Learn,
+}
+
+impl std::fmt::Debug for PickerLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PickerLink")
+    }
 }
 
 /// The launcher's lobby as a bridge passes it on: the lobby to show the
@@ -135,6 +163,8 @@ impl Default for BridgeOptions {
             status: None,
             lobby: None,
             start_world: None,
+            mods: None,
+            picker: None,
         }
     }
 }
@@ -147,6 +177,8 @@ pub enum Control {
     Speed(Speed),
     Kick(PlayerId),
     Chat(ChatText),
+    /// Show this banner in the room from now on.
+    Banner(Option<tpf3mp_proto::BannerId>),
     /// Leave the room, which ends the session.
     Leave,
     /// The game the front end started has exited. Once its hook attached,
@@ -406,6 +438,9 @@ pub struct Bridge<L> {
     menu_readied: u64,
     /// The game's build, once its hook said hello.
     build: Option<String>,
+    /// What this game last declared to the room in the session, when the
+    /// picker changed it: declared again on a new connection.
+    declared: Option<ContentManifest>,
 }
 
 impl<L: HookLink> Bridge<L> {
@@ -457,6 +492,7 @@ impl<L: HookLink> Bridge<L> {
             menu_readied: 0,
             options,
             build: None,
+            declared: None,
         }
     }
 
@@ -488,7 +524,7 @@ impl<L: HookLink> Bridge<L> {
         let view = lobby.views.borrow_and_update().clone();
         self.outbox
             .retain(|message| !matches!(message, ToHook::Lobby(_)));
-        self.outbox.push_back(ToHook::Lobby(view));
+        self.outbox.push_back(ToHook::Lobby(Box::new(view)));
     }
 
     /// The player acted in the game's main-menu window: the launcher does
@@ -669,8 +705,10 @@ impl<L: HookLink> Bridge<L> {
                     self.reported = Some(progress);
                     self.loaded = true;
                 }
-                ToAgent::Command { payload } => {
-                    client.send_intent(self.commands, payload).await?;
+                ToAgent::Command { payload, secret } => {
+                    client
+                        .send_intent_with(self.commands, payload, secret)
+                        .await?;
                     self.commands += 1;
                 }
                 ToAgent::Ran { step } if current => {
@@ -949,6 +987,10 @@ impl<L: HookLink> Bridge<L> {
                         checkpoint_interval: start.checkpoint_interval,
                         saves: path_text(&saves)?,
                         player: client.player(),
+                        mods: match &self.options.picker {
+                            Some(picker) => (picker.lists)(),
+                            None => self.options.mods.clone(),
+                        },
                     });
                     if let Some(room) = &self.room {
                         self.outbox.push_back(ToHook::Room(room_info(room)));
@@ -1036,12 +1078,28 @@ impl<L: HookLink> Bridge<L> {
                 self.status(|status| status.room = Some(room));
             }
             ClientEvent::Notice(text) => self.status(|status| status.announce(text.as_str())),
-            ClientEvent::ContentDiff(diff) => self.status(|status| {
-                if let Some(diff) = &diff {
-                    status.notice(format!("your game differs from the room's: {diff}"));
+            ClientEvent::ContentDiff(diff) => {
+                // What the room says this game lacks names the room's shared
+                // mods: the picker declares those this player has.
+                let again = diff
+                    .as_ref()
+                    .zip(self.options.picker.as_ref())
+                    .and_then(|(diff, picker)| (picker.learn)(diff));
+                if let Some(manifest) = again {
+                    info!(
+                        mods = manifest.mods.len(),
+                        "declaring the room's shared mods this game has"
+                    );
+                    self.declared = Some(manifest.clone());
+                    self.request(client, Request::DeclareContent(manifest));
                 }
-                status.content_diff = diff;
-            }),
+                self.status(|status| {
+                    if let Some(diff) = &diff {
+                        status.notice(format!("your game differs from the room's: {diff}"));
+                    }
+                    status.content_diff = diff;
+                });
+            }
             ClientEvent::Advisory(datagram) => match datagram {
                 tpf3mp_proto::Datagram::Cursor(cursor) => {
                     self.outbox.retain(|message| match message {
@@ -1252,6 +1310,7 @@ impl<L: HookLink> Bridge<L> {
             Control::Speed(speed) => Request::SetSpeed(speed),
             Control::Kick(player) => Request::Kick(player),
             Control::Chat(text) => Request::Chat(text),
+            Control::Banner(banner) => Request::SetBanner(banner),
             Control::Leave => {
                 if let Err(error) = client.leave_room().await {
                     debug!(%error, "leaving the room failed; ending the session anyway");
@@ -1455,12 +1514,23 @@ impl Outbox {
                 ..
             }) => payload.len(),
             ToHook::Load { file, .. } => file.as_ref().map_or(0, |file| file.as_str().len()),
-            ToHook::Begin { rules, saves, .. } => rules.as_str().len() + saves.as_str().len(),
+            ToHook::Begin {
+                rules, saves, mods, ..
+            } => {
+                rules.as_str().len()
+                    + saves.as_str().len()
+                    + mods
+                        .as_ref()
+                        .map_or(0, |m| (m.shared.len() + m.personal.len()) * 97)
+            }
             ToHook::Diverged { lanes, .. } => lanes.len() * 2,
             ToHook::Chat { from, text } => from.as_str().len() + text.as_str().len(),
             ToHook::Room(room) => room.members.len() * 64,
             ToHook::Lobby(view) => {
-                view.chat.len() * 320 + view.room.as_ref().map_or(0, |room| room.members.len() * 80)
+                view.chat.len() * 320
+                    + view.room.as_ref().map_or(0, |room| room.members.len() * 80)
+                    + view.rules.len() * 240
+                    + view.saves.len() * 72
             }
             ToHook::Cursor(cursor) => cursor.label.as_ref().map_or(0, |l| l.as_str().len()),
             ToHook::End { reason } => reason.as_str().len(),
@@ -1606,6 +1676,7 @@ async fn rejoin_room<L: HookLink>(
     let deadline = Instant::now() + rejoin.give_up_after;
     let mut backoff = Duration::from_millis(250);
     let mut resume = bridge.resume_point();
+    let declared = bridge.declared.clone();
     loop {
         let attempt = async {
             let (client, events) = connect(options.clone()).await.map_err(|error| {
@@ -1615,7 +1686,7 @@ async fn rejoin_room<L: HookLink>(
                     Failed::Retry(error.to_string())
                 }
             })?;
-            if let Some(content) = &rejoin.content {
+            if let Some(content) = declared.as_ref().or(rejoin.content.as_ref()) {
                 client
                     .declare_content(content.clone())
                     .await
@@ -1817,6 +1888,7 @@ mod tests {
             ready: true,
             content: None,
             connected,
+            banner: None,
         };
         let room = RoomView {
             id: RoomId(FixedBytes([7; 16])),
@@ -1828,6 +1900,7 @@ mod tests {
             phase: RoomPhase::Running,
             settings: RoomSettings::DEFAULT,
             members: vec![member(1, "Ann", true), member(2, "Bo", false)],
+            competitive: false,
         };
         let info = room_info(&room);
         assert_eq!(info.name.as_str(), "Sunday line");
@@ -1913,6 +1986,7 @@ mod tests {
                 player: PlayerId(FixedBytes([7; 32])),
                 client_seq: seq,
                 payload: Payload::new(vec![0; MAX_PAYLOAD]).unwrap(),
+                seal: None,
             },
         };
         // Far more than the outbox takes, all for the next step.
@@ -1959,7 +2033,7 @@ mod tests {
         bridge.flush().unwrap();
         assert_eq!(
             fake.hook_hears(),
-            vec![ToHook::Lobby(lobby("B"))],
+            vec![ToHook::Lobby(Box::new(lobby("B")))],
             "the newest only, and no hello again"
         );
         bridge.lobby_news();

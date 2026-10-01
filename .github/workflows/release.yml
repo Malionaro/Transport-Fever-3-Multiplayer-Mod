@@ -8,9 +8,11 @@ name: release
 #
 # Repository variables it builds in (Settings, Secrets and variables,
 # Actions, Variables):
-# - TPF3MP_DEFAULT_SERVER: the server the launcher plays on, and the only
-#   one (docs/DECISIONS.md, D12). Without it, players would type a server,
-#   so no release is drafted without it either;
+# - TPF3MP_DEFAULT_SERVER: the launcher's default server
+#   (docs/DECISIONS.md, D12, and its proposed amendment: players may change
+#   it in Settings; invites never do). A build without it falls back to the
+#   project's relay coded in the launcher, but a release names its server on
+#   purpose, so no release is drafted without it;
 # - TPF3MP_SERVER_NAME: what players see of that server, such as EU, in
 #   place of its address;
 # - TPF3MP_UPDATE_PUBLIC_KEY: the public keys updates must be signed with.
@@ -194,7 +196,7 @@ jobs:
             exit 1
           fi
           if [ -z "$TPF3MP_DEFAULT_SERVER" ]; then
-            echo "::error::no draft without the repository variable TPF3MP_DEFAULT_SERVER: the launcher plays on that server alone (docs/DECISIONS.md, D12). Set it (docs/OPERATIONS.md, \"Before the first release\"), then re-run this workflow"
+            echo "::error::no draft without the repository variable TPF3MP_DEFAULT_SERVER: it is the launcher's default server, which a release names on purpose (docs/DECISIONS.md, D12). Set it (docs/OPERATIONS.md, \"Before the first release\"), then re-run this workflow"
             exit 1
           fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

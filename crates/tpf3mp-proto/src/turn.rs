@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Platform, Text,
-    bytes::Payload,
+    bytes::{FixedBytes, Payload},
     control::{RulesName, Speed},
     ids::{PlayerId, RoomId},
     snapshot::WorldOffer,
@@ -64,6 +64,19 @@ pub struct Event {
     pub body: EventBody,
 }
 
+/// What the server made of a [`crate::Secret`]: an HMAC-SHA256 of the
+/// password under the server's key, bound to the room and to the secret's
+/// scope. Games compare seals and never see the password; without the
+/// server's key a seal cannot be turned back into one or checked against a
+/// guess, so it may be logged and kept in a save. Only the server makes
+/// seals: a client cannot send one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seal {
+    /// The scope the player named, as [`crate::Secret::scope`].
+    pub scope: u64,
+    pub tag: FixedBytes<32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventBody {
     /// A player's accepted intent.
@@ -71,6 +84,9 @@ pub enum EventBody {
         player: PlayerId,
         client_seq: u64,
         payload: Payload,
+        /// The seal of the password the player sent with it, if any: only
+        /// the server makes one ([`crate::Secret`]).
+        seal: Option<Seal>,
     },
     PlayerJoined {
         player: PlayerId,

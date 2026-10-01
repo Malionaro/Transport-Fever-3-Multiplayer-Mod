@@ -39,7 +39,8 @@
 function data()
 	local MOD = "tpf3mp_1"
 	-- Every module, in an order where each needs only those before it.
-	local MODULES = { "geom", "roads", "engine", "registry", "companies", "follow", "capture", "bridge", "guard" }
+	local MODULES = { "geom", "roads", "engine", "registry", "companies", "progression", "follow", "capture",
+		"bridge", "guard", "worldload" }
 	-- Frames a refusal's notice stays in the game bar.
 	local NOTICE_FRAMES = 360
 
@@ -73,7 +74,7 @@ function data()
 	-- hook's log.
 	local refusals, reasons = {}, {}
 
-	local function refused(kind, why)
+	local function refused(kind, why, from)
 		local name = kind or "command no factory made"
 		local count = (refusals[name] or 0) + 1
 		refusals[name] = count
@@ -81,7 +82,8 @@ function data()
 		if changed then reasons[name] = why end
 		if count == 1 or count % 100 == 0 or changed then
 			link:log("refused the player's " .. name .. " in the room's game ("
-				.. count .. " so far)" .. (why and (": " .. tostring(why)) or ""))
+				.. count .. " so far)" .. (why and (": " .. tostring(why)) or "")
+				.. (from and (", from the mod " .. tostring(from)) or ""))
 		end
 		notice = require("tpf3mp.guard").notice(kind)
 	end
@@ -118,6 +120,16 @@ function data()
 		line = idOf("lines"),
 		group = idOf("groups"),
 		town = idOf("towns"),
+		-- The room's company whose player entity `entity` is, by its id: the
+		-- game's company window renames the player's company so
+		-- (game_mechanics/company/company.tl, its editable title).
+		company = function(entity)
+			local roster = ui().companies
+			for _, c in ipairs(roster and roster.list or {}) do
+				if c.entity == entity then return c.id end
+			end
+			return nil
+		end,
 		player = function()
 			local ok, player = pcall(function() return api.engine.util.getPlayer() end)
 			if ok and type(player) == "number" then return player end
@@ -174,6 +186,8 @@ function data()
 			refused = refused,
 			later = function(fn) pending[#pending + 1] = fn end,
 			context = context,
+			personal = function(mod) return link:personal()[mod] == true end,
+			shared = function() return link:shared() end,
 		})
 		if wrapped then
 			link:log("the guard is on " .. wrapped .. " command factories")
@@ -225,6 +239,69 @@ function data()
 			or ("the GUI's company cannot follow the player's: " .. tostring(why)))
 	end
 
+	-- The company window's ranks and the permits they give, with more than
+	-- one company in the room: each company's own, as the room's rule keeps
+	-- them (tpf3mp/progression.lua), read from the mod's game script's
+	-- state. With one company the game's own.
+	local function showRanks()
+		local ok, why = require("tpf3mp.progression").follow(scriptState)
+		link:log(ok and "the company window shows each company's own rank"
+			or ("the company window shows the game's own rank only: " .. tostring(why)))
+	end
+
+	-- Whether this player's company may have its lines stop at `entity`, a
+	-- station group or a station's construction another company owns: while
+	-- that company keeps its stations open (tpf3mp/companies.lua, mayUse;
+	-- DECISIONS.md, D22, proposed). Every game checks the line again when
+	-- the room orders it; this only lets the line manager offer the station.
+	local function openToMe(entity)
+		local shared = ui()
+		local roster = shared.companies
+		if not (shared.status and roster and link and link:room()) then return false end
+		local ok, open = pcall(function()
+			local CT = api.type.ComponentType
+			local group = api.engine.getComponent(entity, CT.STATION_GROUP)
+			local con = group == nil and api.engine.getComponent(entity, CT.CONSTRUCTION) or nil
+			if group == nil and not (con and con.stations and #con.stations > 0) then return false end
+			local owned = api.engine.getComponent(entity, CT.PLAYER_OWNED)
+			local owner = owned and owned.player
+			for _, c in ipairs(roster.list or {}) do
+				if c.entity == owner then return not c.closed end
+			end
+			return false
+		end)
+		return ok and open == true
+	end
+
+	-- TF3's line manager offers only the player's own stations and those no
+	-- one owns (gui/line_vehicle_mgmt/manager_window.tl asks
+	-- scripts/entity_util.tl's isOwnedByPlayerOrNotOwned; seen on build
+	-- 40408); the game itself stops a line anywhere. In this GUI state the
+	-- mod's answer also takes another company's open stations. Other windows
+	-- ask the same function of vehicles and warehouses, which stay as the
+	-- game answers. Whether every script shares one entity_util table, as
+	-- one ug_require's cache would give, is INFERRED: hook.log says how many
+	-- the mod changed.
+	local function offerOpenStations()
+		local changed, tried = 0, {}
+		for _, path in ipairs({ "/scripts/entity_util.tl", "::/scripts/entity_util.tl" }) do
+			local ok, util = pcall(ug_require, path)
+			if ok and type(util) == "table" and not tried[util]
+				and type(util.isOwnedByPlayerOrNotOwned) == "function" then
+				tried[util] = true
+				local original = util.isOwnedByPlayerOrNotOwned
+				util.isOwnedByPlayerOrNotOwned = function(entity, ...)
+					if original(entity, ...) then return true end
+					return openToMe(entity)
+				end
+				changed = changed + 1
+			end
+		end
+		link:log(changed > 0 and ("the line manager offers other companies' open stations ("
+			.. changed .. " entity_util table(s))")
+			or "the line manager offers the player's own stations only: no entity_util.isOwnedByPlayerOrNotOwned")
+	end
+
 	local function start()
 		local ok, why = installModules()
 		if not ok then
@@ -246,6 +323,8 @@ function data()
 		say("linked to the hook")
 		guardCommands()
 		followMyCompany()
+		showRanks()
+		offerOpenStations()
 		-- The stop the construction menu gives the stop tool, wherever the
 		-- menu runs (gui/tpf3mp/gui_state.script.lua watches the other state).
 		pcall(function()
@@ -253,30 +332,33 @@ function data()
 		end)
 	end
 
+	-- The room's world being loaded (tpf3mp/worldload.lua), a frame at a
+	-- time while the game reads the save's mods.
+	local loading
+
 	-- Does what the hook asks: saving the world under the name it gives, or
-	-- loading the room's world from the game's save folder.
+	-- loading the room's world from the game's save folder, with the room's
+	-- mods (docs/MODS.md).
 	local function serve()
 		if not link then return end
 		local request = link:poll()
-		if not request then return end
-		if request.save then
+		if request and request.save then
 			local name = request.save
 			local ok, err = pcall(app.saveGame, name, function()
 				link:saved(name, true)
 			end, false, true)
 			if not ok then link:saved(name, false, tostring(err)) end
-		elseif request.load then
-			local ok, err = pcall(function()
-				local id = api.type.SavegameId.new()
-				id.path = ""
-				id.saveGameName = request.load
-				id.saveGameNamespace = app.SaveGameNamespace.getSavegame()
-				app.loadGame(id, false, nil)
-			end)
-			if ok then
+		elseif request and request.load then
+			loading = require("tpf3mp.worldload").new(request.load)
+		end
+		if loading then
+			local done, why = require("tpf3mp.worldload").step(loading, app, api, link)
+			if done == "busy" then return end
+			loading = nil
+			if done == "started" then
 				link:log("loading the room's world")
 			else
-				link:log("loading the room's world failed: " .. tostring(err))
+				link:log("loading the room's world failed: " .. tostring(why))
 			end
 		end
 	end
@@ -346,11 +428,15 @@ function data()
 					local n = api.engine.getComponent(c.entity, api.type.ComponentType.NAME)
 					if n and type(n.name) == "string" and n.name ~= "" then name = n.name end
 				end)
+				-- Whether it has a password, not the password's seal: the
+				-- window has no use for it.
+				local locked = type(c.lock) == "table"
 				out.list[#out.list + 1] = { id = c.id, entity = c.entity, name = name or c.name, color = c.color,
-					balance = balance, owed = owed }
+					balance = balance, owed = owed, founder = c.founder, locked = locked, closed = c.closed == true }
 				local color = type(c.color) == "table" and c.color or {}
 				sign[#sign + 1] = table.concat({ c.id, name or c.name, tostring(balance), tostring(owed),
-					tostring(color[1]), tostring(color[2]), tostring(color[3]) }, ":")
+					tostring(color[1]), tostring(color[2]), tostring(color[3]), tostring(locked),
+					tostring(c.closed == true), tostring(c.founder) }, ":")
 			end
 		end
 		for _, m in ipairs(out.members) do sign[#sign + 1] = tostring(m.player) .. "=" .. tostring(m.company) end
@@ -411,11 +497,13 @@ function data()
 	end
 
 	-- A company operation for the room, from the window. What became of it
-	-- comes back with the player's other actions (follow the ticket).
-	local function companyOp(shared, op, doing, action)
+	-- comes back with the player's other actions (follow the ticket). A
+	-- password, for joining or locking a company, goes to the room beside it
+	-- (tpf3mp/bridge.lua); `doing` never names it.
+	local function companyOp(shared, op, doing, action, password)
 		local l = shared.link
 		if not l then return end
-		local ok, ticket = l:command(action or { CompanyOp = op })
+		local ok, ticket = l:command(action or { CompanyOp = op }, password)
 		if ok then
 			shared.asked = shared.asked or {}
 			shared.asked[ticket] = doing
@@ -426,14 +514,136 @@ function data()
 		shared.version = shared.version + 1
 	end
 
+	-- The colours a company can wear: the companies' own first (a vehicle in
+	-- one has its marker on the map in it too), then the game's line colours
+	-- and greys, as its vehicle and line windows offer them
+	-- (gui/line_vehicle_mgmt/line_react_util.tl). The chooser also takes a
+	-- colour of the player's own (INFERRED from its style sheet's
+	-- custom-color-button, gui/main/builtin.css.lua).
+	local palette = nil
+	local function companyPalette()
+		if palette then return palette end
+		palette = {}
+		for _, color in ipairs(require("tpf3mp.companies").PALETTE) do palette[#palette + 1] = vec3(color) end
+		pcall(function()
+			local rep = api.gui.genericRep
+			local color_util = ug_require("/gui/main/color_util.tl")
+			for _, file in ipairs({ "::/gui/line_vehicle_mgmt/line_colors.gres", "::/gui/main/grayscale.gres" }) do
+				for _, color in ipairs(color_util.toArray3(rep.get(rep.find(file)).data)) do
+					palette[#palette + 1] = color
+				end
+			end
+		end)
+		return palette
+	end
+
+	-- Native fixed-width panels keep a long name, eight companies or a busy
+	-- chat from stretching the window beyond the screen. -1 means automatic
+	-- height in TF3's StyleSheet; zero would hide the content.
+	local WINDOW_WIDTH, PLAYERS_WIDTH, COMPANIES_WIDTH = 800, 192, 548
+	local BODY_HEIGHT = 310
+	local function sheet(width, height, padding, background)
+		local s = api.gui.StyleSheet.new()
+		s.size = api.type.Vec2f.new(width or -1, height or -1)
+		if padding then s.padding = api.type.Vec4f.new(padding, padding, padding, padding) end
+		if background then s.backgroundColor = api.type.Vec4f.new(0.07, 0.10, 0.12, 0.90) end
+		return s
+	end
+	local function gap(size)
+		return builtin.Component{ meta = { styleSheet = sheet(size, size) },
+			mouseTransparent = true, layout = builtin.BoxLayout{ children = {} } }
+	end
+	local function box(children, horizontal, width, padding, background)
+		return builtin.Component{
+			meta = { styleSheet = sheet(width, nil, padding, background) },
+			mouseTransparent = true,
+			layout = builtin.BoxLayout{
+				orientation = horizontal and builtin.type.Orientation.Horizontal or builtin.type.Orientation.Vertical,
+				children = children,
+			},
+		}
+	end
+	-- Break on spaces when possible and on UTF-8 character boundaries for
+	-- unbroken names. The complete text stays visible, including chat.
+	local function wrapped(text, limit)
+		local lines, chars, space = {}, {}, nil
+		local function flush(count)
+			lines[#lines + 1] = table.concat(chars, "", 1, count)
+			local left = {}
+			for i = count + 1, #chars do left[#left + 1] = chars[i] end
+			if left[1] == " " then table.remove(left, 1) end
+			chars, space = left, nil
+			for i, c in ipairs(chars) do if c == " " then space = i end end
+		end
+		for c in tostring(text):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+			if c == "\n" then
+				flush(#chars)
+			else
+				chars[#chars + 1] = c
+				if c == " " then space = #chars end
+				if #chars > limit then flush(space and space > 1 and space - 1 or limit) end
+			end
+		end
+		if #chars > 0 then lines[#lines + 1] = table.concat(chars) end
+		return table.concat(lines, "\n")
+	end
+	local function label(text, class, width, limit)
+		return builtin.TextView{
+			meta = { class = class or "font-scale-body", styleSheet = sheet(width), tooltip = tostring(text) },
+			text = limit and wrapped(text, limit) or tostring(text),
+		}
+	end
+	local function scroll(children, width, height)
+		return builtin.ScrollArea{
+			meta = { styleSheet = sheet(width, height) },
+			horizontalPolicy = builtin.type.ScrollBarPolicy.AlwaysOff,
+			verticalPolicy = builtin.type.ScrollBarPolicy.AsNeeded,
+			content = box(children, false, width - 20),
+		}
+	end
+
 	-- The companies: each with its money and players, the one you play for
-	-- first, with its colour and name to change; the others to join; a
-	-- company of your own to found.
+	-- first, with its colour and name to change; the others to join, with
+	-- their password where they have one; a company of your own to found.
+	-- Its head (tpf3mp/companies.lua, DECISIONS.md D22, proposed) also sets
+	-- or takes away its password, sends players out, and opens or closes its
+	-- stations to other companies' lines.
 	local function companyRows(rows, status, shared, drafts)
 		local roster = shared.companies
 		if not roster then return end
-		local function line(text) rows[#rows + 1] = builtin.TextView{ text = text } end
-		local names, companyOf, mine = {}, {}, nil
+		local companies = require("tpf3mp.companies")
+		local function line(text) rows[#rows + 1] = label(text, "font-scale-annotation", COMPANIES_WIDTH - 40, 38) end
+		local function row(children)
+			local spaced = {}
+			for i, child in ipairs(children) do
+				if i > 1 then spaced[#spaced + 1] = gap(8) end
+				spaced[#spaced + 1] = child
+			end
+			rows[#rows + 1] = box(spaced, true)
+			rows[#rows + 1] = gap(8)
+		end
+		local function button(label, tooltip, onClick)
+			return builtin.Button{ meta = { class = "secondary", tooltip = tooltip },
+				content = builtin.TextView{ meta = { class = "font-scale-body" }, text = label }, onClick = onClick }
+		end
+		-- A field for a draft, sent with `act` on Enter or its button.
+		local function field(draft, placeholder, secret, act)
+			return builtin.TextInputField{
+				meta = { class = "font-scale-body", styleSheet = sheet(300, 36) },
+				placeholderText = placeholder,
+				value = draft:get(),
+				maxLength = 64,
+				passwordMode = secret or nil,
+				acceptOnFocusLoss = false,
+				resetValueOnCancel = false,
+				onTyping = function(text) draft:set(text) end,
+				onCancel = function() shared.version = shared.version + 1 end,
+				onValueChange = function(text) act(text) end,
+			}
+		end
+		local function blank(text) return type(text) ~= "string" or text:match("^%s*$") end
+		local names, byId, companyOf, mine = {}, {}, {}, nil
+		for _, p in ipairs(status.players or {}) do byId[p.id] = p end
 		for _, m in ipairs(roster.members) do companyOf[m.player] = m.company end
 		for _, p in ipairs(status.players or {}) do
 			local id = companyOf[p.id] or 0
@@ -445,19 +655,22 @@ function data()
 		local ordered = {}
 		for _, c in ipairs(roster.list) do if c.id == mine then ordered[#ordered + 1] = c end end
 		for _, c in ipairs(roster.list) do if c.id ~= mine then ordered[#ordered + 1] = c end end
-		line("")
-		line("Companies")
+		local myName
+		for _, c in ipairs(roster.list) do if c.id == mine then myName = c.name end end
+		local iHead = status.me_id ~= nil and companies.head(roster, mine) == status.me_id
+		local otherCards = {}
 		for _, c in ipairs(ordered) do
-			local who = names[c.id] and table.concat(names[c.id], ", ") or "nobody"
+			local head = companies.head(roster, c.id)
+			local tags = {}
+			if c.id == mine then tags[#tags + 1] = "Your company" end
+			if head and byId[head] then tags[#tags + 1] = "head: " .. tostring(byId[head].name) end
+			if c.locked then tags[#tags + 1] = "password" end
+			if c.closed then tags[#tags + 1] = "stations closed" end
 			local children = {}
 			if c.id == mine then
 				children[#children + 1] = builtin.ColorChooserButton{
-					meta = { tooltip = "Your company's colour" },
-					colors = (function()
-						local palette = {}
-						for i, color in ipairs(require("tpf3mp.companies").PALETTE) do palette[i] = vec3(color) end
-						return palette
-					end)(),
+					meta = { tooltip = "Your company's colour: its vehicles wear it" },
+					colors = companyPalette(),
 					color = vec3(c.color),
 					onValueChange = function(v)
 						local r, g, b = v.x or v[1], v.y or v[2], v.z or v[3]
@@ -467,64 +680,135 @@ function data()
 					resetButton = false,
 				}
 			end
-			children[#children + 1] = builtin.TextView{
-				text = "  " .. tostring(c.name) .. "  " .. money(c.balance)
-					.. ((type(c.owed) == "number" and c.owed > 0) and (" (owes " .. money(c.owed) .. ")") or "")
-					.. "  " .. who .. (c.id == mine and "  (yours)" or ""),
-			}
+			children[#children + 1] = gap(8)
+			children[#children + 1] = label(c.name, "font-scale-title-4", COMPANIES_WIDTH - 100, 28)
+			local card = { box(children, true), gap(6) }
+			if #tags > 0 then card[#card + 1] = label(table.concat(tags, " · "), "font-scale-annotation, info", nil, 38) end
+			if c.balance ~= nil then
+				card[#card + 1] = label("Balance  " .. money(c.balance), "font-scale-body", nil, 38)
+				if type(c.owed) == "number" and c.owed > 0 then
+					card[#card + 1] = label("Debt  " .. money(c.owed), "font-scale-annotation", nil, 38)
+				end
+			end
+			card[#card + 1] = gap(6)
+			card[#card + 1] = label("Players  " .. (names[c.id] and table.concat(names[c.id], ", ") or "Nobody yet"),
+				"font-scale-annotation", nil, 38)
+			children = {}
 			if c.id ~= mine then
-				children[#children + 1] = builtin.Button{
-					meta = { tooltip = "Play for " .. tostring(c.name) .. " from now on" },
-					content = builtin.TextView{ text = "Join" },
-					onClick = function() companyOp(shared, { Join = c.id }, "Joining " .. c.name) end,
-				}
+				if c.locked then
+					-- Its password, typed here; the room seals it, and only
+					-- the seal reaches the games.
+					children[#children + 1] = field(drafts.joinPassword, "Password", true, function(text)
+						if blank(text) then return end
+						companyOp(shared, { Join = c.id }, "Joining " .. c.name, nil, text)
+						drafts.joinPassword:set("")
+					end)
+				end
+				children[#children + 1] = button("Join", "Play for " .. tostring(c.name) .. " from now on"
+					.. (c.locked and "; it needs its password" or ""), function()
+					local password = c.locked and drafts.joinPassword:get() or nil
+					if c.locked and blank(password) then
+						shared.companyNote = c.name .. " needs its password"
+						shared.version = shared.version + 1
+						return
+					end
+					companyOp(shared, { Join = c.id }, "Joining " .. c.name, nil, password)
+					drafts.joinPassword:set("")
+				end)
 			elseif c.id ~= 0 and #(names[c.id] or {}) <= 1 then
 				-- Its last player dissolves it, once it owns nothing.
-				children[#children + 1] = builtin.Button{
-					meta = { tooltip = "Dissolve " .. tostring(c.name) .. " once it owns nothing,"
-						.. " and play for the room's first company again" },
-					content = builtin.TextView{ text = "Dissolve" },
-					onClick = function() companyOp(shared, { Delete = c.id }, "Dissolving " .. c.name) end,
-				}
+				children[#children + 1] = button("Dissolve", "Dissolve " .. tostring(c.name)
+					.. " once it owns nothing, and play for the room's first company again",
+					function() companyOp(shared, { Delete = c.id }, "Dissolving " .. c.name) end)
 			end
-			rows[#rows + 1] = builtin.BoxLayout{ orientation = builtin.type.Orientation.Horizontal, children = children }
+			if #children > 0 then card[#card + 1] = gap(8); card[#card + 1] = box(children, true) end
+			local destination = c.id == mine and rows or otherCards
+			destination[#destination + 1] = box(card, false, COMPANIES_WIDTH - 24, 12, true)
+			destination[#destination + 1] = gap(10)
 		end
-		local function field(draft, placeholder, label, tooltip, act)
-			rows[#rows + 1] = builtin.BoxLayout{
-				orientation = builtin.type.Orientation.Horizontal,
-				children = {
-					builtin.TextInputField{
-						placeholderText = placeholder,
-						value = draft:get(),
-						maxLength = 64,
-						acceptOnFocusLoss = false,
-						resetValueOnCancel = false,
-						onTyping = function(text) draft:set(text) end,
-						onCancel = function() shared.version = shared.version + 1 end,
-						onValueChange = function(text) act(text) end,
-					},
-					builtin.Button{
-						meta = { tooltip = tooltip },
-						content = builtin.TextView{ text = label },
-						onClick = function() act(draft:get()) end,
-					},
-				},
+		line("MANAGE YOUR COMPANY")
+		rows[#rows + 1] = gap(6)
+		-- What the head of the player's company does with it.
+		if iHead then
+			local c
+			for _, x in ipairs(roster.list) do if x.id == mine then c = x end end
+			local lockChildren = {
+				field(drafts.lockPassword, c.locked and "A new password" or "A password to join", true, function(text)
+					if blank(text) then return end
+					companyOp(shared, { Lock = c.id }, "Setting the password of " .. c.name, nil, text)
+					drafts.lockPassword:set("")
+				end),
+				button(c.locked and "Change" or "Set", "Only players who know it can join " .. tostring(c.name),
+					function()
+						local text = drafts.lockPassword:get()
+						if blank(text) then return end
+						companyOp(shared, { Lock = c.id }, "Setting the password of " .. c.name, nil, text)
+						drafts.lockPassword:set("")
+					end),
 			}
+			if c.locked then
+				lockChildren[#lockChildren + 1] = button("Remove", "Let anyone join " .. tostring(c.name),
+					function() companyOp(shared, { Unlock = c.id }, "Removing the password of " .. c.name) end)
+			end
+			row(lockChildren)
+			row({
+				label(c.closed and "Stations: yours alone" or "Stations: open to other companies", "font-scale-annotation", 300, 28),
+				button(c.closed and "Open" or "Close", c.closed
+					and "Let other companies' lines stop at " .. tostring(c.name) .. "'s stations"
+					or "Keep " .. tostring(c.name) .. "'s stations to its own lines",
+					function()
+						companyOp(shared, { ShareStations = { company = c.id, open = c.closed == true } },
+							(c.closed and "Opening " or "Closing ") .. "the stations of " .. c.name)
+					end),
+			})
+			for _, player in ipairs(companies.members(roster, mine)) do
+				local p = byId[player]
+				if player ~= status.me_id and p then
+					row({
+						label(p.name, nil, 300, 28),
+						button("Send out", "Send " .. tostring(p.name) .. " back to the room's first company",
+							function()
+								companyOp(shared, { Dismiss = { company = c.id, player = player } },
+									"Sending " .. tostring(p.name) .. " out of " .. c.name)
+							end),
+					})
+				end
+			end
 		end
-		local myName
-		for _, c in ipairs(roster.list) do if c.id == mine then myName = c.name end end
-		field(drafts.rename, "A new name for " .. tostring(myName), "Rename", "Rename the company you play for",
-			function(text)
-				if type(text) ~= "string" or text:match("^%s*$") then return end
+		row({
+			field(drafts.rename, "A new name for " .. tostring(myName), false, function(text)
+				if blank(text) then return end
 				companyOp(shared, { Rename = { company = mine, name = text } }, "Renaming " .. tostring(myName))
 				drafts.rename:set("")
-			end)
-		field(drafts.found, "A company of your own", "Found", "Found a company and play for it",
-			function(text)
-				if type(text) ~= "string" or text:match("^%s*$") then return end
+			end),
+			button("Rename", "Rename the company you play for", function()
+				local text = drafts.rename:get()
+				if blank(text) then return end
+				companyOp(shared, { Rename = { company = mine, name = text } }, "Renaming " .. tostring(myName))
+				drafts.rename:set("")
+			end),
+		})
+		rows[#rows + 1] = gap(8)
+		if #otherCards > 0 then
+			line("OTHER COMPANIES")
+			rows[#rows + 1] = gap(6)
+			for _, card in ipairs(otherCards) do rows[#rows + 1] = card end
+		end
+		line("START ANOTHER COMPANY")
+		rows[#rows + 1] = gap(6)
+		row({
+			field(drafts.found, "A company of your own", false, function(text)
+				if blank(text) then return end
 				companyOp(shared, { Create = { name = text } }, "Founding " .. text)
 				drafts.found:set("")
-			end)
+			end),
+			button("Found", "Found a company and play for it", function()
+				local text = drafts.found:get()
+				if blank(text) then return end
+				companyOp(shared, { Create = { name = text } }, "Founding " .. text)
+				drafts.found:set("")
+			end),
+		})
 		-- Another company's loans are the room's (tpf3mp/companies.lua), on
 		-- the terms the game offers; the first company's are in the game's
 		-- own finance window.
@@ -532,41 +816,29 @@ function data()
 			local loans = {}
 			for _, loan in ipairs(roster.loans or {}) do if loan.company == mine then loans[#loans + 1] = loan end end
 			for _, loan in ipairs(loans) do
-				rows[#rows + 1] = builtin.BoxLayout{
-					orientation = builtin.type.Orientation.Horizontal,
-					children = {
-						builtin.TextView{ text = "  Loan: " .. money(loan.remaining) .. " owed of " .. money(loan.amount)
-							.. ", " .. money(loan.payment) .. " a month, " .. (loan.months - loan.paid) .. " months left" },
-						builtin.Button{
-							meta = { tooltip = "Pay back what is still owed now" },
-							content = builtin.TextView{ text = "Repay" },
-							onClick = function()
-								companyOp(shared, nil, "Repaying " .. money(loan.remaining), { Loan = { Repay = { loan = {
-									type = "Custom", amount = loan.amount, duration = 1, percentage = 0, id = loan.id } } } })
-							end,
-						},
-					},
-				}
+				row({
+					label("Loan: " .. money(loan.remaining) .. " owed of " .. money(loan.amount)
+						.. ", " .. money(loan.payment) .. " a month, " .. (loan.months - loan.paid) .. " months left", nil, 300, 28),
+					button("Repay", "Pay back what is still owed now", function()
+						companyOp(shared, nil, "Repaying " .. money(loan.remaining), { Loan = { Repay = { loan = {
+							type = "Custom", amount = loan.amount, duration = 1, percentage = 0, id = loan.id } } } })
+					end),
+				})
 			end
 			local offers = {}
 			for _, offer in ipairs(roster.offers or {}) do
 				if type(offer) == "table" and type(offer.amount) == "number" then
-					offers[#offers + 1] = builtin.Button{
-						meta = { tooltip = string.format("Borrow %s at %g%% a year", money(offer.amount),
-							(offer.percentage or 0) * 100) },
-						content = builtin.TextView{ text = "Borrow " .. money(offer.amount) },
-						onClick = function()
+					offers[#offers + 1] = button("Borrow " .. money(offer.amount),
+						string.format("Borrow %s at %g%% a year", money(offer.amount), (offer.percentage or 0) * 100),
+						function()
 							local terms = { type = offer.type, amount = offer.amount, duration = offer.duration,
 								percentage = offer.percentage }
 							companyOp(shared, nil, "Borrowing " .. money(offer.amount),
 								{ Loan = { Take = { next = terms, offer = terms } } })
-						end,
-					}
+						end)
 				end
 			end
-			if #offers > 0 then
-				rows[#rows + 1] = builtin.BoxLayout{ orientation = builtin.type.Orientation.Horizontal, children = offers }
-			end
+			for _, offer in ipairs(offers) do row({ offer }) end
 		end
 		if shared.companyNote then line(shared.companyNote) end
 	end
@@ -584,35 +856,63 @@ function data()
 			end
 			shared.version = shared.version + 1
 		end
-		local rows = {}
-		local function line(text) rows[#rows + 1] = builtin.TextView{ text = text } end
-		line("Room: " .. tostring(status.room))
-		if status.speed then line("Speed: " .. speedText(status.speed)) end
+		local rows = { label(status.room, "font-scale-title-3", 740, 36), gap(6) }
+		local statusRow = {}
+		if status.speed then statusRow[#statusRow + 1] = label("Speed: " .. speedText(status.speed), "font-scale-annotation") end
+		statusRow[#statusRow + 1] = gap(16)
+		statusRow[#statusRow + 1] = label("Host controls speed", "font-scale-annotation")
+		statusRow[#statusRow + 1] = gap(16)
 		if status.diverged then
-			line("Your world differed from the room's at step " .. tostring(status.diverged)
-				.. "; the room's is on its way")
+			statusRow[#statusRow + 1] = label("Resyncing your world", "font-scale-annotation, warning")
 		else
-			line("Worlds match")
+			statusRow[#statusRow + 1] = label("Worlds match", "font-scale-annotation, success")
 		end
-		line("")
-		line("Players")
+		rows[#rows + 1] = box(statusRow, true)
+		if status.diverged then
+			rows[#rows + 1] = label("Your world differed at step " .. tostring(status.diverged)
+				.. ". The room's world is on its way.", "font-scale-annotation, warning", 740, 64)
+		end
+		rows[#rows + 1] = gap(18)
+		local players, online = {}, 0
 		for _, p in ipairs(status.players or {}) do
 			local tags = {}
 			if p.owner then tags[#tags + 1] = "host" end
 			if p.me then tags[#tags + 1] = "you" end
 			if not p.connected then tags[#tags + 1] = "away" end
-			line("  " .. tostring(p.name) .. (#tags > 0 and (" (" .. table.concat(tags, ", ") .. ")") or ""))
+			if p.connected then online = online + 1 end
+			players[#players + 1] = box({
+				label(p.name, "font-scale-body", PLAYERS_WIDTH - 40, 16),
+				label(#tags > 0 and table.concat(tags, " · ") or "playing", "font-scale-annotation" .. (p.me and ", info" or ""), nil, 16),
+			}, false, PLAYERS_WIDTH - 24, 10, true)
+			players[#players + 1] = gap(8)
 		end
-		companyRows(rows, status, shared, drafts)
-		line("")
-		line("Chat")
-		-- The newest lines only: the window sizes itself to what it holds.
-		for i = math.max(1, #shared.lines - CHAT_SHOWN + 1), #shared.lines do line(shared.lines[i]) end
-		if #shared.lines == 0 then line("Nobody said anything yet.") end
-		rows[#rows + 1] = builtin.BoxLayout{
-			orientation = builtin.type.Orientation.Horizontal,
-			children = {
+		local companies = {}
+		companyRows(companies, status, shared, drafts)
+		if #companies == 0 then companies[1] = label("Waiting for the companies...", "font-scale-annotation") end
+		rows[#rows + 1] = box({
+			box({ label("Players", "font-scale-title-4"),
+				label(online .. " of " .. #(status.players or {}) .. " online", "font-scale-annotation"), gap(10),
+				scroll(players, PLAYERS_WIDTH, BODY_HEIGHT) }, false, PLAYERS_WIDTH),
+			gap(20),
+			box({ label("Companies", "font-scale-title-4"),
+				label("Choose who you build with", "font-scale-annotation"), gap(10),
+				scroll(companies, COMPANIES_WIDTH, BODY_HEIGHT) }, false, COMPANIES_WIDTH),
+		}, true)
+		rows[#rows + 1] = gap(18)
+		rows[#rows + 1] = label("Chat", "font-scale-title-4")
+		rows[#rows + 1] = gap(6)
+		local chat = {}
+		-- The newest lines, in a bounded panel. The composer stays visible.
+		for i = math.max(1, #shared.lines - CHAT_SHOWN + 1), #shared.lines do
+			chat[#chat + 1] = label(shared.lines[i], "font-scale-body", 720, 64)
+			chat[#chat + 1] = gap(4)
+		end
+		if #chat == 0 then chat[1] = label("Nobody said anything yet.", "font-scale-annotation") end
+		rows[#rows + 1] = scroll(chat, 760, 92)
+		rows[#rows + 1] = gap(8)
+		rows[#rows + 1] = box({
 				builtin.TextInputField{
+					meta = { class = "font-scale-body", styleSheet = sheet(652, 36) },
 					placeholderText = "Say something to the room",
 					value = draft:get(),
 					maxLength = 280,
@@ -626,12 +926,13 @@ function data()
 					onCancel = function() shared.version = shared.version + 1 end,
 					onValueChange = function(text) send(text) end,
 				},
+				gap(8),
 				builtin.Button{
-					content = builtin.TextView{ text = "Send" },
+					meta = { class = "primary", styleSheet = sheet(100, 36) },
+					content = label("Send"),
 					onClick = function() send(draft:get()) end,
 				},
-			},
-		}
+			}, true)
 		return rows
 	end
 
@@ -646,7 +947,8 @@ function data()
 			shared.window = react.RegisterWrapperRecipe("Tpf3mpWindow", builtin.Window, function(params)
 				local drawn = react.useState(0)
 				local draft = react.useRef("")
-				local drafts = { rename = react.useRef(""), found = react.useRef("") }
+				local drafts = { rename = react.useRef(""), found = react.useRef(""),
+					joinPassword = react.useRef(""), lockPassword = react.useRef("") }
 				react.onStep(function()
 					local version = ui().version
 					if version ~= drawn:old() then drawn:set(version) end
@@ -669,7 +971,7 @@ function data()
 					-- the mods' buttons, which it would cover at 0, 0.
 					initialX = 0,
 					initialY = 0.15,
-					content = builtin.BoxLayout{ orientation = builtin.type.Orientation.Vertical, children = rows },
+					content = box(rows, false, WINDOW_WIDTH, 20, true),
 				}
 			end)
 		end

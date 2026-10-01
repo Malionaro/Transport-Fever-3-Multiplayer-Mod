@@ -162,6 +162,7 @@ async fn a_hostile_server_cannot_fill_the_bridge_outbox() {
                             player: PlayerId(FixedBytes([7; 32])),
                             client_seq: seq,
                             payload: Payload::new(vec![0xab; MAX_PAYLOAD]).unwrap(),
+                            seal: None,
                         },
                     }
                 })

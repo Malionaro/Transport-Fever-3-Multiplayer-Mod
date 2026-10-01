@@ -28,10 +28,13 @@ pub enum Reach {
     Offline,
 }
 
-/// The server's reach, kept up to date on a thread of its own.
-#[derive(Debug, Clone)]
+/// The server's reach, kept up to date on a thread of its own, which ends
+/// once the probe is dropped.
+#[derive(Debug)]
 pub struct Probe {
     reach: Arc<AtomicU8>,
+    /// The server asked; `None` for one that asks nothing.
+    server: Option<String>,
 }
 
 impl Probe {
@@ -39,7 +42,9 @@ impl Probe {
     pub fn start(server: &str) -> Option<Self> {
         let url = probe_url(server)?;
         let reach = Arc::new(AtomicU8::new(Reach::Unknown as u8));
-        let shared = Arc::clone(&reach);
+        // Weak: the thread stops asking once the probe is gone, as when the
+        // player changed the server.
+        let shared = Arc::downgrade(&reach);
         std::thread::Builder::new()
             .name("server-probe".into())
             .spawn(move || {
@@ -50,7 +55,7 @@ impl Probe {
                         .timeout_global(Some(PATIENCE))
                         .build(),
                 );
-                loop {
+                while shared.strong_count() > 0 {
                     let answer = agent
                         .get(&url)
                         .header(
@@ -59,12 +64,18 @@ impl Probe {
                         )
                         .call()
                         .map(|response| response.status().as_u16());
-                    shared.store(classify(answer.ok()) as u8, Ordering::Relaxed);
+                    match shared.upgrade() {
+                        Some(reach) => reach.store(classify(answer.ok()) as u8, Ordering::Relaxed),
+                        None => break,
+                    }
                     std::thread::sleep(EVERY);
                 }
             })
             .ok()?;
-        Some(Self { reach })
+        Some(Self {
+            reach,
+            server: Some(server.trim().to_owned()),
+        })
     }
 
     /// One that always shows `reach`, asking nothing: for tests and
@@ -72,7 +83,16 @@ impl Probe {
     pub fn showing(reach: Reach) -> Self {
         Self {
             reach: Arc::new(AtomicU8::new(reach as u8)),
+            server: None,
         }
+    }
+
+    /// Whether this probe tells of `server`: one that asks nothing tells of
+    /// any.
+    pub fn tells_of(&self, server: &str) -> bool {
+        self.server
+            .as_deref()
+            .is_none_or(|asked| asked.eq_ignore_ascii_case(server.trim()))
     }
 
     pub fn reach(&self) -> Reach {
@@ -122,6 +142,21 @@ mod tests {
         for bad in ["", "no-port", "host:port", "evil.example/x:29470", ":29470"] {
             assert_eq!(probe_url(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_probe_tells_of_its_own_server() {
+        let shown = Probe::showing(Reach::Online);
+        assert!(
+            shown.tells_of("any.example:1"),
+            "one for tests tells of any"
+        );
+        let asking = Probe {
+            reach: Arc::new(AtomicU8::new(Reach::Unknown as u8)),
+            server: Some("eu.example:29470".into()),
+        };
+        assert!(asking.tells_of(" EU.example:29470"));
+        assert!(!asking.tells_of("us.example:29470"));
     }
 
     #[test]

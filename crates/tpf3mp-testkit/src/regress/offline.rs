@@ -120,6 +120,7 @@ pub fn play_offline(plan: &OfflinePlan) -> Result<Vec<ReplicaReport>, ScriptErro
                     player,
                     client_seq: seq,
                     payload,
+                    seal: None,
                 },
             });
         }

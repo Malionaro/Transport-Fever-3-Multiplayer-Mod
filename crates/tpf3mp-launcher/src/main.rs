@@ -95,18 +95,40 @@ struct AutoRoom {
     game_data_dir: Option<std::path::PathBuf>,
 }
 
-/// The server a package plays on, set when it is built.
+/// The server a package plays on by default, set when it is built. Without
+/// it, the project's relay ([`setup::RELAY`]), in every build.
 const DEFAULT_SERVER: Option<&str> = option_env!("TPF3MP_DEFAULT_SERVER");
 /// What players see of that server, such as EU, set when it is built.
 const SERVER_NAME: Option<&str> = option_env!("TPF3MP_SERVER_NAME");
 
+/// The launcher's default server and its name: the ones the package was
+/// built with (`built`, `named`), else the project's relay, named
+/// [`setup::RELAY_NAME`] unless `named` says otherwise. Empty counts as
+/// unset, as a release's unset repository variable arrives.
+fn package_server(built: Option<&str>, named: Option<&str>) -> (String, Option<String>) {
+    let given = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    match given(built) {
+        Some(server) => (server, given(named)),
+        None => (
+            setup::RELAY.to_owned(),
+            Some(given(named).unwrap_or_else(|| setup::RELAY_NAME.to_owned())),
+        ),
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = Args::parse();
     if args.launcher.default_server.is_none() {
-        args.launcher.default_server = DEFAULT_SERVER.map(str::to_owned);
-    }
-    if args.launcher.server_name.is_none() {
-        args.launcher.server_name = SERVER_NAME.map(str::to_owned);
+        let (server, name) = package_server(DEFAULT_SERVER, SERVER_NAME);
+        args.launcher.default_server = Some(server);
+        if args.launcher.server_name.is_none() {
+            args.launcher.server_name = name;
+        }
     }
     let logs = logs::dir().ok();
     // The log's lines also wait here to go to the server, redacted.
@@ -282,6 +304,9 @@ fn auto_room(
                     max_players: 8,
                     password: None,
                     rules: None,
+                    start_save: None,
+                    listing: None,
+                    competitive: false,
                 })
                 .await
             {
@@ -440,7 +465,35 @@ mod tests {
 
     use tpf3mp_agent::launcher::{Member, MemberContent, Phase, Room};
 
-    use super::{Args, ready_to_start};
+    use super::{Args, package_server, ready_to_start};
+    use tpf3mp_agent::launcher::setup::{RELAY, RELAY_NAME};
+
+    #[test]
+    fn the_default_server_is_the_packages_else_the_relay() {
+        assert_eq!(
+            package_server(None, None),
+            (RELAY.to_owned(), Some(RELAY_NAME.to_owned())),
+            "a build without TPF3MP_DEFAULT_SERVER, a developer's too"
+        );
+        assert_eq!(
+            package_server(Some(""), Some(" ")),
+            (RELAY.to_owned(), Some(RELAY_NAME.to_owned())),
+            "an unset repository variable arrives empty"
+        );
+        assert_eq!(
+            package_server(None, Some("EU")),
+            (RELAY.to_owned(), Some("EU".to_owned()))
+        );
+        assert_eq!(
+            package_server(Some(" eu.example.org:29470 "), None),
+            ("eu.example.org:29470".to_owned(), None),
+            "the relay's name is the relay's alone"
+        );
+        assert_eq!(
+            package_server(Some("eu.example.org:29470"), Some("EU")),
+            ("eu.example.org:29470".to_owned(), Some("EU".to_owned()))
+        );
+    }
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
         Args::try_parse_from(std::iter::once("tpf3mp-launcher").chain(args.iter().copied()))
@@ -536,8 +589,10 @@ mod tests {
                     owner: i == 0,
                     you: i == 0,
                     content: MemberContent::Same,
+                    banner: None,
                 })
                 .collect(),
+            competitive: false,
         }
     }
 

@@ -18,10 +18,24 @@
 -- (tpf3mp/apply.lua), and what another company owns is refused, the same in
 -- every game.
 --
+-- Who may do what (DECISIONS.md, D22, proposed): a company's players build,
+-- buy, run lines, borrow, rename and recolour it; its head (the player who
+-- founded it while they play for it, else the one who has played for it
+-- longest) alone gives it a password or takes it away, sends a player out of
+-- it and opens or closes its stations to other companies' lines. Joining a
+-- company with a password needs it: the room seals the password the player
+-- typed (tpf3mp_proto::Secret) and every game compares that seal with the
+-- one the company keeps, so no game ever holds the password. The room's
+-- first company is everyone's: it has no head, no password, and its
+-- stations stay open.
+--
 --   roster = {
 --     next = n,                          -- the next company id
---     list = { { id =, entity =, name =, color = { r, g, b }, gone = true? }, ... },
+--     list = { { id =, entity =, name =, color = { r, g, b }, gone = true?,
+--                founder = "<64 hex digits>"?, lock = { scope =, tag = }?,
+--                closed = true? }, ... },
 --     members = { { player = "<64 hex digits>", company = id }, ... },
+--                                        -- in the order they joined
 --   }
 --
 -- Lists of records, not tables keyed by id or player: a save keeps them as
@@ -128,14 +142,66 @@ function companies.members(roster, id)
 	return out
 end
 
+-- `player` plays for company `id` from now on, last in the join order.
 local function setMember(roster, player, id)
-	for _, m in ipairs(roster.members) do
+	for i, m in ipairs(roster.members) do
 		if m.player == player then
-			m.company = id
-			return
+			table.remove(roster.members, i)
+			break
 		end
 	end
 	roster.members[#roster.members + 1] = { player = player, company = id }
+end
+
+-- `player` plays for the room's first company again.
+local function leave(roster, player)
+	for i, m in ipairs(roster.members) do
+		if m.player == player then
+			table.remove(roster.members, i)
+			return
+		end
+	end
+end
+
+-- The head of company `id`: its founder while they play for it, else the
+-- player who has played for it longest; nil for the room's first company,
+-- which is everyone's, and for a company nobody plays for.
+function companies.head(roster, id)
+	if id == 0 then return nil end
+	local c = companies.find(roster, id)
+	if not c or c.gone then return nil end
+	local players = companies.members(roster, id)
+	for _, p in ipairs(players) do
+		if p == c.founder then return p end
+	end
+	return players[1]
+end
+
+-- The roster in one line, for hook.log: each live company with its id, its
+-- head (the first 8 hex digits), how many chose it, and whether it has a
+-- password or closed stations. Never a seal.
+function companies.describe(roster)
+	local out = {}
+	for _, c in ipairs(companies.live(roster)) do
+		local head = companies.head(roster, c.id)
+		local tags = { #companies.members(roster, c.id) .. " chose it" }
+		if head then tags[#tags + 1] = "head " .. head:sub(1, 8) end
+		if companies.locked(c) then tags[#tags + 1] = "password" end
+		if not companies.open(c) then tags[#tags + 1] = "stations closed" end
+		out[#out + 1] = tostring(c.name) .. " #" .. c.id .. " (" .. table.concat(tags, ", ") .. ")"
+	end
+	return table.concat(out, "; ")
+end
+
+-- Whether company `c` has a password.
+function companies.locked(c)
+	return type(c) == "table" and type(c.lock) == "table"
+end
+
+-- Whether other companies' lines may stop at company `c`'s stations: yes
+-- unless its head closed them.
+function companies.open(c)
+	return not (type(c) == "table" and c.closed == true)
 end
 
 -- Who owns `entity` (its PLAYER_OWNED player), or nil: the game's own, or
@@ -157,6 +223,21 @@ function companies.mayTouch(roster, company, entity, api, what)
 	local other = roster and companies.byEntity(roster, owner)
 	local name = other and other.name or "another company"
 	return false, "the " .. (what or "thing") .. " belongs to " .. name
+end
+
+-- Whether `company` (a player entity) may have its lines stop at the
+-- station group `group` (D22, proposed): one no company owns, its own, or
+-- another company's that keeps its stations open. Else false and why,
+-- naming the owner. Stopping at a station changes nothing of it, so it is
+-- not `mayTouch`'s.
+function companies.mayUse(roster, company, group, api)
+	local owner = companies.ownerOf(api, group)
+	if owner == nil or owner == company then return true end
+	local other = roster and companies.byEntity(roster, owner)
+	if other and not companies.open(other) then
+		return false, "the station belongs to " .. other.name .. ", which keeps its stations to itself"
+	end
+	return true
 end
 
 -- Whether anything is owned by the player entity `entity`; nil when this
@@ -205,6 +286,33 @@ end
 
 local function memberOf(roster, player, id)
 	return companies.of(roster, player).id == id
+end
+
+-- Refuses unless `player` heads company `c`.
+local function headOf(roster, player, c, doing)
+	if c.id == 0 then return false, "the room's first company is everyone's: nobody " .. doing .. " it" end
+	if companies.head(roster, c.id) ~= player then
+		return false, "only the head of " .. c.name .. " " .. doing .. " it"
+	end
+	return true
+end
+
+-- Whether `seal` (the room's, { scope =, tag = }) is a password's for
+-- company `id`.
+local function sealFor(seal, id)
+	return type(seal) == "table" and seal.scope == id and type(seal.tag) == "string" and #seal.tag == 64
+end
+
+-- A colour as the action carries it, { r =, g =, b = } in fractions, or nil
+-- for one out of range.
+local function colorOf(color)
+	if type(color) ~= "table" then return nil end
+	local out = { color.r, color.g, color.b }
+	for k = 1, 3 do
+		local v = out[k]
+		if type(v) ~= "number" or v ~= v or v < 0 or v > 1 then return nil end
+	end
+	return out
 end
 
 -- The entity a command made, from its data's `field`, else its first result.
@@ -424,9 +532,11 @@ function companies.due(roster, month)
 end
 
 -- Applies one `CompanyOp` for `player`. `send(command)` runs a command at
--- once and returns its data and result entities. Returns true, or false and
--- why; the roster changes only when it returns true.
-function companies.run(roster, player, op, send, api)
+-- once and returns its data and result entities. `seal` is the room's seal
+-- of the password sent with it, { scope =, tag = }, or nil. Returns true, or
+-- false and why; the roster changes only when it returns true. A reason
+-- never says more of a password than whether it fitted.
+function companies.run(roster, player, op, send, api, seal)
 	if type(op) ~= "table" then return false, "a company operation is a table" end
 	local kind, body = next(op)
 	if kind == "Create" then
@@ -442,13 +552,18 @@ function companies.run(roster, player, op, send, api)
 		if entity == nil then return false, "the game made no company" end
 		local id = roster.next
 		roster.next = id + 1
-		roster.list[#roster.list + 1] = { id = id, entity = entity, name = name, color = color }
+		roster.list[#roster.list + 1] = { id = id, entity = entity, name = name, color = color, founder = player }
 		setMember(roster, player, id)
 		return true, nil, id
 	elseif kind == "Join" then
 		local c = companies.find(roster, body)
 		if c == nil or c.gone then return false, "there is no company " .. tostring(body) end
-		setMember(roster, player, c.id)
+		if memberOf(roster, player, c.id) then return true, nil, c.id end
+		if companies.locked(c) then
+			if not sealFor(seal, c.id) then return false, "joining " .. c.name .. " needs its password" end
+			if seal.tag ~= c.lock.tag then return false, "the password for " .. c.name .. " is not right" end
+		end
+		if c.id == 0 then leave(roster, player) else setMember(roster, player, c.id) end
 		return true, nil, c.id
 	elseif kind == "Rename" then
 		local c = type(body) == "table" and companies.find(roster, body.company)
@@ -464,9 +579,12 @@ function companies.run(roster, player, op, send, api)
 		local c = type(body) == "table" and companies.find(roster, body.company)
 		if not c or c.gone then return false, "there is no such company" end
 		if not memberOf(roster, player, c.id) then return false, "only its players recolour a company" end
-		local color = type(body.color) == "table" and { body.color.r, body.color.g, body.color.b }
-		if not color or type(color[1]) ~= "number" or type(color[2]) ~= "number" or type(color[3]) ~= "number" then
-			return false, "a colour is { r, g, b }"
+		local color = colorOf(body.color)
+		if not color then return false, "a colour is { r, g, b }, each from 0 to 1" end
+		for _, other in ipairs(companies.live(roster)) do
+			if other.id ~= c.id and sameColor(other.color, color) then
+				return false, other.name .. " wears that colour already"
+			end
 		end
 		c.color = color
 		companies.paintFleet(c, send, api)
@@ -484,9 +602,43 @@ function companies.run(roster, player, op, send, api)
 		if owns == nil then return false, "this game cannot tell what " .. c.name .. " owns" end
 		if owns then return false, c.name .. " still owns something" end
 		c.gone = true
-		for i, m in ipairs(roster.members) do
-			if m.player == player then table.remove(roster.members, i) break end
-		end
+		leave(roster, player)
+		return true, nil, c.id
+	elseif kind == "Lock" then
+		-- Its head gives it a password, or a new one: every game keeps the
+		-- room's seal of it, never the password.
+		local c = companies.find(roster, body)
+		if not c or c.gone then return false, "there is no company " .. tostring(body) end
+		local ok, why = headOf(roster, player, c, "gives a password to")
+		if not ok then return false, why end
+		if not sealFor(seal, c.id) then return false, "a password for " .. c.name .. " comes sealed by the room" end
+		c.lock = { scope = seal.scope, tag = seal.tag }
+		return true, nil, c.id
+	elseif kind == "Unlock" then
+		local c = companies.find(roster, body)
+		if not c or c.gone then return false, "there is no company " .. tostring(body) end
+		local ok, why = headOf(roster, player, c, "takes the password from")
+		if not ok then return false, why end
+		c.lock = nil
+		return true, nil, c.id
+	elseif kind == "Dismiss" then
+		-- Its head sends a player out: they play for the room's first
+		-- company again. What they built stays the company's.
+		local c = type(body) == "table" and companies.find(roster, body.company)
+		if not c or c.gone then return false, "there is no such company" end
+		local ok, why = headOf(roster, player, c, "sends players out of")
+		if not ok then return false, why end
+		if body.player == player then return false, "the head leaves by joining another company" end
+		if not memberOf(roster, body.player, c.id) then return false, "that player does not play for " .. c.name end
+		leave(roster, body.player)
+		return true, nil, c.id
+	elseif kind == "ShareStations" then
+		local c = type(body) == "table" and companies.find(roster, body.company)
+		if not c or c.gone then return false, "there is no such company" end
+		if type(body.open) ~= "boolean" then return false, "stations are open or not" end
+		local ok, why = headOf(roster, player, c, body.open and "opens the stations of" or "closes the stations of")
+		if not ok then return false, why end
+		c.closed = (not body.open) or nil
 		return true, nil, c.id
 	end
 	return false, "a company operation of no kind"

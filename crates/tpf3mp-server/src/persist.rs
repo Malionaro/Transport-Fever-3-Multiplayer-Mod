@@ -40,8 +40,10 @@ use tpf3mp_proto::{
 /// saves appear in the log. Version 4 lets the start record carry a
 /// [`Base`], for compacted logs. Version 5 records the rules the room is
 /// played by, and version 6 the game's content manifest. Version 7's
-/// invite tag is of the room's six-character code alone.
-pub(crate) const FORMAT_VERSION: u16 = 7;
+/// invite tag is of the room's six-character code alone. Version 8's
+/// commands carry the seal of a password sent with them (protocol 8), never
+/// the password.
+pub(crate) const FORMAT_VERSION: u16 = 8;
 /// Largest start record: one whose base holds the rules' state.
 const MAX_START_RECORD: usize = 16 << 20;
 /// Largest record after the start record: a turn frame at its cap. Kept

@@ -138,13 +138,18 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(word)
 }
 
-fn i32_at(bytes: &[u8], offset: usize) -> i32 {
+pub(crate) fn i32_at(bytes: &[u8], offset: usize) -> i32 {
     let mut word = [0u8; 4];
     word.copy_from_slice(&bytes[offset..offset + 4]);
     i32::from_le_bytes(word)
 }
 
-fn read(memory: &dyn Memory, address: usize, len: usize, what: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read(
+    memory: &dyn Memory,
+    address: usize,
+    len: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
     memory
         .read(address, len)
         .ok_or_else(|| format!("{what} does not read"))
@@ -152,7 +157,7 @@ fn read(memory: &dyn Memory, address: usize, len: usize, what: &str) -> Result<V
 
 /// The `std::vector` whose `{begin, end, capacity}` is at `offset` of
 /// `head`: its begin and element count.
-fn vector(
+pub(crate) fn vector(
     head: &[u8],
     offset: usize,
     stride: usize,
@@ -183,7 +188,7 @@ fn vector(
 }
 
 /// The `int32` at `field` of each of a vector's `count` elements.
-fn ids(
+pub(crate) fn ids(
     memory: &dyn Memory,
     begin: usize,
     count: usize,

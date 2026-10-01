@@ -31,7 +31,9 @@
 --     nodes   = { { id = -1, pos = {x, y, z} }, ... },   -- the proposal's new nodes (ids < 0)
 --     edges   = { { node0 =, node1 =, network =, tangent0 = {..}, tangent1 = {..},
 --                   structure = "Ground" | { Bridge = file } | { Tunnel = file },
---                   template =, style = }, ... },         -- the proposal's new edges
+--                   template =, style =,
+--                   decorations = { { name =, flag = } }, locked =, owned = }, ... },
+--                                                         -- the proposal's new edges
 --     removed = { { node0 =, node1 =, network = }, ... }, -- the existing edges it removes
 --     removedNodes = { { id =, pos = {x, y, z} }, ... },   -- the existing nodes it removes
 --     explicit = true | nil,               -- every link names its kind (a construction's streets)
@@ -124,7 +126,9 @@ function roads.convert(capture, world)
 		local t0, errT0 = vec3(e.tangent0)
 		local t1, errT1 = vec3(e.tangent1)
 		if not (t0 and t1) then return nil, "edge " .. k .. " tangent: " .. tostring(errT0 or errT1) end
-		local link = { from = i1, to = i2, tangent0 = t0, tangent1 = t1, structure = e.structure or "Ground" }
+		local link = { from = i1, to = i2, tangent0 = t0, tangent1 = t1, structure = e.structure or "Ground",
+			decorations = e.decorations or {}, locked = e.locked == true, owned = e.owned == true,
+			lanes = e.lanes or {} }
 		if capture.explicit or e.network ~= own or e.template ~= ownTemplate or e.style ~= capture.style then
 			if e.network ~= "Street" and e.network ~= "Track" then
 				return nil, "edge " .. k .. " is in no network"
@@ -160,7 +164,8 @@ function roads.convert(capture, world)
 		removedNodes[#removedNodes + 1] = { network = network, at = at }
 	end
 
-	local polyline = { vertices = vertices, links = links, removals = removals, removed_nodes = removedNodes }
+	local polyline = { vertices = vertices, links = links, removals = removals, removed_nodes = removedNodes,
+		junctions = capture.junctions or {} }
 	if own == "Street" then
 		return { BuildRoad = {
 			street = capture.street, style = capture.style, bus_lane = capture.bus_lane == true,

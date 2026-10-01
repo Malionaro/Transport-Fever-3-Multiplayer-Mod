@@ -24,6 +24,7 @@ tokio.workspace = true
 tpf3mp-bridge.workspace = true
 tpf3mp-ipc.workspace = true
 tpf3mp-launch.workspace = true
+tpf3mp-modscan.workspace = true
 tpf3mp-net.workspace = true
 tpf3mp-proto.workspace = true
 tpf3mp-snapshot.workspace = true

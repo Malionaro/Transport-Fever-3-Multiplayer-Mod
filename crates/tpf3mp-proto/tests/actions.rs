@@ -10,12 +10,13 @@ use tpf3mp_proto::{
     BoundedVec, MAX_PAYLOAD, Payload, Text,
     action::{
         ACTION_SCHEMA_VERSION, Action, AssignLine, Bulldoze, BuyVehicle, CompanyId, CompanyOp,
-        ConsistPart, ConstructionBuild, ConstructionRef, CreateLine, EdgeEnds, EdgeKind, EdgeRef,
-        EditLine, Fraction, LineChange, LineData, LineId, LineStop, Link, Load, LoadMode, LoanOp,
-        LoanTerms, MAX_EDGES, MAX_VERTICES, Network, NodeRef, Param, ParamValue, PlaceStop,
-        Polyline, Pos, Pos2, Prospect, ReplaceVehicle, ReplacedPart, Resolve, RoadBuild, StationId,
-        StopRules, Structure, Tangent, Terminal, Terraform, TerrainCell, Tint, TownId, TrackBuild,
-        Tram, Transform, UnitDir, VehicleChange, VehicleId, VehicleOp, Vertex,
+        ConsistPart, ConstructionBuild, ConstructionRef, CreateLine, Decoration, EdgeEnds,
+        EdgeKind, EdgeObjectKind, EdgeRef, EditLine, Fraction, LineChange, LineData, LineId,
+        LineStop, Link, Load, LoadMode, LoanOp, LoanTerms, MAX_EDGES, MAX_VERTICES, Network,
+        NodeRef, Param, ParamValue, PlaceStop, Polyline, Pos, Pos2, Prospect, ReplaceVehicle,
+        ReplacedPart, Resolve, RoadBuild, StationId, StopRules, Structure, Tangent, Terminal,
+        Terraform, TerrainCell, Tint, TownId, TrackBuild, Tram, Transform, UnitDir, VehicleChange,
+        VehicleId, VehicleOp, Vertex,
     },
     lua,
 };
@@ -74,6 +75,10 @@ fn polyline() -> Polyline {
                 },
                 structure: Structure::Ground,
                 kind: None,
+                decorations: BoundedVec::default(),
+                locked: false,
+                owned: false,
+                lanes: BoundedVec::default(),
             },
             Link {
                 from: 1,
@@ -94,6 +99,13 @@ fn polyline() -> Polyline {
                     template: text("street/country.street_template"),
                     style: None,
                 }),
+                decorations: list(vec![Decoration {
+                    name: text("::/infrastructure/edge_addons/barrier_b.edge"),
+                    flag: false,
+                }]),
+                locked: true,
+                owned: true,
+                lanes: BoundedVec::default(),
             },
         ]),
         list(vec![EdgeRef {
@@ -309,6 +321,25 @@ fn samples() -> Vec<Action> {
             },
             model: text("stations/street/small_stops/small_new_twosided.con"),
             two_sided: true,
+            object: EdgeObjectKind::Stop,
+            one_way: false,
+        }),
+        Action::PlaceStop(PlaceStop {
+            edge: EdgeRef {
+                network: Network::Track,
+                ends: ends(pos(10, 0, 0), pos(90_000, 0, 0)),
+            },
+            at: pos(45_000, 0, 0),
+            left: false,
+            direction: UnitDir {
+                x: 1_000_000,
+                y: 0,
+                z: 0,
+            },
+            model: text("infrastructure/signal/signal_path_a.con"),
+            two_sided: false,
+            object: EdgeObjectKind::Signal,
+            one_way: true,
         }),
         Action::Terraform(
             Terraform::new(
@@ -356,6 +387,16 @@ fn samples() -> Vec<Action> {
                 b: 850_000,
             },
         }),
+        Action::CompanyOp(CompanyOp::Lock(CompanyId(2))),
+        Action::CompanyOp(CompanyOp::Unlock(CompanyId(2))),
+        Action::CompanyOp(CompanyOp::Dismiss {
+            company: CompanyId(2),
+            player: text(&"ab".repeat(32)),
+        }),
+        Action::CompanyOp(CompanyOp::ShareStations {
+            company: CompanyId(2),
+            open: false,
+        }),
         Action::Loan(Box::new(LoanOp::Take {
             next: loan(7_000_000),
             offer: loan(5_000_000),
@@ -379,6 +420,10 @@ fn samples() -> Vec<Action> {
             vehicle: VehicleId(2),
             change: VehicleChange::Depart,
         }),
+        Action::VehicleOp(VehicleOp {
+            vehicle: VehicleId(2),
+            change: VehicleChange::ManualDeparture(true),
+        }),
         Action::ReplaceVehicle(replacement()),
         Action::Prospect(Prospect {
             town: TownId(4),
@@ -389,7 +434,93 @@ fn samples() -> Vec<Action> {
             )),
         }),
         Action::NotificationSeen { notification: 12 },
+        Action::ApplyRank { level: 6 },
+        junction_action(),
     ]
+}
+
+fn junction_action() -> Action {
+    use tpf3mp_proto::action::{
+        JunctionChange, JunctionConfig, JunctionEdit, LaneConnection, TrafficPhase,
+        TrafficPreference,
+    };
+    let edge = EdgeRef {
+        network: Network::Street,
+        ends: ends(pos(0, 0, 0), pos(100_000, 0, 0)),
+    };
+    Action::EditJunctions(JunctionEdit {
+        changes: list(vec![JunctionChange {
+            node: NodeRef {
+                network: Network::Street,
+                at: pos(0, 0, 0),
+            },
+            config: Some(JunctionConfig {
+                connections: list(vec![LaneConnection {
+                    incoming: edge,
+                    lane_in: 0,
+                    outgoing: edge,
+                    lane_out: 1,
+                    road: true,
+                    tram: false,
+                }]),
+                crosswalks: list(vec![edge]),
+                preference: TrafficPreference::Yes,
+                light: Some(text("::/light/standard.lua")),
+                phases: list(vec![TrafficPhase {
+                    locked: list(vec![0, 1]),
+                    duration: 12_375,
+                    minimum: 4_125,
+                    skip: true,
+                }]),
+                double_slip: false,
+                custom_phases: true,
+            }),
+        }]),
+    })
+}
+
+#[test]
+fn invalid_junction_relationships_are_refused_on_the_wire_and_in_lua() {
+    use tpf3mp_proto::action::{JunctionChange, JunctionEdit, MAX_LANES};
+    let Action::EditJunctions(base) = junction_action() else {
+        unreachable!()
+    };
+    let mut cases = vec![
+        Action::EditJunctions(JunctionEdit {
+            changes: list(vec![]),
+        }),
+        Action::EditJunctions(JunctionEdit {
+            changes: list(vec![base.changes[0].clone(), base.changes[0].clone()]),
+        }),
+    ];
+    for variant in 0..4 {
+        let mut config = base.changes[0].config.clone().unwrap();
+        if variant == 0 {
+            let mut turn = config.connections[0].clone();
+            turn.lane_in = MAX_LANES as u16;
+            config.connections = list(vec![turn]);
+        } else {
+            let mut phase = config.phases[0].clone();
+            match variant {
+                1 => phase.minimum = phase.duration + 1,
+                2 => phase.locked = list(vec![2]),
+                _ => phase.locked = list(vec![0, 0]),
+            }
+            config.phases = list(vec![phase]);
+        }
+        cases.push(Action::EditJunctions(JunctionEdit {
+            changes: list(vec![JunctionChange {
+                node: base.changes[0].node,
+                config: Some(config),
+            }]),
+        }));
+    }
+    for bad in cases {
+        assert!(bad.to_payload().is_err());
+        let wire = postcard::to_stdvec(&(ACTION_SCHEMA_VERSION, &bad)).unwrap();
+        assert!(Action::from_payload(&Payload::new(wire).unwrap()).is_err());
+        assert!(lua::action_from_lua(&lua::action_to_lua(&bad).unwrap()).is_err());
+    }
 }
 
 /// A train's replacement: its locomotive kept, turned, and a new coach
@@ -445,13 +576,13 @@ fn check(bytes: &[u8]) {
 #[test]
 fn every_variant_round_trips() {
     let samples = samples();
-    // Every top-level variant is sampled: postcard tags them 0..=16.
+    // Every top-level variant is sampled: postcard tags them 0..=18.
     let mut tags: Vec<u8> = samples
         .iter()
         .map(|action| postcard::to_stdvec(action).unwrap()[0])
         .collect();
     tags.dedup();
-    assert_eq!(tags, (0..=16).collect::<Vec<u8>>());
+    assert_eq!(tags, (0..=18).collect::<Vec<u8>>());
 
     for action in samples {
         let bytes = postcard::to_stdvec(&action).unwrap();
@@ -560,6 +691,7 @@ fn a_link_to_a_missing_vertex_is_refused() {
         links: Vec<Link>,
         removals: Vec<EdgeRef>,
         removed_nodes: Vec<NodeRef>,
+        junctions: Vec<tpf3mp_proto::action::JunctionChange>,
     }
     let good = polyline();
     let mut vertices = good.vertices.to_vec();
@@ -580,6 +712,7 @@ fn a_link_to_a_missing_vertex_is_refused() {
         links: good.links.to_vec(),
         removals: Vec::new(),
         removed_nodes: Vec::new(),
+        junctions: Vec::new(),
     };
     // The schema version, then Action::BuildTrack.
     let bytes = postcard::to_stdvec(&(ACTION_SCHEMA_VERSION, 1u32, &track)).unwrap();

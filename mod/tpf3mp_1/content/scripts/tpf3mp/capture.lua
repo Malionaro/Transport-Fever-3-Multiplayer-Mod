@@ -196,20 +196,40 @@ function capture.replaced(component)
 end
 
 -- Whether an edit's street part removes only the old construction's own
--- nodes and edges (its CONSTRUCTION component's frozenNodes and
--- frozenEdges). true, or nil and why not.
+-- nodes and edges. Track ends may not be in frozenNodes (Steam 40408:
+-- a two-track station has 50 nodes, only 46 frozen). Such a node belongs
+-- to the rebuild only if every incident edge is frozen in this construction
+-- and is being removed. Shared endpoints touching external tracks refuse.
+-- true, or nil and why not.
 function capture.ownStreets(street, component)
-	local own = {}
+	local own = { frozenNodes = {}, frozenEdges = {} }
 	for _, key in ipairs({ "frozenNodes", "frozenEdges" }) do
 		local list = get(component, key)
-		for i = 1, (length(list) or 0) do own[get(list, i)] = true end
+		for i = 1, (length(list) or 0) do own[key][get(list, i)] = true end
 	end
-	for _, key in ipairs({ "removedSegments", "removedNodes" }) do
-		local list = get(street, key)
-		for i = 1, (length(list) or 0) do
-			if not own[get(get(list, i), "entity")] then
-				return nil, "a construction edit that changes the streets around it"
-			end
+	local removed = {}
+	local segments = get(street, "removedSegments")
+	for i = 1, (length(segments) or 0) do
+		local id = get(get(segments, i), "entity")
+		if not own.frozenEdges[id] then
+			return nil, "a construction edit that changes the streets around it"
+		end
+		removed[id] = true
+	end
+	local function ownEnd(id)
+		local ok, edges = pcall(function() return api.engine.system.streetSystem.getNodeSegments(id) end)
+		local n = ok and length(edges)
+		if not n or n < 1 then return false end
+		for i = 1, n do
+			if not removed[get(edges, i)] then return false end
+		end
+		return true
+	end
+	local nodes = get(street, "removedNodes")
+	for i = 1, (length(nodes) or 0) do
+		local id = get(get(nodes, i), "entity")
+		if not own.frozenNodes[id] and not ownEnd(id) then
+			return nil, "a construction edit that changes the streets around it"
 		end
 	end
 	return true
@@ -297,6 +317,15 @@ function capture.track(proposal)
 	return module("engine").captureBuild(proposal, "Track")
 end
 
+-- The road and track modifiers' builds (tpf3mp/engine.lua captureModify).
+function capture.modify(proposal)
+	return module("engine").captureModify(proposal)
+end
+
+function capture.junction(proposal)
+	return module("junctions").edit(proposal)
+end
+
 -- A stop placed on a street or track with the stop tool (tpf3mp_proto
 -- action::PlaceStop), read off its proposal by tpf3mp/engine.lua. Returns
 -- the action table; false for a proposal of nothing; or nil and why.
@@ -306,6 +335,10 @@ end
 -- menu gave the tool; the GUI notes it (capture.STOP_NOTE,
 -- gui/tpf3mp/gui_state.script.lua) and `link` reads the note.
 capture.STOP_NOTE = "stop-tool"
+-- Whether the signal the tool places is one-way: "1" or "0".
+capture.ONE_WAY_NOTE = "stop-tool-one-way"
+-- The tool the construction menu last started: its action and resource.
+capture.TOOL_NOTE = "tool"
 
 -- In a GUI Lua state: notes the stop the construction menu gives the stop
 -- tool, for capture.stop, which runs in another. The menu makes the tool's
@@ -319,12 +352,19 @@ function capture.watchStopTool(util, link)
 	end
 	if type(util) ~= "table" or type(util.getActionParams) ~= "function" or link == nil then return false end
 	local original = util.getActionParams
-	util.getActionParams = function(...)
-		local result = original(...)
+	util.getActionParams = function(definition, ...)
+		local result = original(definition, ...)
+		-- The tool picked, for the log (capture.TOOL_NOTE).
+		pcall(function()
+			link:note(capture.TOOL_NOTE, tostring(definition.action) .. " " .. tostring(definition.resName))
+		end)
 		pcall(function()
 			local builder = result.constructionActionParams.edgeObjectBuilder
 			local name = builder and builder.resName
-			if type(name) == "string" and name ~= "" then link:note(capture.STOP_NOTE, name) end
+			if type(name) == "string" and name ~= "" then
+				link:note(capture.STOP_NOTE, name)
+				link:note(capture.ONE_WAY_NOTE, builder.oneWay == true and "1" or "0")
+			end
 		end)
 		return result
 	end
@@ -336,7 +376,8 @@ end
 
 function capture.stop(proposal, link)
 	local noted = link and link.note and link:note(capture.STOP_NOTE) or nil
-	return module("engine").placeStop(proposal, noted)
+	local oneWay = link and link.note and link:note(capture.ONE_WAY_NOTE) == "1"
+	return module("engine").placeStop(proposal, noted, oneWay)
 end
 
 -- The bulldozer's removal (tpf3mp_proto action::Bulldoze), read off its
@@ -367,6 +408,12 @@ end
 -- gui/entity_window/entity_window_util.tl, build 40408). Every other build
 -- from a window stays refused. Returns the action table, or raises why not.
 function capture.windowBuild(_ctx, proposal)
+	local p = proposal and proposal.proposal
+	if p and #(proposal.toAdd or {}) == 0 and #(proposal.toRemove or {}) == 0
+		and ((p.nodeConfigsToAdd and #p.nodeConfigsToAdd > 0)
+		or (p.nodeConfigsToRemove and #p.nodeConfigsToRemove > 0)) then
+		return capture.junction(proposal)
+	end
 	local action, why = capture.construction(proposal)
 	if not action then error(why, 0) end
 	if action.BuildConstruction.replaces == nil then error("building from this window", 0) end
@@ -377,6 +424,12 @@ end
 -- "" when it has none.
 function capture.describe(proposal)
 	return module("engine").describe(proposal)
+end
+
+-- What a tool changed of the edges it rebuilt, for the log
+-- (tpf3mp/engine.lua).
+function capture.rebuildDiff(proposal)
+	return module("engine").rebuildDiff(proposal)
 end
 
 -- ------------------------------------------------------ vehicles and lines
@@ -519,6 +572,12 @@ function capture.vehicleDepart(ctx, vehicle)
 	return { VehicleOp = { vehicle = vehicleOf(ctx, vehicle), change = "Depart" } }
 end
 
+-- Held at its stops until told to leave, or not: what a timetable mod's
+-- game script sends (tpf3mp/modguard.lua).
+function capture.vehicleManualDeparture(ctx, vehicle, manual)
+	return { VehicleOp = { vehicle = vehicleOf(ctx, vehicle), change = { ManualDeparture = manual == true } } }
+end
+
 -- The game's load modes (Line.LoadMode), numbers to the schema's names.
 local LOAD_MODES = { [0] = "LoadIfAvailable", [1] = "FullLoadAny", [2] = "FullLoadAll", [3] = "LegacyUnloadOnly" }
 
@@ -610,12 +669,19 @@ function capture.prospect(ctx, param)
 	} }
 end
 
--- Renaming and recolouring: lines so far.
+-- Renaming and recolouring: lines, and the room's companies (the game's
+-- company window renames the player's company by its player entity,
+-- game_mechanics/company/company.tl), which every game checks is the
+-- player's own (tpf3mp/companies.lua).
 function capture.setName(ctx, entity, name)
+	local company = ctx.company and ctx.company(entity)
+	if company ~= nil then return { CompanyOp = { Rename = { company = company, name = name } } } end
 	return { EditLine = { line = named("renaming this", ctx.line(entity)), change = { Rename = name } } }
 end
 
 function capture.setColor(ctx, entity, color)
+	local company = ctx.company and ctx.company(entity)
+	if company ~= nil then return { CompanyOp = { Recolor = { company = company, color = tintOf(color) } } } end
 	return { EditLine = { line = named("recolouring this", ctx.line(entity)), change = { Recolor = tintOf(color) } } }
 end
 

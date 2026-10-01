@@ -286,6 +286,7 @@ local function module(name)
 end
 
 local geom = module("geom")
+local junctions = module("junctions")
 
 -- How near an existing node a vertex resolving to it is, horizontally.
 local NODE_TOLERANCE = 1.5
@@ -367,26 +368,74 @@ end
 
 local STRUCTURE = { Ground = "NORMAL", Bridge = "BRIDGE", Tunnel = "TUNNEL" }
 
+-- A link's lanes: its template's, or the ones the tool made (a tram track, a
+-- bus lane: a lane's transport modes on TF3). The game has no constructor
+-- for a lane, so each is a copy of one of the template's (read afresh, so
+-- no two are one), set to what the link says.
+-- The transport modes a lane names (api.type.enum.TransportMode, 0 to 15).
+local MODES = 16
+local function lanesFor(link, t)
+	if link.lanes == nil or #link.lanes == 0 then return t.laneConfigs end
+	local out = {}
+	for i, l in ipairs(link.lanes) do
+		local fresh = t.laneConfigs
+		local lane = fresh[math.min(i, #fresh)]
+		if lane == nil then error("a lane its template has none to make it from", 0) end
+		lane.speed, lane.width, lane.height, lane.offset = l.speed, l.width, l.height, l.offset
+		lane.forward = l.forward == true
+		-- Every mode, true or false. Build 40408 reads a lane's modes keyed
+		-- from 0 (the TransportMode value) but takes them as a Lua array,
+		-- from 1: mode m at m + 1. Keyed from 0 they land one mode off, and
+		-- a sidewalk that carries vehicles failed every game's build, then
+		-- crashed its simulation (TransportNetworkSystem, `person0 ==
+		-- person1`; 2026-10-01).
+		local modes = {}
+		for m = 0, MODES - 1 do modes[m + 1] = math.floor(l.modes / 2 ^ m) % 2 == 1 end
+		lane.transportModes = modes
+		out[i] = lane
+	end
+	return out
+end
+
 -- Adds the polyline's nodes and edges, and its removals, to `proposal`'s
 -- street proposal. `network`, `templateName` and `style` are the build's
 -- own kind, for the links that name none; nil for a construction's
--- streets, whose every link names its kind. With `dangling` false, a new
--- vertex at the end of a single link, and that link, are left out: in a
--- construction's streets, the construction's own entrance.
+-- streets, whose every link names its kind. With `dangling` true, peel
+-- back complete branches ending at new vertices: the construction makes
+-- its own entrance and internal track. Removing only the outermost links
+-- leaves duplicate track inside a branched depot (Steam 40408). Existing
+-- nodes and splits anchor the external network and are never peeled off.
 function networkInto(proposal, network, templateName, style, polyline, dangling)
-	local degree = {}
-	for _, link in ipairs(polyline.links) do
-		degree[link.from] = (degree[link.from] or 0) + 1
-		degree[link.to] = (degree[link.to] or 0) + 1
-	end
-	local function loose(i) return polyline.vertices[i + 1].resolve == "New" and degree[i] == 1 end
-	local links = {}
-	for _, link in ipairs(polyline.links) do
-		if not (dangling and (loose(link.from) or loose(link.to))) then links[#links + 1] = link end
-	end
-	local skipped = {}
+	local links, skipped = polyline.links, {}
 	if dangling then
-		for i = 0, #polyline.vertices - 1 do skipped[i + 1] = loose(i) end
+		local degree, incident = {}, {}
+		for i = 0, #polyline.vertices - 1 do degree[i], incident[i] = 0, {} end
+		for k, link in ipairs(links) do
+			for _, i in ipairs({ link.from, link.to }) do
+				degree[i] = degree[i] + 1
+				incident[i][#incident[i] + 1] = k
+			end
+		end
+		local function loose(i) return polyline.vertices[i + 1].resolve == "New" and degree[i] == 1 end
+		local queue, removed = {}, {}
+		for i = 0, #polyline.vertices - 1 do if loose(i) then queue[#queue + 1] = i end end
+		local head = 1
+		while head <= #queue do
+			local i = queue[head]
+			head = head + 1
+			for _, k in ipairs(incident[i]) do
+				if not removed[k] then
+					removed[k] = true
+					local link = links[k]
+					local other = link.from == i and link.to or link.from
+					degree[i], degree[other] = degree[i] - 1, degree[other] - 1
+					if loose(other) then queue[#queue + 1] = other end
+				end
+			end
+		end
+		links = {}
+		for k, link in ipairs(polyline.links) do if not removed[k] then links[#links + 1] = link end end
+		for i, v in ipairs(polyline.vertices) do skipped[i] = v.resolve == "New" and degree[i - 1] == 0 end
 	end
 	polyline = { vertices = polyline.vertices, links = links, removals = polyline.removals,
 		removed_nodes = polyline.removed_nodes }
@@ -514,19 +563,56 @@ function networkInto(proposal, network, templateName, style, polyline, dangling)
 		-- The build's own kind, or the kind the link names.
 		local kind = link.kind or { network = network, template = templateName, style = style }
 		local t = template(kind.template)
-		s.comp.laneConfigs = t.laneConfigs
+		s.comp.laneConfigs = lanesFor(link, t)
 		s.comp.roadTemplate = kind.template
 		s.comp.roadStyle = kind.style or t.streetStyle
 		s.comp.roadType = kind.network == "Track" and enum("RoadType").TRACK or enum("RoadType").STREET
+		-- What the tool left on it: its decorations (by name, as every game
+		-- numbers them), the towns' lock, and the acting company's ownership.
+		local decorations = {}
+		for _, d in ipairs(link.decorations or {}) do
+			decorations[#decorations + 1] = { find("edgeDecorationRep", d.name), d.flag == true }
+		end
+		s.comp.edgeDecorations = decorations
+		s.comp.roadDevelopmentLocked = link.locked == true
+		if link.owned == true then
+			local ok = pcall(function() s.playerOwned.player = company() end)
+			if not ok then
+				local owned = api.type.PlayerOwned.new()
+				owned.player = company()
+				s.playerOwned = owned
+			end
+		end
 	end
 
+	-- An edge removed with its stops or signals leaves them pointing
+	-- nowhere: on TPF2 that crashed every game at the same step
+	-- (docs/BUILDING.md). So one with any is removed only where a link
+	-- rebuilds it in place, between the same places in the same direction,
+	-- which takes its objects under their own entities (as the capture
+	-- demands, tpf3mp/engine.lua keptInPlace).
+	local taken = {}
+	local function sameAt(a, b)
+		return math.abs(a[1] - b[1]) < 0.05 and math.abs(a[2] - b[2]) < 0.05 and math.abs(a[3] - b[3]) < 0.05
+	end
 	for k, r in ipairs(polyline.removals or {}) do
 		local e = edgeBetween(nodes(r.network), r.network, arr(r.ends.a), arr(r.ends.b))
 		if e == nil then error("no " .. r.network .. " edge to remove (" .. k .. ")") end
-		-- An edge removed with its stops or signals leaves them pointing
-		-- nowhere: on TPF2 that crashed every game at the same step
-		-- (docs/BUILDING.md). The room does not carry them yet.
-		if #(e.comp.objects or {}) > 0 then error("removal " .. k .. " has a stop or signal on it") end
+		local objects = e.comp.objects or {}
+		if #objects > 0 then
+			local into
+			for j, link in ipairs(polyline.links) do
+				if not taken[j] and sameAt(at[link.from + 1], e.a) and sameAt(at[link.to + 1], e.b) then
+					into = j
+					break
+				end
+			end
+			if into == nil then error("removal " .. k .. " has a stop or signal on it and no link rebuilds it") end
+			taken[into] = true
+			local kept = {}
+			for i, o in ipairs(objects) do kept[i] = { o[1], o[2] } end
+			links[into].comp.objects = kept
+		end
 		removeEdge(e)
 	end
 
@@ -542,8 +628,9 @@ function networkInto(proposal, network, templateName, style, polyline, dangling)
 	-- and the game cannot read a proposal that removes an edge a
 	-- configuration still names (build 40408: "Unknown exception" from
 	-- makeProposalData). So the configurations at the ends of the removed
-	-- edges go too, and the game makes new ones; a node removed takes its
-	-- own with it, and may not be named for both.
+	-- edges go too. junctions.into below adds their settings back with the
+	-- replacement edges; a removed node takes its own configuration with it
+	-- and may not be named for both.
 	local configsToRemove = {}
 	for _, node in ipairs(ends) do
 		if not removedNode[node]
@@ -557,6 +644,7 @@ function networkInto(proposal, network, templateName, style, polyline, dangling)
 	proposal.streetProposal.edgesToRemove = edgesToRemove
 	if #nodesToRemove > 0 then proposal.streetProposal.nodesToRemove = nodesToRemove end
 	if #configsToRemove > 0 then proposal.streetProposal.nodeConfigsToRemove = configsToRemove end
+	junctions.into(proposal, polyline.junctions, ends, mine)
 
 	-- What is sent, in the log before it goes: an exception from the game
 	-- does not always come back through pcall.
@@ -577,14 +665,25 @@ end
 local function buildNetwork(network, templateName, style, polyline)
 	local proposal = api.type.SimpleProposal.new()
 	networkInto(proposal, network, templateName, style, polyline)
-	-- Paid by the player, as the tool builds.
+	-- Paid by the player, as the tool builds; the town buildings in the way
+	-- cleared, as the tool clears them (the capture lets only those through).
 	local context = api.type.Context.new()
 	context.player = company()
+	context.gatherBuildings = true
 	return buildProposal(proposal, context)
 end
 
 function HANDLERS.BuildRoad(road)
 	return buildNetwork("Street", road.street, road.style, road.polyline)
+end
+
+function HANDLERS.EditJunctions(edit)
+	junctions.requireEnabled()
+	local proposal = api.type.SimpleProposal.new()
+	junctions.into(proposal, edit.changes, {}, mine)
+	local context = api.type.Context.new()
+	context.player = company()
+	return buildProposal(proposal, context)
 end
 
 -- The bulldozer's removals, as the game makes them itself: a construction
@@ -687,17 +786,22 @@ function HANDLERS.PlaceStop(stop)
 	local t, d = geom.hermiteTangent(e.a, e.ta, e.b, e.tb, u), stop.direction
 	if t[1] * d.x + t[2] * d.y + t[3] * d.z < 0 then left = not left end
 	local types = enum("EdgeObjectType")
+	local isStop = stop.object == nil or stop.object == "Stop"
+	local function typeOf(l)
+		if not isStop then return types.SIGNAL end
+		return l and types.STOP_LEFT or types.STOP_RIGHT
+	end
 	-- The sides it takes: one, or both for a two-sided stop, the
 	-- originator's first side first, as its tool added them.
 	local sides = { left }
-	if stop.two_sided == true then sides[2] = not left end
+	if isStop and stop.two_sided == true then sides[2] = not left end
 	-- One stop a side: a second is a fatal assert in the game's lane
-	-- creation (TPF2, docs/BUILDING.md).
+	-- creation (TPF2, docs/BUILDING.md). Signals are not by side.
 	local objects = {}
 	for i, o in ipairs(e.comp.objects or {}) do
-		for _, l in ipairs(sides) do
-			if o[2] == (l and types.STOP_LEFT or types.STOP_RIGHT) then
-				error("the edge has a stop on that side already", 0)
+		if isStop then
+			for _, l in ipairs(sides) do
+				if o[2] == typeOf(l) then error("the edge has a stop on that side already", 0) end
 			end
 		end
 		objects[i] = { o[1], o[2] }
@@ -708,12 +812,12 @@ function HANDLERS.PlaceStop(stop)
 		-- from -400000000 down (build 40408: con_util_entity_index.h
 		-- asserts the range, a fatal error; game_mechanics/towns/
 		-- town_util.tl; the stop tool's own proposals).
-		objects[#objects + 1] = { NEW_EDGE_OBJECT - (k - 1), l and types.STOP_LEFT or types.STOP_RIGHT }
+		objects[#objects + 1] = { NEW_EDGE_OBJECT - (k - 1), typeOf(l) }
 		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
 		eo.edgeEntity = -1
 		eo.param = u
 		eo.left = l
-		eo.oneWay = false
+		eo.oneWay = stop.one_way == true
 		eo.model = stop.model
 		eo.playerEntity = company()
 		eo.name = ""
@@ -767,6 +871,7 @@ end
 local registry = module("registry")
 local companiesModule = module("companies")
 require_companies = function() return companiesModule end
+local progressionModule = module("progression")
 
 local function entityOf(ctx, kind, id)
 	local e = registry.entity(ctx and ctx.registry, kind, id)
@@ -951,6 +1056,8 @@ function HANDLERS.VehicleOp(op, ctx)
 		return run(api.cmd.makeVehicleReverseCmd(vehicle))
 	elseif change == "Depart" then
 		return run(api.cmd.makeVehicleTryToDepartCmd(vehicle))
+	elseif type(change) == "table" and change.ManualDeparture ~= nil then
+		return run(api.cmd.makeVehicleSetManualDepartureCmd(vehicle, change.ManualDeparture == true))
 	end
 	return false, "a vehicle change of no kind"
 end
@@ -958,13 +1065,21 @@ end
 -- The game's load modes, by the schema's names, as numbers.
 local LOAD_MODES = { LoadIfAvailable = 0, FullLoadAny = 1, FullLoadAll = 2, LegacyUnloadOnly = 3 }
 
--- A LineData as the game's Line component.
+-- A LineData as the game's Line component. Each stop is at a station the
+-- acting company may use (tpf3mp/companies.lua, mayUse): no company's, its
+-- own, or another company's that keeps its stations open (DECISIONS.md, D22,
+-- proposed). The game itself stops a line anywhere (build 40408: no owner
+-- check on a line's stops); its line manager offers only the player's own
+-- stations, which the GUI lifts for open ones (gui/tpf3mp/tpf3mp.script.lua).
 local function lineComponent(data, ctx)
 	local line = api.type.Line.new()
 	local stops = {}
 	for i, s in ipairs(data.stops) do
 		local stop = api.type.Line.Stop.new()
-		stop.stationGroup = entityOf(ctx, "groups", s.group)
+		local group = entityOf(ctx, "groups", s.group)
+		local usable, why = companiesModule.mayUse(ctx and ctx.roster, company(), group, api)
+		if not usable then error("stop " .. i .. ": " .. why, 0) end
+		stop.stationGroup = group
 		stop.station = s.terminal.station
 		stop.terminal = s.terminal.terminal
 		local alternatives = {}
@@ -1096,18 +1211,55 @@ function HANDLERS.Prospect(p, ctx)
 end
 
 -- The room's companies (tpf3mp/companies.lua): the acting player founds,
--- joins, renames, recolours or dissolves one, in `ctx.roster`.
+-- joins, renames, recolours or dissolves one, and its head locks it, sends a
+-- player out or shares its stations, in `ctx.roster`; `ctx.seal` is the
+-- room's seal of a password sent with it.
 function HANDLERS.CompanyOp(op, ctx)
 	if not (ctx and ctx.roster and ctx.player) then return false, "no roster to change" end
-	local ok, why = companiesModule.run(ctx.roster, ctx.player, op, send, api)
+	local ok, why = companiesModule.run(ctx.roster, ctx.player, op, send, api, ctx.seal)
 	if not ok then return false, why end
 	return true
+end
+
+-- Taking a company rank (tpf3mp/progression.lua). With one company in the
+-- room, the company growth script's own event, as the company window sends
+-- it: the game keeps that company's rank, and checks the rank is reached.
+-- With more, the acting company's rank in the mod's state, when it reached
+-- it; the save's own player also takes it in the game's own state, so its
+-- rank stays when the room is one company again.
+function HANDLERS.ApplyRank(r, ctx)
+	local level = tonumber(r.level)
+	if level == nil then return false, "a rank is a number" end
+	local roster = ctx and ctx.roster
+	local event = function()
+		return api.cmd.makeScriptingSendEventCmd("", "Companies", "applyLevel", { level = level })
+	end
+	if progressionModule.multi(roster) then
+		local ok, why = progressionModule.take(ctx.progression, roster, company(), level)
+		if not ok then return false, why end
+		if company() == api.engine.util.getPlayer() then send(event()) end
+		return true
+	end
+	if company() ~= api.engine.util.getPlayer() then
+		return false, "only the room's first company has the game's own rank"
+	end
+	-- The game ignores a rank not reached; this says why, where it can read it.
+	local game = progressionModule.game(api)
+	local read, own = pcall(function() return game and game.own(company()) end)
+	if read and type(own) == "table" and type(own.level) == "number" and type(own.potentialLevel) == "number" then
+		if level <= own.level then return false, "the company has rank " .. own.level .. " already" end
+		if level > own.potentialLevel then
+			return false, "the company has reached rank " .. own.potentialLevel .. ", not " .. level
+		end
+	end
+	return run(event())
 end
 
 -- Runs one action. `ctx` is { registry = } (tpf3mp/registry.lua), for the
 -- actions that name vehicles, lines and station groups; with companies, also
 -- `roster`, `player` (who sent it) and `company` (their company's player
--- entity), which the action is booked to. Returns true, nil
+-- entity), which the action is booked to, and `progression`, the companies'
+-- ranks (tpf3mp/progression.lua). Returns true, nil
 -- and the entity it made or changed (for the kinds in CREATES and KEEPS,
 -- where the game said), or false and why not; never raises.
 function apply.run(action, ctx)

@@ -54,6 +54,71 @@ mod windows {
     }
 }
 
+/// Tells the launcher, which keeps the game suspended meanwhile, that the
+/// hook has armed what must be in place before the game runs (the main
+/// menu's entry): it sets the event `tpf3mp_ipc::hook_ready_event` names
+/// for this process. Set once, by [`Ready::signal`] or when dropped, so
+/// every way out of the bootstrap lets the game run.
+pub(crate) struct Ready {
+    signalled: bool,
+}
+
+impl Ready {
+    pub(crate) fn new() -> Self {
+        Self { signalled: false }
+    }
+
+    /// Lets the game run, and says so in the hook's log.
+    pub(crate) fn signal(mut self, log: &mut crate::Logger) {
+        let told = self.set();
+        log.line(if told {
+            "told the launcher the hook is ready: the game runs from here"
+        } else {
+            "no launcher waits for the hook to be ready (no event)"
+        });
+    }
+
+    fn set(&mut self) -> bool {
+        if std::mem::replace(&mut self.signalled, true) {
+            return false;
+        }
+        set_ready_event()
+    }
+}
+
+impl Drop for Ready {
+    fn drop(&mut self) {
+        let _ = self.set();
+    }
+}
+
+/// Sets this process's ready event, if a launcher made one.
+#[cfg(windows)]
+fn set_ready_event() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    let name: Vec<u16> = tpf3mp_ipc::hook_ready_event(std::process::id())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: a NUL-terminated name; the handle, if any, is closed here.
+    unsafe {
+        let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if event.is_null() {
+            return false;
+        }
+        let set = SetEvent(event) != 0;
+        CloseHandle(event);
+        set
+    }
+}
+
+/// No launcher waits on other systems: the game is not started suspended.
+#[cfg(not(windows))]
+fn set_ready_event() -> bool {
+    false
+}
+
 #[cfg(unix)]
 mod unix {
     /// A load-time constructor: on Linux, as `LD_PRELOAD` loads the hook

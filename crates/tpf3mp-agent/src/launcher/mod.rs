@@ -40,8 +40,8 @@ use tpf3mp_proto::{
 use tracing::{info, warn};
 
 pub use self::api::{
-    Action, ChatLine, Connection, Differences, Game, InstalledGame, Member, MemberContent, Phase,
-    Room, RulesChoice, State, World,
+    Action, ChatLine, Connection, Differences, Game, InstalledGame, Member, MemberContent,
+    ModClass, ModHave, ModRow, Phase, Room, RoomModRow, RulesChoice, State, World,
 };
 use self::{api::View, http::Page, lobby::IdleLink};
 use crate::{
@@ -62,6 +62,12 @@ const GAME_POLL: Duration = Duration::from_millis(500);
 /// How often the launcher's lobby is worked out for the game's window and
 /// the game's link served while no room session holds it.
 const LOBBY_TICK: Duration = Duration::from_millis(100);
+/// How often the player's saves are looked at again, for the game's window
+/// to offer as a room's start save.
+const SAVES_TICK: Duration = Duration::from_secs(5);
+/// How long the launcher watches a game link it finds already made for
+/// another launcher's heartbeat, before taking it.
+const LINK_HELD_WAIT: Duration = Duration::from_millis(350);
 
 /// What a launcher needs.
 #[derive(Debug, Clone)]
@@ -73,13 +79,20 @@ pub struct LauncherConfig {
     /// Where the server and name of each connection are remembered for the
     /// next run (see [`Remembered`]).
     pub remember: Option<PathBuf>,
-    /// The server the page offers first, as `host:port`.
+    /// The server the launcher plays on, as `host:port`: the one on its
+    /// command line, else the player's setting, else
+    /// [`Self::default_server`].
     pub server: Option<String>,
-    /// Whether [`Self::server`] is the only server this launcher plays on
-    /// (D12): the one its package was built for, or the one it was told
-    /// on its command line. Then neither the player nor an invite can
-    /// choose another.
+    /// Whether [`Self::server`] is the server this launcher plays on (D12,
+    /// as amended): an invite then never takes the player to another, and
+    /// only the player's server setting ([`Action::SetServer`]) changes it.
+    /// Without, as in a test or a build with no server at all, the player
+    /// types one and an invite may name its own.
     pub server_fixed: bool,
+    /// The launcher's default server, `host:port`: the one its package was
+    /// built for, or the project's relay. The server setting's "Reset to
+    /// default" goes back to it.
+    pub default_server: Option<String>,
     /// What players see of that server, such as `EU`, in place of its
     /// address.
     pub server_name: Option<String>,
@@ -88,8 +101,16 @@ pub struct LauncherConfig {
     pub identity: Arc<Identity>,
     /// The name the page offers first.
     pub name: String,
-    /// What this player's game runs, declared on every connection.
+    /// What this player's game runs, declared on every connection: the
+    /// build and the shared mods (`crate::content::split`).
     pub content: ContentManifest,
+    /// This player's mods for the room's worlds, shared and personal, when
+    /// it listed them (`BridgeOptions::mods`).
+    pub mods: Option<tpf3mp_bridge::ModLists>,
+    /// The player's installed mods and those they chose, when the launcher
+    /// found them itself (no `--mods`): `content` and `mods` then follow
+    /// them and the room (`crate::picker`; docs/MODS.md).
+    pub picker: Option<crate::picker::Mods>,
     /// Transport Fever 3 as Steam installed it, if it did.
     pub installed: Option<crate::steam::Installed>,
     /// The shared-memory link the game's hook opens.
@@ -214,6 +235,8 @@ impl LauncherHandle {
 
     /// What the launcher shows now.
     pub fn state(&self) -> State {
+        // A room session's bridge may have learned the room's mods.
+        self.shared.show_mods();
         api::snapshot(&self.shared.view(), &self.shared.status())
     }
 }
@@ -234,6 +257,8 @@ pub(crate) struct Shared {
     actions: mpsc::Sender<(Action, oneshot::Sender<Result<(), String>>)>,
     /// The bridges' ends of the game window's lobby.
     lobby: LobbyLink,
+    /// The player's mods, when the launcher found them itself.
+    picker: Option<Arc<Mutex<crate::picker::Mods>>>,
 }
 
 impl Shared {
@@ -245,11 +270,17 @@ impl Shared {
             view: Mutex::new(View {
                 server: config.server.clone(),
                 server_fixed: config.server_fixed,
+                server_default: config.default_server.clone(),
                 server_name: config.server_name.clone(),
                 name: config.name.clone(),
+                banner: config
+                    .remember
+                    .as_deref()
+                    .and_then(|file| Remembered::load(file).banner),
                 player: Some(config.identity.player()),
                 installed: config.installed.clone(),
                 diagnostics: config.diagnostics.as_ref().map(|recorder| recorder.is_on()),
+                start_save: config.start_save.as_deref().and_then(save_name),
                 ..View::default()
             }),
             status: SharedStatus::default(),
@@ -258,7 +289,9 @@ impl Shared {
                 views: views_rx,
                 actions: lobby_actions,
             },
+            picker: config.picker.clone().map(|mods| Arc::new(Mutex::new(mods))),
         });
+        shared.show_mods();
         let lobby = LobbyEnds {
             views,
             actions: lobby_rx,
@@ -272,6 +305,50 @@ impl Shared {
 
     fn status(&self) -> std::sync::MutexGuard<'_, Status> {
         self.status.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The picker's mods, locked, if the launcher found them itself.
+    fn picker(&self) -> Option<std::sync::MutexGuard<'_, crate::picker::Mods>> {
+        self.picker
+            .as_ref()
+            .map(|mods| mods.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// What the picker declares now; the build alone without a picker.
+    fn content_of_picker(&self) -> ContentManifest {
+        self.picker().map_or_else(
+            || ContentManifest::new(Text::lossy(""), Vec::new()),
+            |mods| mods.manifest(),
+        )
+    }
+
+    /// What this player declares to the room now.
+    fn content(&self, config: &LauncherConfig) -> ContentManifest {
+        self.picker()
+            .map_or_else(|| config.content.clone(), |mods| mods.manifest())
+    }
+
+    /// Puts the picker's mods in the view.
+    fn show_mods(&self) {
+        let rows = self.picker().map(|mods| api::mod_rows(&mods));
+        if let Some((mods, room_mods)) = rows {
+            let mut view = self.view();
+            view.mods = mods;
+            view.room_mods = room_mods;
+        }
+    }
+
+    /// The picker as a room session asks it.
+    fn picker_link(&self) -> Option<bridge::PickerLink> {
+        let lists = Arc::clone(self.picker.as_ref()?);
+        let learning = Arc::clone(&lists);
+        Some(bridge::PickerLink {
+            lists: Arc::new(move || lists.lock().unwrap_or_else(PoisonError::into_inner).lists()),
+            learn: Arc::new(move |diff| {
+                let mut mods = learning.lock().unwrap_or_else(PoisonError::into_inner);
+                mods.learn(diff).then(|| mods.manifest())
+            }),
+        })
     }
 }
 
@@ -297,12 +374,26 @@ type SessionEnded = (
     Option<String>,
 );
 
+/// What the launcher's window says once it started the game: for its own
+/// window only, not the game's (`lobby::view` leaves it out).
+pub(crate) const GAME_STARTED: &str = "started Transport Fever 3 with TPF3-MP; its main menu has a Multiplayer entry, and it joins the room once it has loaded";
+
 /// The game's link, served by the launcher while no room session holds it.
 type Idle = Option<IdleLink<tpf3mp_ipc::Link>>;
 
 /// Opens the link the game's hook attaches to (D11: the launcher names it in
 /// the game's environment), as a new generation.
 fn open_link(config: &LauncherConfig) -> Result<IdleLink<tpf3mp_ipc::Link>, String> {
+    // Another launcher running with the same link would lose its game to
+    // this one, and each game would show the other launcher's lobby.
+    if let Some(pid) = tpf3mp_ipc::Link::held_by_another_agent(&config.link, LINK_HELD_WAIT) {
+        let message = format!(
+            "another TPF3-MP launcher (process {pid}) uses the game link {}: start this launcher with its own --game-link, or close the other",
+            config.link
+        );
+        warn!(%message);
+        return Err(message);
+    }
     tpf3mp_ipc::Link::create(
         &tpf3mp_ipc::Config::new(&config.link),
         tpf3mp_ipc::Role::Agent,
@@ -326,12 +417,24 @@ async fn control(
     // before a room is chosen, and its menu's window talks to the launcher
     // over it (D17).
     let mut idle: Idle = open_link(&config)
-        .inspect_err(|error| warn!(%error, "the game's link opens with the first room instead"))
+        .inspect_err(|error| {
+            warn!(%error, "the game's link opens with the first room instead");
+            // Said in the window too: two launchers on one link cross.
+            shared.view().error = Some(error.clone());
+        })
         .ok();
     let mut tick = tokio::time::interval(LOBBY_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut saves_tick = tokio::time::interval(SAVES_TICK);
+    saves_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = saves_tick.tick() => {
+                let saves = tokio::task::spawn_blocking(crate::steam::list_saves)
+                    .await
+                    .unwrap_or_default();
+                shared.view().saves = saves;
+            }
             action = actions.recv() => {
                 let Some((action, reply)) = action else {
                     return;
@@ -344,6 +447,7 @@ async fn control(
                 lobby_act(&shared, &config, asked, &mut connected, &mut session, &mut game, &mut idle).await;
             }
             _ = tick.tick() => {
+                shared.show_mods();
                 let view = lobby::view(&api::snapshot(&shared.view(), &shared.status()));
                 lobby.views.send_if_modified(|told| {
                     let changed = *told != view;
@@ -408,8 +512,12 @@ async fn control(
                 }
                 // Back to the server, ready for the next room.
                 if let Some(finished) = finished {
+                    if let Some(mut mods) = shared.picker() {
+                        mods.forget_room();
+                    }
+                    shared.show_mods();
                     connected =
-                        reconnect(&shared, finished.options, config.content.clone()).await;
+                        reconnect(&shared, finished.options, shared.content(&config)).await;
                 }
             }
             () = game_exit(&mut game) => {
@@ -482,8 +590,12 @@ fn action_kind(action: &Action) -> &'static str {
         Action::Kick { .. } => "kick",
         Action::Chat { .. } => "chat",
         Action::Leave => "leave",
+        Action::ChooseMod { .. } => "choose_mod",
         Action::Diagnostics { .. } => "diagnostics",
         Action::LaunchGame => "launch_game",
+        Action::ListRooms { .. } => "list_rooms",
+        Action::SetServer { .. } => "set_server",
+        Action::SetBanner { .. } => "set_banner",
     }
 }
 
@@ -502,7 +614,7 @@ async fn act(
             // A whole invite, as "Copy invite" gives it, connects and joins;
             // one to another server is refused, in a room or not.
             let passed = passed_invite(&server);
-            let server = server_for(fixed_server(config), &server, passed.as_ref())?;
+            let server = server_for(fixed_server(shared).as_deref(), &server, passed.as_ref())?;
             if session.is_some() {
                 return Err("leave the room first".into());
             }
@@ -548,12 +660,34 @@ async fn act(
             max_players,
             password,
             rules,
+            start_save,
+            listing,
+            competitive,
         } => {
             let current = connected.as_ref().ok_or("connect to a server first")?;
             let rules = match rules.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(name) => Some(Text::new(name).map_err(|_| "no such rules".to_owned())?),
             };
+            // Before the room exists: a save that cannot be found creates
+            // no room.
+            let listed = shared.view().saves.clone();
+            let start_world = start_world(
+                start_save.as_deref(),
+                &listed,
+                config.start_save.as_ref(),
+                crate::steam::find_save,
+            )?;
+            // The room's shared mods are the start save's, less this
+            // player's personal ones: declared before the room exists, so
+            // the room compares every guest's with them (docs/MODS.md).
+            if let Some(manifest) = own_start(shared, start_world.as_deref()) {
+                current
+                    .client
+                    .declare_content(manifest)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             let create = CreateRoom {
                 name: Text::new(room.trim())
                     .map_err(|_| "that room name is too long".to_owned())?,
@@ -561,6 +695,14 @@ async fn act(
                 password: password_text(password)?,
                 settings: config.room_settings,
                 rules,
+                // A public room starts with one company, the save's own
+                // (D21); its owner says when there are more.
+                listing: listing.map(|listing| tpf3mp_proto::RoomListing {
+                    map: Text::lossy(listing.map.trim()),
+                    year: listing.year,
+                    companies: 1,
+                }),
+                competitive,
             };
             let (invite, room) = current
                 .client
@@ -568,6 +710,10 @@ async fn act(
                 .await
                 .map_err(|error| error.to_string())?;
             shared.status().room = Some(room);
+            if let Some(picked) = start_save.filter(|picked| !picked.trim().is_empty()) {
+                // Offered first next time.
+                shared.view().start_save = Some(picked.trim().to_owned());
+            }
             begin_session(
                 shared,
                 config,
@@ -576,15 +722,16 @@ async fn act(
                 idle,
                 invite,
                 create.password,
+                start_world,
             )
         }
         Action::Join { invite, password } => {
             let passed = passed_invite(&invite).ok_or("that is not an invite")?;
             // An invite to another server is refused, connected or not.
-            if let (Some(fixed), Some(other)) = (fixed_server(config), &passed.server)
-                && !same_server(fixed, other)
+            if let (Some(fixed), Some(other)) = (fixed_server(shared), &passed.server)
+                && !same_server(&fixed, other)
             {
-                return Err(elsewhere(fixed, other));
+                return Err(elsewhere(&fixed, other));
             }
             let current = connected.as_ref().ok_or("connect to a server first")?;
             let password = password_text(password)?;
@@ -623,6 +770,71 @@ async fn act(
         }
         Action::Leave => forward(session, Control::Leave).await,
         Action::LaunchGame => launch_game(shared, config, session, game, idle),
+        Action::ChooseMod { id, chosen } => {
+            let chosen_now = {
+                let mut mods = shared
+                    .picker()
+                    .ok_or("this launcher takes its mods from --mods")?;
+                mods.choose(&id, chosen)?;
+                mods.chosen()
+            };
+            shared.show_mods();
+            if let Some(file) = &config.remember {
+                let mut remembered = Remembered::load(file);
+                remembered.mods = Some(chosen_now);
+                if let Err(error) = remembered.save(file) {
+                    warn!(%error, "cannot remember the mods chosen for next time");
+                }
+            }
+            info!(id, chosen, "a mod chosen");
+            if session.is_some() {
+                shared
+                    .status()
+                    .notice("the mods you choose now load with the room's next world".to_owned());
+            }
+            Ok(())
+        }
+        Action::ListRooms { page } => {
+            let current = connected.as_ref().ok_or("connect to a server first")?;
+            let page = current
+                .client
+                .list_rooms(page)
+                .await
+                .map_err(|error| error.to_string())?;
+            shared.view().rooms = Some(api::RoomList::of(&page));
+            Ok(())
+        }
+        Action::SetBanner { banner } => {
+            let banner = banner
+                .map(|id| id.trim().to_owned())
+                .filter(|id| !id.is_empty());
+            let id = match &banner {
+                Some(id) if tpf3mp_proto::is_banner(id) => Some(Text::lossy(id)),
+                Some(_) => return Err("there is no such banner".into()),
+                None => None,
+            };
+            shared.view().banner.clone_from(&banner);
+            if let Some(file) = &config.remember {
+                let mut remembered = Remembered::load(file);
+                remembered.banner = banner;
+                if let Err(error) = remembered.save(file) {
+                    warn!(%error, "cannot remember the banner for next time");
+                }
+            }
+            match (session.as_ref(), connected.as_ref()) {
+                (Some(_), _) => forward(session, bridge::Control::Banner(id)).await,
+                (None, Some(current)) => current
+                    .client
+                    .request(tpf3mp_proto::Request::SetBanner(id))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                (None, None) => Ok(()),
+            }
+        }
+        Action::SetServer { server } => {
+            set_server(shared, config, &server, connected, session).await
+        }
         Action::Diagnostics { on } => {
             let recorder = config
                 .diagnostics
@@ -713,14 +925,44 @@ fn launch_game(
     .map_err(|error| error.to_string())?;
     info!(pid = started.pid, "started the game with the hook");
     *game = Some(started);
-    shared.status().notice(
-        "started Transport Fever 3 with TPF3-MP; its main menu has a Multiplayer entry, and it joins the room once it has loaded",
-    );
+    shared.status().notice(GAME_STARTED);
     Ok(())
 }
 
+/// The save a room this player creates starts from: the one `picked` names,
+/// which must be one of the player's `listed` saves (a name, never a path:
+/// the game's window names it), none when `picked` is empty, and the
+/// launcher's own `default` when nothing was picked.
+fn start_world(
+    picked: Option<&str>,
+    listed: &[String],
+    default: Option<&PathBuf>,
+    find: impl Fn(&str) -> Result<PathBuf, String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(picked) = picked.map(str::trim) else {
+        return Ok(default.cloned());
+    };
+    if picked.is_empty() {
+        return Ok(None);
+    }
+    if !listed.iter().any(|name| name == picked) {
+        return Err(format!("there is no save {picked} in your save folder"));
+    }
+    find(picked).map(Some)
+}
+
+/// A save's name, as the game's save list shows it: its file name without
+/// `.sav`.
+fn save_name(file: &Path) -> Option<String> {
+    file.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+}
+
 /// Hands the connection to a bridge, which runs the room from its lobby to
-/// the end of its game, and plays it through the game's hook.
+/// the end of its game, and plays it through the game's hook. A room this
+/// player owns starts from `start_world`, if it names a save.
+#[allow(clippy::too_many_arguments)]
 fn begin_session(
     shared: &Arc<Shared>,
     config: &LauncherConfig,
@@ -729,6 +971,7 @@ fn begin_session(
     idle: &mut Idle,
     invite: Invite,
     password: Option<Text<64>>,
+    start_world: Option<PathBuf>,
 ) -> Result<(), String> {
     let Connected {
         client,
@@ -760,14 +1003,16 @@ fn begin_session(
         status: Some(Arc::clone(&shared.status)),
         lobby: Some(shared.lobby.clone()),
         // A room this player created starts from the save named for it.
-        start_world: config.start_save.clone().filter(|_| owned),
+        start_world: start_world.filter(|_| owned),
+        mods: config.mods.clone(),
+        picker: shared.picker_link(),
         ..BridgeOptions::default()
     };
     let rejoin = Rejoin {
         options: options.clone(),
         invite,
         password,
-        content: Some(config.content.clone()),
+        content: Some(shared.content(config)),
         give_up_after: REJOIN_PATIENCE,
     };
     let task = tokio::spawn(async move {
@@ -784,7 +1029,7 @@ fn begin_session(
         // With a server of its own, the code is all friends need; otherwise
         // they need the server too, and "Copy invite" gives both.
         view.invite = Some(match &view.server {
-            Some(server) if fixed_server(config).is_none() => format!("{server} {invite}"),
+            Some(server) if !view.server_fixed => format!("{server} {invite}"),
             _ => invite.to_string(),
         });
         view.in_room = true;
@@ -863,7 +1108,7 @@ async fn connect_to(
     let result = match connect(options.clone()).await {
         // What the game runs goes with every connection, so rooms can
         // compare it and say how it differs.
-        Ok((client, events)) => match client.declare_content(config.content.clone()).await {
+        Ok((client, events)) => match client.declare_content(shared.content(config)).await {
             Ok(()) => Ok((client, events)),
             Err(error) => Err(error.to_string()),
         },
@@ -900,22 +1145,152 @@ async fn connect_to(
     Ok(())
 }
 
+/// With the picker, the room this player creates starts from `save`: its
+/// mods, less this player's personal ones, become the room's shared mods.
+/// Returns what to declare, or `None` without the picker. A save whose mods
+/// cannot be read leaves the room's unknown: its worlds load with the save's
+/// own mods, as without the picker, and the player is told.
+fn own_start(shared: &Shared, save: Option<&Path>) -> Option<ContentManifest> {
+    let read = save.map(tpf3mp_modscan::save::mods);
+    let mut mods = shared.picker()?;
+    match read {
+        Some(Ok(listed)) => {
+            info!(
+                mods = listed.len(),
+                "the room's shared mods come from its start save"
+            );
+            mods.own_start(&listed);
+        }
+        Some(Err(why)) => {
+            warn!(%why, "the start save's mods do not read");
+            mods.forget_room();
+            drop(mods);
+            shared.status().notice(format!(
+                "the start save's mods could not be read ({why}): everyone loads its own list of mods"
+            ));
+            shared.show_mods();
+            return Some(shared.content_of_picker());
+        }
+        None => mods.forget_room(),
+    }
+    let manifest = mods.manifest();
+    drop(mods);
+    shared.show_mods();
+    Some(manifest)
+}
+
+/// The player's server setting (D12, as amended): play on `typed`, or on
+/// the launcher's default when it is empty. Refused in a room, and for
+/// anything but a `host:port`. Remembered for the next run; a connected
+/// launcher leaves its server and connects to the new one, under the same
+/// name.
+async fn set_server(
+    shared: &Arc<Shared>,
+    config: &LauncherConfig,
+    typed: &str,
+    connected: &mut Option<Connected>,
+    session: &Option<Session>,
+) -> Result<(), String> {
+    if session.is_some() {
+        return Err("leave the room first: the server changes between rooms".into());
+    }
+    let default = config.default_server.clone();
+    // The default typed out is the default: the setting then follows it.
+    let chosen = match typed.trim() {
+        "" => None,
+        typed => Some(server_address(typed)?)
+            .filter(|chosen| !default.as_deref().is_some_and(|d| same_server(d, chosen))),
+    };
+    let server = chosen
+        .clone()
+        .or(default)
+        .ok_or("this launcher has no default server: type one")?;
+    if let Some(file) = &config.remember {
+        let mut remembered = Remembered::load(file);
+        remembered.chosen_server.clone_from(&chosen);
+        if let Err(error) = remembered.save(file) {
+            warn!(%error, "cannot remember the server for next time");
+        }
+    }
+    let was_connected = connected.is_some();
+    if let Some(connected) = connected.take() {
+        connected.client.close().await;
+    }
+    let name = {
+        let mut view = shared.view();
+        view.server = Some(server.clone());
+        view.server_fixed = true;
+        view.connected = false;
+        view.rooms = None;
+        view.server_version = None;
+        view.session = None;
+        view.name.clone()
+    };
+    info!(%server, chosen = chosen.is_some(), "the player set the server");
+    if was_connected {
+        let name = Text::new(name.trim()).map_err(|_| "that name is too long".to_owned())?;
+        connect_to(shared, config, connected, &server, name).await?;
+    }
+    Ok(())
+}
+
+/// A server as the player typed it for the setting, as `host:port`: the
+/// host a name or an IPv4 address, or an IPv6 address in brackets, and a
+/// port from 1. Trimmed; or why it is not one.
+pub fn server_address(typed: &str) -> Result<String, String> {
+    const HOW: &str = "the server must be host:port, such as tpf3mp.example.org:29470";
+    let typed = typed.trim();
+    let (host, port) = typed.rsplit_once(':').ok_or(HOW)?;
+    let port_ok = !port.starts_with('+') && port.parse::<u16>().is_ok_and(|port| port > 0);
+    let host_ok = match host.strip_prefix('[') {
+        Some(inner) => inner
+            .strip_suffix(']')
+            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok()),
+        None => {
+            host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+        }
+    };
+    if typed.len() > 128 || !port_ok || !host_ok {
+        return Err(HOW.into());
+    }
+    Ok(typed.to_owned())
+}
+
 /// What the launcher remembers between runs: the server and the name the
-/// player last connected with, which the page then offers first.
+/// player last connected with, which the page then offers first, and the
+/// player's settings.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Remembered {
+    /// The server last connected to.
     pub server: Option<String>,
     pub name: Option<String>,
+    /// The player's server setting, when they chose one other than the
+    /// default ([`Action::SetServer`]).
+    #[serde(default)]
+    pub chosen_server: Option<String>,
     /// Whether the player's diagnostics go to the server; on unless they
     /// switched them off.
     #[serde(default)]
     pub diagnostics: Option<bool>,
+    /// The personal mods the player chose, by id (docs/MODS.md).
+    #[serde(default)]
+    pub mods: Option<Vec<String>>,
+    /// The banner the player picked ([`Action::SetBanner`]).
+    #[serde(default)]
+    pub banner: Option<String>,
 }
 
 impl Remembered {
     /// What `file` holds, or nothing if it is missing or not ours.
     pub fn load(file: &Path) -> Self {
-        let small = fs::metadata(file).is_ok_and(|metadata| metadata.len() <= 4096);
+        let small = fs::metadata(file).is_ok_and(|metadata| metadata.len() <= 64 * 1024);
         small
             .then(|| fs::read(file).ok())
             .flatten()
@@ -942,7 +1317,21 @@ async fn join(
     password: Option<Text<64>>,
 ) -> Result<(), String> {
     let current = connected.as_mut().ok_or("connect to a server first")?;
-    let joined = current
+    // Another's room: its shared mods are learned from what it says this
+    // game lacks (docs/MODS.md). Until then, this game declares none.
+    let fresh = shared.picker().map(|mut mods| {
+        mods.forget_room();
+        mods.manifest()
+    });
+    if let Some(manifest) = fresh {
+        shared.show_mods();
+        current
+            .client
+            .declare_content(manifest)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let mut joined = current
         .client
         .join_room(JoinRoom {
             invite,
@@ -950,6 +1339,35 @@ async fn join(
             resume: None,
         })
         .await;
+    // A running game compares at once: learn the room's mods from its
+    // refusal, and try once more with those this game has.
+    if matches!(
+        joined,
+        Err(ClientError::Refused(RequestError::ContentMismatch))
+    ) && shared.picker.is_some()
+    {
+        let diff = content_diff(&mut current.events).await;
+        let again = diff.as_ref().and_then(|diff| {
+            let mut mods = shared.picker()?;
+            mods.learn(diff).then(|| mods.manifest())
+        });
+        shared.show_mods();
+        if let Some(manifest) = again {
+            current
+                .client
+                .declare_content(manifest)
+                .await
+                .map_err(|error| error.to_string())?;
+            joined = current
+                .client
+                .join_room(JoinRoom {
+                    invite,
+                    password: password.clone(),
+                    resume: None,
+                })
+                .await;
+        }
+    }
     let room = match joined {
         Ok(room) => room,
         Err(ClientError::Refused(RequestError::ContentMismatch)) => {
@@ -965,7 +1383,16 @@ async fn join(
         Err(error) => return Err(error.to_string()),
     };
     shared.status().room = Some(room);
-    begin_session(shared, config, connected, session, idle, invite, password)
+    begin_session(
+        shared,
+        config,
+        connected,
+        session,
+        idle,
+        invite,
+        password,
+        config.start_save.clone(),
+    )
 }
 
 /// How the game differs from a room that refused it, if the room says so
@@ -984,9 +1411,11 @@ async fn content_diff(events: &mut Events) -> Option<ContentDiff> {
     .flatten()
 }
 
-/// The server this launcher plays on alone, when it has one (D12).
-fn fixed_server(config: &LauncherConfig) -> Option<&str> {
-    config.server.as_deref().filter(|_| config.server_fixed)
+/// The server this launcher plays on, when it has one (D12): no invite
+/// takes the player elsewhere.
+fn fixed_server(shared: &Shared) -> Option<String> {
+    let view = shared.view();
+    view.server.clone().filter(|_| view.server_fixed)
 }
 
 /// The server to connect to for what the player gave to Connect: `typed`,
@@ -1026,7 +1455,9 @@ fn same_server(a: &str, b: &str) -> bool {
 
 /// Why an invite to `other` is refused by a launcher fixed to `fixed`.
 fn elsewhere(fixed: &str, other: &str) -> String {
-    format!("that invite is for another server, {other}: TPF3-MP plays on {fixed} alone")
+    format!(
+        "that invite is for another server, {other}: you play on {fixed}. To play there, change the server in Settings"
+    )
 }
 
 /// An invite as players pass it on: the room's invite, perhaps with the
@@ -1098,6 +1529,13 @@ async fn connect_options(
         .map_err(|error| error.to_string())?;
     // Every connection sends the recorder's lines, the rejoins' too.
     options.diagnostics.clone_from(&config.diagnostics);
+    // And shows the player's banner, the rejoins too.
+    options.banner = config
+        .remember
+        .as_deref()
+        .and_then(|file| Remembered::load(file).banner)
+        .and_then(|banner| Text::new(banner).ok())
+        .filter(|banner| tpf3mp_proto::is_banner(banner.as_str()));
     Ok(options)
 }
 
@@ -1173,7 +1611,10 @@ mod tests {
         let remembered = Remembered {
             server: Some("tpf3mp.example.org:29470".into()),
             name: Some("Ann".into()),
+            chosen_server: Some("play.example.net:29470".into()),
             diagnostics: Some(false),
+            mods: Some(vec!["schbrongx_minimap".into()]),
+            banner: Some("m03".into()),
         };
         remembered.save(&file).unwrap();
         assert_eq!(Remembered::load(&file), remembered);
@@ -1186,7 +1627,10 @@ mod tests {
         assert_eq!(
             Remembered::load(&file),
             Remembered {
+                chosen_server: None,
                 diagnostics: None,
+                mods: None,
+                banner: None,
                 ..remembered
             }
         );
@@ -1264,6 +1708,76 @@ mod tests {
         // A launcher that started no game waits on none.
         let none = tokio::time::timeout(Duration::from_millis(50), game_exit(&mut None)).await;
         assert!(none.is_err());
+    }
+
+    #[test]
+    fn a_room_starts_from_a_listed_save_picked_by_name_or_the_launchers_own() {
+        let listed = vec!["mptest".to_owned(), "older".to_owned()];
+        let default = PathBuf::from("launcher.sav");
+        let find = |name: &str| Ok(PathBuf::from(format!("/saves/{name}.sav")));
+        assert_eq!(
+            start_world(Some(" mptest "), &listed, Some(&default), find),
+            Ok(Some(PathBuf::from("/saves/mptest.sav")))
+        );
+        assert_eq!(
+            start_world(None, &listed, Some(&default), find),
+            Ok(Some(default.clone())),
+            "nothing picked: the launcher's own"
+        );
+        assert_eq!(start_world(None, &listed, None, find), Ok(None));
+        assert_eq!(
+            start_world(Some(""), &listed, Some(&default), find),
+            Ok(None),
+            "none picked: the owner's game loads a world itself"
+        );
+        // Only a save the player was offered, by its name.
+        assert!(start_world(Some("other"), &listed, None, find).is_err());
+        assert!(start_world(Some("C:/Windows/win.ini"), &listed, None, find).is_err());
+        let gone = |_: &str| Err("no save".to_owned());
+        assert!(start_world(Some("mptest"), &listed, None, gone).is_err());
+        assert_eq!(
+            save_name(Path::new("/x/y/twomptest.sav")).as_deref(),
+            Some("twomptest")
+        );
+    }
+
+    #[test]
+    fn the_server_setting_takes_host_and_port_only() {
+        for good in [
+            "tpf3mp.213-133-98-90.sslip.io:29470",
+            " localhost:29470 ",
+            "127.0.0.1:29470",
+            "[2001:db8::1]:29470",
+            "EU.Example.org:1",
+        ] {
+            assert_eq!(server_address(good), Ok(good.trim().to_owned()), "{good}");
+        }
+        for bad in [
+            "",
+            "tpf3mp.example.org",
+            "tpf3mp.example.org:",
+            "tpf3mp.example.org:0",
+            "tpf3mp.example.org:65536",
+            "tpf3mp.example.org:+80",
+            ":29470",
+            "two words:29470",
+            "https://tpf3mp.example.org:29470",
+            "evil.example:29470 K7QM2X",
+            "-bad.example:29470",
+            "a..b:29470",
+            "2001:db8::1:29470",
+            "[not-ip]:29470",
+            "\u{e9}.example:29470",
+        ] {
+            assert!(server_address(bad).is_err(), "{bad:?}");
+        }
+        let long = format!("{}.{}.example:29470", "a".repeat(55), "b".repeat(55));
+        assert!(server_address(&long).is_ok());
+        let too_long = format!("{}:29470", vec!["a".repeat(60); 3].join("."));
+        assert!(
+            server_address(&too_long).is_err(),
+            "past the lobby's 128 bytes"
+        );
     }
 
     #[test]

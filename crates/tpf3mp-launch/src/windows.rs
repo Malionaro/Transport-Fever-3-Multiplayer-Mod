@@ -26,9 +26,9 @@ use windows_sys::Win32::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
         },
         Threading::{
-            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, CreateRemoteThread,
-            GetExitCodeProcess, GetExitCodeThread, LPTHREAD_START_ROUTINE, PROCESS_INFORMATION,
-            ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
+            CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread, LPTHREAD_START_ROUTINE,
+            PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
         },
     },
 };
@@ -37,6 +37,39 @@ use crate::{Launch, LaunchError, Started, folder_of};
 
 /// How long loading the hook may take.
 const LOAD_TIMEOUT_MS: u32 = 30_000;
+/// How long the game waits, suspended, for the hook to be ready. The tests
+/// load a system library that never says so.
+const READY_TIMEOUT_MS: u32 = if cfg!(test) { 300 } else { 30_000 };
+
+/// The event the hook sets once it is ready (`tpf3mp_ipc::hook_ready_event`).
+struct ReadyEvent(HANDLE);
+
+impl ReadyEvent {
+    fn create(pid: u32) -> Option<Self> {
+        let name: Vec<u16> = tpf3mp_ipc::hook_ready_event(pid)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: a NUL-terminated name; manual reset, not set.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+        (!event.is_null()).then_some(Self(event))
+    }
+
+    /// Whether the hook said it is ready within `timeout_ms`.
+    fn wait(&self, timeout_ms: u32) -> bool {
+        // SAFETY: this event's handle.
+        unsafe { WaitForSingleObject(self.0, timeout_ms) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for ReadyEvent {
+    fn drop(&mut self) {
+        // SAFETY: the handle is this one's, closed once, here.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
 
 /// A process started suspended. Dropped before it was let run, it is ended:
 /// a game half started is never left behind.
@@ -102,7 +135,17 @@ impl Drop for Process {
 
 pub(crate) fn start(launch: &Launch, env: &[(String, String)]) -> Result<Started, LaunchError> {
     let mut process = create_suspended(launch, env)?;
+    // Made before the hook loads, so the hook finds it however fast it is.
+    let ready = ReadyEvent::create(process.info.dwProcessId);
     load_hook(&process, &launch.hook)?;
+    // The game stays suspended until the hook has armed what must be in
+    // place before the game runs its first line (the main menu's entry):
+    // otherwise the game could load its main menu first, and it would be
+    // the game's own. A hook that never says so lets the game run anyway,
+    // after the wait.
+    if let Some(ready) = &ready {
+        ready.wait(READY_TIMEOUT_MS);
+    }
     // SAFETY: the main thread's handle, from CreateProcessW.
     if unsafe { ResumeThread(process.info.hThread) } == u32::MAX {
         return Err(LaunchError::HookNotLoaded(format!(
@@ -391,6 +434,31 @@ mod tests {
             CloseHandle(handle);
             (got != 0).then_some(code)
         }
+    }
+
+    #[test]
+    fn the_game_waits_for_the_hooks_ready_event_and_no_longer() {
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        // A process id no game has: the event is this test's alone.
+        let pid = u32::MAX - std::process::id();
+        let ready = ReadyEvent::create(pid).unwrap();
+        assert!(!ready.wait(50), "not set: the wait runs out");
+        let name: Vec<u16> = tpf3mp_ipc::hook_ready_event(pid)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // As the hook sets it, from another thread.
+        std::thread::spawn(move || unsafe {
+            let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+            assert!(!event.is_null());
+            SetEvent(event);
+            CloseHandle(event);
+        })
+        .join()
+        .unwrap();
+        let begun = std::time::Instant::now();
+        assert!(ready.wait(10_000), "set: the game runs");
+        assert!(begun.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

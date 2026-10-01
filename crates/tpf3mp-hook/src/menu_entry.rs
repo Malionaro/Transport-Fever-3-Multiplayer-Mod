@@ -372,6 +372,27 @@ fn patch_once(state: *mut c_void) {
         return;
     }
     note(&format!("menu patch installed in Lua state {state:p}"));
+    // A main page this state loaded before the patch was in it is the
+    // game's own: say so plainly.
+    if let Some(key) = eval_string(state, MAIN_PAGE_LOADED) {
+        note(&format!(
+            "main_page.tl MISSED: {key} was loaded in state {state:p} before the menu patch; the main menu is the game's own, without the Multiplayer entry"
+        ));
+    }
+}
+
+/// Run in a state as the patch goes in: the key of a main page already
+/// loaded there, or nil.
+const MAIN_PAGE_LOADED: &str = r#"
+for key in pairs(_ug_loadedModules or {}) do
+	if type(key) == "string" and key:find("gui/menu/main_page%.tl$") then return key end
+end
+return nil
+"#;
+
+/// Whether `path`, as the loader body sees it, is the main page.
+fn is_main_page(path: &str) -> bool {
+    path.ends_with("gui/menu/main_page.tl")
 }
 
 /// Runs `chunk` (no arguments, one result) in `state` and takes the result as
@@ -519,6 +540,20 @@ extern "C" fn on_entry(args: *const u64) -> *const u8 {
             return reply_stub as *const () as *const u8;
         }
         return original;
+    }
+    let patched = PATCHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&(state as usize));
+    if request_path(closure).is_some_and(|path| is_main_page(&path)) {
+        // In a patched state the patch's wrap has asked for the mod's copy
+        // (the body sees only the path, the same for both); in one the
+        // patch is not in yet, the game's own page loads.
+        note(if patched {
+            "main_page.tl SERVED: the main menu's page comes from the mod, with the Multiplayer entry"
+        } else {
+            "main_page.tl MISSED: the main menu's page loaded before the menu patch was in its Lua state; the main menu is the game's own"
+        });
     }
     patch_once(state);
     original

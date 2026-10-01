@@ -77,6 +77,7 @@ fn room(phase: RoomPhase, owner: PlayerId) -> RoomView {
             checkpoint_interval: 50,
         },
         members: Vec::new(),
+        competitive: false,
     }
 }
 

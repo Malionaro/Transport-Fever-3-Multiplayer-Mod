@@ -12,7 +12,7 @@
 -- What each lane reads, from the engine the game script runs in:
 --
 -- - NETWORK: every street and track edge, by its ends to 0.1 m and its road
---   template;
+--   template, lane settings and portable junction configurations;
 -- - CONSTRUCTIONS: every construction, by its file and position to 0.1 m;
 -- - LINES: every line's number of stops;
 -- - VEHICLES: each vehicle's state, stop, and place on its path (edge and
@@ -49,6 +49,12 @@
 -- Pure Lua over the `api` it is given; the tests hand it a fake.
 
 local lanes = {}
+local junctions
+if type(ug_require) == "function" then
+	junctions = ug_require("tpf3mp_1::/scripts/tpf3mp/junctions.lua")
+else
+	junctions = require("tpf3mp.junctions")
+end
 
 lanes.NETWORK = 0
 lanes.CONSTRUCTIONS = 1
@@ -129,8 +135,18 @@ readers[lanes.NETWORK] = function(api, emit)
 				local edge = component(api, e, "BASE_EDGE")
 				if edge then
 					local a, b = vec01(edge.position0), vec01(edge.position1)
-					if a > b then a, b = b, a end
+					local reversed = a > b
+					if reversed then a, b = b, a end
 					local row = a .. ">" .. b .. ":" .. tostring(edge.roadTemplate)
+					local laneRows = {}
+					for i = 1, #edge.laneConfigs do
+						local l, modes = edge.laneConfigs[i], {}
+						for m = 0, 15 do modes[#modes+1] = l.transportModes[m] == true and "1" or "0" end
+						laneRows[#laneRows+1] = string.format("%.3f/%.3f/%.3f/%.3f/%s/%s", l.speed,l.width,l.height,
+							l.offset * (reversed and -1 or 1), tostring(l.forward ~= reversed), table.concat(modes))
+					end
+					table.sort(laneRows)
+					row = row .. "|lanes:" .. table.concat(laneRows,";")
 					rows[#rows + 1] = row
 					if emit then
 						emit(nil, e, row, "p0=" .. vecFull(edge.position0) .. " p1=" .. vecFull(edge.position1)
@@ -139,6 +155,10 @@ readers[lanes.NETWORK] = function(api, emit)
 				end
 			end
 		end
+	end
+	for _, row in ipairs(junctions.rows(api)) do
+		rows[#rows+1] = "junction:" .. row
+		if emit then emit(nil, nil, "junction:" .. row, "") end
 	end
 	return summary(rows)
 end

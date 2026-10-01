@@ -6,8 +6,10 @@
 //!
 //! The images land in `target/launcher-screenshots/`, one for each of the
 //! sample states the page it copies offers (its `preview.js`), with the
-//! same data, so the two can be laid side by side (D20). They need a GPU
-//! (or a software renderer), so the test is not part of the normal run.
+//! same data and the lobby in the window, so the two can be laid side by
+//! side (D20); and the `g*` ones, the window as it opens, with the lobby
+//! in the game's menu (D17). They need a GPU (or a software renderer), so
+//! the test is not part of the normal run.
 
 #![allow(clippy::unwrap_used)]
 
@@ -25,6 +27,7 @@ use tpf3mp_launcher::{
     notes::{Block, Notes, ReleaseNotes},
     probe::{Probe, Reach},
     update::UpdateState,
+    view::Place,
 };
 
 struct Still(RefCell<State>);
@@ -42,10 +45,14 @@ impl Backend for Still {
 }
 
 fn render(name: &str, state: State, scroll_left: f32) {
-    render_clicking(name, state, scroll_left, None);
+    render_clicking(name, state, scroll_left, None, Place::Launcher);
 }
 
-fn render_clicking(name: &str, state: State, scroll_left: f32, click: Option<&str>) {
+fn render_in_game(name: &str, state: State) {
+    render_clicking(name, state, 0.0, None, Place::Game);
+}
+
+fn render_clicking(name: &str, state: State, scroll_left: f32, click: Option<&str>, place: Place) {
     let app = LauncherApp::new(
         Still(RefCell::new(state)),
         Extras {
@@ -68,7 +75,8 @@ fn render_clicking(name: &str, state: State, scroll_left: f32, click: Option<&st
                 installed_mod: Some(Some("0.1.0".into())),
             },
         },
-    );
+    )
+    .with_place(place);
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1100.0, 690.0))
         .wgpu()
@@ -101,6 +109,7 @@ fn base() -> State {
         player: Some("7QM2".into()),
         server: Some("play.tpf3mp.example:29470".into()),
         server_fixed: true,
+        server_default: Some("play.tpf3mp.example:29470".into()),
         server_name: Some("EU".into()),
         rules: vec![
             RulesChoice {
@@ -148,6 +157,7 @@ fn member(
         owner,
         you,
         content,
+        banner: None,
     }
 }
 
@@ -193,6 +203,7 @@ fn room(phase: Phase, members: Vec<Member>) -> Room {
         max_players: 4,
         has_password: false,
         members,
+        competitive: false,
     }
 }
 
@@ -211,9 +222,67 @@ fn chat() -> Vec<ChatLine> {
     ]
 }
 
+/// The window as it opens: the lobby in the game's menu (D17). Part of
+/// [`screens`]: two tests rendering at once crash some GPU drivers.
+fn screens_with_the_lobby_in_the_game() {
+    render_in_game("g1-start-the-game", base());
+    let attached = Game {
+        attached: Some("40408".into()),
+        ..Game::default()
+    };
+    render_in_game(
+        "g2-game-running",
+        State {
+            game: attached.clone(),
+            ..base()
+        },
+    );
+    render_in_game(
+        "g3-in-the-room",
+        State {
+            room: Some(room(Phase::Lobby, members())),
+            chat: chat(),
+            game: attached,
+            ..connected()
+        },
+    );
+    render_in_game(
+        "g4-receiving-the-world",
+        State {
+            room: Some(room(Phase::Running, members())),
+            game: Game {
+                attached: Some("40408".into()),
+                world: World::Fetching,
+                bytes: 48_000_000,
+                total: 112_000_000,
+                step: None,
+                speed: 100,
+            },
+            ..connected()
+        },
+    );
+    render_in_game(
+        "g5-playing",
+        State {
+            room: Some(room(Phase::Running, members())),
+            notices: vec!["Bob joined the room.".into(), "The room started.".into()],
+            game: Game {
+                attached: Some("40408".into()),
+                world: World::Playing,
+                bytes: 0,
+                total: 0,
+                step: Some(18432),
+                speed: 200,
+            },
+            ..connected()
+        },
+    );
+}
+
 #[test]
 #[ignore = "renders images for review; needs a GPU or a software renderer"]
 fn screens() {
+    screens_with_the_lobby_in_the_game();
     render("1-not-connected", base(), 0.0);
     render(
         "2-connecting",
@@ -224,7 +293,13 @@ fn screens() {
         0.0,
     );
     render("3-connected", connected(), 0.0);
-    render_clicking("9-settings", connected(), 0.0, Some("Settings"));
+    render_clicking(
+        "9-settings",
+        connected(),
+        0.0,
+        Some("Settings"),
+        Place::Launcher,
+    );
     let lobby = State {
         room: Some(room(Phase::Lobby, members())),
         chat: chat(),

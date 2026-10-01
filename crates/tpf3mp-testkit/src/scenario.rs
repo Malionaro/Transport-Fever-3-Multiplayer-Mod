@@ -154,6 +154,8 @@ async fn seat(
             password: None,
             settings,
             rules,
+            listing: None,
+            competitive: false,
         })
         .await?;
     for client in others {
@@ -350,7 +352,10 @@ type BridgeTask = tokio::task::JoinHandle<Result<BridgeEnd, BridgeFault>>;
 
 /// Starts once every player is marked ready, their agents deciding: the
 /// room refuses until then, and while the world it starts from is still on
-/// its way.
+/// its way. Asked within the server's request rate (10 a second for one
+/// connection), and asked again after a pause when the server says it was
+/// asked too often: on a slow machine the room took long enough to be ready
+/// that a faster loop spent its burst and was refused.
 async fn start_when_ready(owner: &Requests, deadline: Duration) -> Result<()> {
     let give_up = tokio::time::Instant::now() + deadline;
     loop {
@@ -359,7 +364,12 @@ async fn start_when_ready(owner: &Requests, deadline: Duration) -> Result<()> {
             Err(ClientError::Refused(
                 RequestError::NotAllReady | RequestError::StartWorldPending,
             )) if tokio::time::Instant::now() < give_up => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(ClientError::Refused(RequestError::RateLimited))
+                if tokio::time::Instant::now() < give_up =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(error) => return Err(error).context("starting the room's game"),
         }

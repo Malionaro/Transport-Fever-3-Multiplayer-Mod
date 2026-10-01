@@ -249,11 +249,14 @@ async fn run(args: Args) -> Result<ExitCode> {
             server: Some(server.clone()),
             // Every player on the rig's server, as a package's on its own.
             server_fixed: true,
+            default_server: Some(server.clone()),
             server_name: None,
             trust: trust.clone(),
             identity,
             name: name.clone(),
             content: content.clone(),
+            mods: None,
+            picker: None,
             // The rig's players run the fake game, not one Steam installed.
             installed: None,
             diagnostics: None,
@@ -381,6 +384,9 @@ async fn set_up_room(args: &Args, server: &str, players: &[Player]) -> Result<()
             max_players: args.players,
             password: None,
             rules: args.rules.clone(),
+            start_save: None,
+            listing: None,
+            competitive: false,
         },
     )
     .await?;
