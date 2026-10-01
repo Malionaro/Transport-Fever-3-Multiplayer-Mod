@@ -1342,6 +1342,39 @@ fn parse_preview_curves(tree: &LuaValue) -> Vec<PreviewCurve> {
     curves
 }
 
+/// Sets the room's copy of the player's own build preview, for the hook's
+/// own detour ([`crate::preview`]) to report where the game draws it: the
+/// pointer on the ground plane in metres, and whether a tool is showing a
+/// preview at all. `None` for `at` lifts it. Repeated the same position is
+/// not sent again, so a pointer that stands still costs nothing.
+pub fn report_cursor(at: Option<(f32, f32)>, curves: Option<Vec<PreviewCurve>>, building: bool) {
+    let mut shared = shared();
+    let player = shared
+        .room
+        .me
+        .unwrap_or(PlayerId(FixedBytes([0u8; 32])));
+    let at = at.map(|(x, y)| {
+        #[allow(clippy::cast_possible_truncation)]
+        Pos2 {
+            x: (x * 1000.0).round() as i32,
+            y: (y * 1000.0).round() as i32,
+        }
+    });
+    if let Some(previous) = &shared.room.outbound_cursor
+        && previous.at == at
+        && previous.building == building
+    {
+        return;
+    }
+    shared.room.outbound_cursor = Some(Cursor {
+        player,
+        at,
+        building,
+        label: None,
+        curves: curves.unwrap_or_default(),
+    });
+}
+
 /// `cursor(x, y, building, label, curves)` or `cursor(nil)`.
 ///
 /// Sets the local player's pointer or build preview position, in metres on the
