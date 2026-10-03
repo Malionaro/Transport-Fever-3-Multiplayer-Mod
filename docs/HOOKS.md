@@ -2975,6 +2975,49 @@ and `native/src/preview_plugin.cpp` in tpf2-multiplayer).
   preview stopped with the fatal assertion `!IsTransformWithContext`
   (`react_transform.cpp:97`). Inside the action slot it would take the
   player's own tool's place.
+- **Whose preview it is** (`tpf3mp/nameplates.lua`,
+  `gui/tpf3mp/nameplates.res.lua`): a member's name and preview location, so
+  a room where several place at once tells the members' builds apart. The hook
+  is not involved and no name goes over the link: the room relays
+  `Preview { from }` with the player's id, and the roster (`status().players`,
+  `id` and `name`) is in the same game already, so the name is resolved
+  locally. In 3D, the preview is marked at its start position (in the game's
+  metres: `BuildRoad`/`BuildTrack` the first vertex of the polyline,
+  `BuildConstruction` the transform's origin, `PlaceStop` its `at`) using
+  `api.gui.mission.setMarkerAtPosition` (`api/gui.d.tl:726`, non-selectable,
+  advisory), cleaned up with `api.gui.mission.removeMarker` when the preview
+  ends. In the GUI, the member's name is displayed in the game bar via the
+  official mod extension point `GameBarInfoDisplayExtension` (`Tpf3mpNameplates`,
+  `gui/game_bar/game_bar_widgets.tl:70-88`). Everything it cannot read shows
+  no marker rather than a wrong one: a member the roster does not name, a
+  preview with no anchor, or a game missing the mission API.
+  Alternatives investigated and why they failed on build 40408:
+  - `builtin.FullScreenComponent` from `GameBarInfoDisplayExtension`: tried
+    2026-10-03. `GameBarInfoDisplayExtension` is mounted inside `BoxLayout`
+    inside `ScrollArea` in the game bar (`game_bar_widgets.tl:70-88`).
+    `builtin.FullScreenComponent` returns `{}` in Lua (`builtin.lua:196`) and
+    its C++ processing (`DeferredFullScreenComponentTree`) is only supported
+    under `builtin.ActionDescriptor` (`town.tl:1095-1114`). Mounted in the
+    plugin's layout, the real game failed with:
+    `Missing builtin receipt for /gui/main/react.lua+433 in DeclareBuiltinLayoutChildWithData::name = WidgetComponentParams`.
+  - `builtin.AbsoluteLayout` (`builtin.d.tl:666`, `builtin.lua:138`): its
+    child parameters accept only `localKey` and `item`, lacking screen
+    coordinates (`x`, `y`, `h`, `v`).
+  - `Window` with `initialX`/`initialY` (`builtin.d.tl:1186-1235`): sets
+    one-time coordinates on window creation; `WindowAPI` has no method to
+    update position dynamically per-frame as the 3D camera moves, and
+    window chrome captures clicks and focus.
+  - HUD / notification extension points: build 40408 defines no extension
+    points in `game_mechanics/notifications` or `gui/hud` (all 17 registered
+    extension points are in the game bar, mod button ridge, mod entry points,
+    or entity windows).
+  - Pure Lua projection caveat: the game binds `api.gui.camera`, `getSize()`,
+    `Vec3f.new()` and `world2Screen()` as C++ `userdata` (`type() == "userdata"`),
+    not Lua tables; strict table checks fail silently.
+  - In `the game scripts' GUI state` (the simulation thread), requiring
+    `::/gui/main/builtin.lua` caused a fatal `Missing builtin recipeId for
+    name = WithComponentParams` error banner (`react.lua:433`); guarded in
+    `follow.lua` to only wrap `LineViewer` where builtin is already loaded.
 
 ### Terraforming
 

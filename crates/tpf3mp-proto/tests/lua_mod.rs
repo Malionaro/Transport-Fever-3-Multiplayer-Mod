@@ -2692,6 +2692,148 @@ fn a_preview_hides_once_its_tool_is_no_longer_active() {
     assert_eq!(previewed(&lua), ["BuildConstruction", "none"]);
 }
 
+/// The name of a member whose build preview this game shows, drawn at that
+/// preview: the point its geometry starts at, put through the game's own
+/// projection (docs/HOOKS.md, "Build previews"). Only a preview that is
+/// named and on the window gets a label: one behind the camera, one the
+/// roster does not name and one with no point to place a name at get none.
+#[test]
+fn a_members_name_is_where_their_build_preview_is() {
+    let lua = gui();
+    let (labels, first, h, v): (usize, String, f64, f64) = lua
+        .load(
+            "local nameplates = ug_require('tpf3mp_1::/scripts/tpf3mp/nameplates.lua') \
+             api.gui.camera = { getSize = function() return { x = 1920, y = 1080 } end, \
+                               world2Screen = function(at) return { x = at.x * 2, y = at.y * 2 } end } \
+             local remote = { \
+                 ['ab'] = { anchor = { x = 100, y = 200, z = 0 } }, \
+                 ['cd'] = { anchor = { x = 5000, y = 5000, z = 0 } }, \
+                 ['ef'] = { anchor = { x = 10, y = 10, z = 0 } }, \
+                 ['12'] = { }, \
+             } \
+             local status = { players = { { id = 'ab', name = 'Julian' }, { id = 'cd', name = 'Sam' }, \
+                                            { id = '12', name = 'Alex' } } } \
+             local shown = nameplates.collect(remote, status, api) \
+             return #shown, shown[1].name, shown[1].h, shown[1].v",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        labels, 1,
+        "only the preview that is named and on the window"
+    );
+    assert_eq!(first, "Julian");
+    assert_eq!((h, v), (0.105, 0.37), "where the projection put it");
+}
+
+/// The point a name hangs at: where the preview's geometry starts, in the
+/// game's metres, and nothing at all for a build it cannot place.
+#[test]
+fn a_name_hangs_at_the_point_its_build_starts() {
+    let lua = gui();
+    let (road, track, station, stop, other): (String, String, String, String, bool) = lua
+        .load(
+            "local nameplates = ug_require('tpf3mp_1::/scripts/tpf3mp/nameplates.lua') \
+             local function at(action) local p = nameplates.anchor(action) \
+                 return p and string.format('%d %d %d', p.x, p.y, p.z) or 'none' end \
+             return \
+                 at({ BuildRoad = { polyline = { vertices = { { pos = { x = 1, y = 2, z = 3 } } } } } }), \
+                 at({ BuildTrack = { polyline = { vertices = { { pos = { x = 4, y = 5, z = 6 } } } } } }), \
+                 at({ BuildConstruction = { transform = { origin = { x = 7, y = 8, z = 9 } } } }), \
+                 at({ PlaceStop = { at = { x = 10, y = 11, z = 12 } } }), \
+                 nameplates.anchor({ Bulldoze = {} }) == nil",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(road, "1 2 3");
+    assert_eq!(track, "4 5 6");
+    assert_eq!(station, "7 8 9");
+    assert_eq!(stop, "10 11 12");
+    assert!(other, "a build the previews are not shown for has no place");
+}
+
+/// The member's name is shown in the game bar, and their preview is marked
+/// in 3D (api.gui.mission.setMarkerAtPosition), only while a preview shows.
+#[test]
+fn the_names_are_shown_only_while_there_is_a_preview() {
+    let lua = gui();
+    lua.load(FAKE_HOOK).exec().unwrap();
+    lua.load(
+        "api.gui.camera = { getSize = function() return { x = 1920, y = 1080 } end, \
+                            world2Screen = function(at) return { x = at.x * 2, y = at.y * 2 } end } \
+         package.loaded['tpf3mp.ui'] = { status = { players = { { id = string.rep('ab', 32), \
+                                                                  name = 'Julian' } } } } \
+         package.loaded['tpf3mp.previews'] = ug_require('tpf3mp_1::/scripts/tpf3mp/previews.lua') \
+         package.loaded['tpf3mp.nameplates'] = ug_require('tpf3mp_1::/scripts/tpf3mp/nameplates.lua') \
+         PLATES = mount(loadPlugin(nil, 'Tpf3mpNameplates', 'GameBarInfoDisplayExtension'))",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let empty: bool = lua
+        .load(
+            "PLATES.step() PLATES.render() \
+             local markersCount = 0 \
+             for _ in pairs(api.gui.mission.markers) do markersCount = markersCount + 1 end \
+             return PLATES.layout.layout == 'BoxLayout' and #(PLATES.layout.params.children or {}) == 0 and markersCount == 0",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert!(
+        empty,
+        "no preview to show, no label in the game bar and no 3D marker"
+    );
+
+    lua.load(
+        "local previews = package.loaded['tpf3mp.previews'] \
+         previews.reset() \
+         local incoming = { { from = string.rep('ab', 32), action = { BuildTrack = { polyline = { \
+             vertices = { { pos = { x = 100, y = 200, z = 0 } } } } } } } } \
+         local link = { previews = function() local c = incoming incoming = {} return c end, \
+                        log = function() end } \
+         previews.take(link, function() return { track = true }, {}, 1 end, \
+                       function() return true end)",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let (marker_pos, names): (String, Vec<String>) = lua
+        .load(
+            "PLATES.step() PLATES.render() \
+             local marker = api.gui.mission.markers['tpf3mp.preview.' .. string.rep('ab', 32)] \
+             assert(marker ~= nil, 'marker set at preview') \
+             local marker_pos = string.format('%d %d %d', marker.pos.x, marker.pos.y, marker.pos.z) \
+             local names = {} \
+             for _, v in ipairs(views(PLATES.layout)) do \
+                 if v.view == 'TextView' then names[#names + 1] = v.params.text end \
+             end \
+             return marker_pos, names",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        marker_pos, "100 200 0",
+        "marker placed at the preview's start"
+    );
+    assert_eq!(names, ["🔨 Julian"], "the member's name in the game bar");
+
+    // Once the preview is no longer active, the marker and label disappear:
+    lua.load(
+        "local previews = package.loaded['tpf3mp.previews'] \
+         previews.reset() \
+         PLATES.step() PLATES.render()",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let cleared: bool = lua
+        .load(
+            "local markersCount = 0 \
+             for _ in pairs(api.gui.mission.markers) do markersCount = markersCount + 1 end \
+             return #(PLATES.layout.params.children or {}) == 0 and markersCount == 0",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert!(cleared, "preview ended: marker and label cleared");
+}
+
 #[test]
 fn a_preview_the_hook_could_not_draw_is_drawn_once_a_renderer_frees() {
     let (lua, _script) = engine();

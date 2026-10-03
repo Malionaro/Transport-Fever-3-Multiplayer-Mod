@@ -1120,6 +1120,111 @@ function data()
 		end)
 	end
 
+	-- A module of the mod's own, read the way this state reads them
+	-- (tpf3mp/apply.lua): require alone finds none of them until ug_require
+	-- has put one in the shared table, and which of the two a plugin gets
+	-- there first is the game's. So both, in that order.
+	local function module(short, file)
+		local ok, found = pcall(require, short)
+		if ok and type(found) == "table" then return found end
+		return ug_require(file)
+	end
+
+	-- The name of every other member whose build preview this game shows:
+	-- in 3D, an advisory marker at the preview's start position (api.gui.mission.setMarkerAtPosition);
+	-- in the game bar, the member's name (Tpf3mpNameplates on GameBarInfoDisplayExtension).
+	-- Advisory, as the previews are: a marker is shown and a name is displayed,
+	-- and nothing is built, sent or changed in the simulation.
+	local Tpf3mpNameplates = react.RegisterPluginRecipe(game_bar_widgets.GameBarInfoDisplayExtension, "Tpf3mpNameplates", function()
+		local activeBuilders = react.useState({})
+		local activeMarkers = react.useRef({})
+
+		react.onStep(function()
+			local plates = module("tpf3mp.nameplates", "tpf3mp_1::/scripts/tpf3mp/nameplates.lua")
+			local previewsMod = module("tpf3mp.previews", "tpf3mp_1::/scripts/tpf3mp/previews.lua")
+			local kept = previewsMod and previewsMod.remote and previewsMod.remote() or {}
+			local status = ui().status
+
+			local fresh = {}
+			local currentKeys = {}
+
+			if type(kept) == "table" and type(status) == "table" then
+				for id, preview in pairs(kept) do
+					local name = plates.nameOf(status, id)
+					local anchor = type(preview) == "table" and preview.anchor or nil
+					if name and anchor and anchor.x and anchor.y and anchor.z then
+						local key = "tpf3mp.preview." .. tostring(id)
+						currentKeys[key] = true
+						fresh[#fresh + 1] = { id = id, name = name, anchor = anchor }
+
+						if api and api.gui and api.gui.mission and api.gui.mission.setMarkerAtPosition then
+							local pos = (api.type and api.type.Vec3f and api.type.Vec3f.new)
+								and api.type.Vec3f.new(anchor.x, anchor.y, anchor.z)
+								or anchor
+							pcall(api.gui.mission.setMarkerAtPosition, key, pos, "standard", 1.0, false, false)
+						end
+					end
+				end
+			end
+
+			table.sort(fresh, function(a, b) return a.id < b.id end)
+
+			-- Clean up markers that are no longer active.
+			local prevMarkers = activeMarkers:get()
+			for oldKey in pairs(prevMarkers) do
+				if not currentKeys[oldKey] then
+					if api and api.gui and api.gui.mission and api.gui.mission.removeMarker then
+						pcall(api.gui.mission.removeMarker, oldKey)
+					end
+				end
+			end
+			activeMarkers:set(currentKeys)
+
+			-- Rerender only if the list of active preview builders changed.
+			local oldList = activeBuilders:old()
+			local changed = #fresh ~= #oldList
+			if not changed then
+				for i = 1, #fresh do
+					if fresh[i].id ~= oldList[i].id or fresh[i].name ~= oldList[i].name then
+						changed = true
+						break
+					end
+				end
+			end
+			if changed then
+				activeBuilders:set(fresh)
+			end
+		end)
+
+		if react.onUnmount then
+			react.onUnmount(function()
+				local prevMarkers = activeMarkers:get()
+				for oldKey in pairs(prevMarkers) do
+					if api and api.gui and api.gui.mission and api.gui.mission.removeMarker then
+						pcall(api.gui.mission.removeMarker, oldKey)
+					end
+				end
+			end)
+		end
+
+		local shown = activeBuilders:old()
+		if #shown == 0 then
+			return builtin.BoxLayout{ children = {} }
+		end
+
+		local children = {}
+		for _, b in ipairs(shown) do
+			children[#children + 1] = builtin.TextView{
+				meta = { class = "font-scale-annotation" },
+				text = "🔨 " .. b.name,
+			}
+		end
+		return builtin.BoxLayout{
+			orientation = builtin.type.Orientation.Horizontal,
+			children = children,
+		}
+	end)
+
 	local Tpf3mpPlugin = react.RegisterPluginRecipe(game_bar_widgets.GameBarInfoDisplayExtension, "Tpf3mpPlugin", function()
 		-- Once per game: the ref lives as long as this plugin is mounted.
 		local started = react.useRef(false)
@@ -1244,5 +1349,6 @@ function data()
 	return {
 		Tpf3mpPlugin = Tpf3mpPlugin,
 		Tpf3mpButton = Tpf3mpButton,
+		Tpf3mpNameplates = Tpf3mpNameplates,
 	}
 end

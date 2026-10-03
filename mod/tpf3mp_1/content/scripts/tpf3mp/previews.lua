@@ -32,6 +32,9 @@
 --
 -- Pure Lua; the tests hand it a fake link and a fake api.
 
+local nameplates = ug_require and ug_require("tpf3mp_1::/scripts/tpf3mp/nameplates.lua")
+	or require("tpf3mp.nameplates")
+
 local previews = {}
 
 -- The tools whose previews the other members are shown, by the capture's
@@ -164,8 +167,11 @@ function previews.take(link, make, draw)
 				local ok, proposal, context, company = pcall(make, action, from)
 				if ok and proposal ~= nil then
 					made = made + 1
+					-- Where this preview is, for the name drawn at it
+					-- (tpf3mp/nameplates.lua): the point its geometry
+					-- starts at, as the action says it.
 					local kept = { proposal = proposal, context = context, company = company,
-						kind = kind, seq = made }
+						kind = kind, seq = made, anchor = nameplates.anchor(action) }
 					remote[from] = kept
 					if draw then
 						local called, drawn, why = pcall(draw, from, kept)

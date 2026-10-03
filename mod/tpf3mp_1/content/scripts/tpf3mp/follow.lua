@@ -412,7 +412,17 @@ function follow.watchLines(api, require_, link, where)
 		pcall(function() link:log(text .. " (" .. tostring(where) .. ")") end)
 	end
 	local wrapped = 0
-	local okB, builtin = pcall(require_, follow.BUILTIN)
+	-- In the game scripts' simulation state (tpf3mp_sim), builtin.lua has not
+	-- been loaded by the engine; requiring it there runs react.lua where
+	-- _react.builtin has no WithComponentParams, raising a fatal red error
+	-- on screen. Only wrap LineViewer where builtin is already loaded or in
+	-- a real GUI state.
+	local okB, builtin = false, nil
+	if package and type(package.loaded) == "table" and package.loaded[follow.BUILTIN] then
+		okB, builtin = true, package.loaded[follow.BUILTIN]
+	elseif where ~= "the game scripts' GUI state" then
+		okB, builtin = pcall(require_, follow.BUILTIN)
+	end
 	if okB and type(builtin) == "table" and type(builtin.LineViewer) == "function" and not follow.wrappedTests[builtin.LineViewer] then
 		local original = builtin.LineViewer
 		local viewer = function(params, ...)

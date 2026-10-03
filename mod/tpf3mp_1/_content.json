@@ -3,6 +3,7 @@
     "files": [
         "gui/tpf3mp/icons/menu_multiplayer_50@2x.tga",
         "gui/tpf3mp/icons/menu_multiplayer_50.tga",
+        "gui/tpf3mp/nameplates.res.lua",
         "tpf3mp/act.lua",
         "tpf3mp/state.lua",
         "gui/menu/lobby.lua",
@@ -55,6 +56,7 @@
         "scripts/tpf3mp/modbuild.lua",
         "scripts/tpf3mp/modguard.lua",
         "scripts/tpf3mp/previews.lua",
+        "scripts/tpf3mp/nameplates.lua",
         "scripts/tpf3mp/progression.lua",
         "scripts/tpf3mp/registry.lua",
         "scripts/tpf3mp/roads.lua",

@@ -4,10 +4,12 @@
 
 # Local runtime output: dev certificates, server data, logs.
 /runtime/
+/server-data/
 *.der
 *.pem
 
-# Agent worktrees created by Claude Code.
+# Editor and agent workspaces.
+/.opencode/
 /.claude/worktrees/
 
 # Python environments for the recon tools (docs/DAY_ONE.md).

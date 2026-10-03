@@ -396,6 +396,16 @@ Dev C:
   (the game's own `ProposalViewer` fails fatally outside a tool's action)
   (investigation/TPF3_BUILD_PREVIEWS_2026-10-02.md). Tick once seen in the
   real game.
+- [ ] *Added* (proposed by Malionaro, 2026-10-03, for the owner): whose
+  build preview it is. The name of the member whose preview this game shows,
+  so a room where several place at once tells the members' builds apart
+  (HOOKS.md, "Build previews", "Whose preview it is"). Pure mod: the name
+  comes from the roster the game already has and is shown in the game bar,
+  and the preview is marked in 3D (api.gui.mission.setMarkerAtPosition) at the
+  point the preview's geometry starts at. Advisory like the previews, and no
+  name goes over the link, so the protocol is untouched. On top of the
+  previews above, which are still in review; built on a branch over them.
+  Tick once seen in the real game.
 - [ ] *Changed:* (D17, the hold lifted by the owner on 2026-09-30): the
   room in the game. The main menu's Multiplayer window connects, creates
   and joins rooms, shows the players and their ready marks, chats and

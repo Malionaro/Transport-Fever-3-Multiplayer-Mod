@@ -197,7 +197,7 @@ function views(node, out)
 	if type(node) ~= "table" then return out end
 	if node.view then out[#out + 1] = node end
 	local params = node.params or {}
-	for _, key in ipairs({ "content", "layout", "child" }) do views(params[key], out) end
+	for _, key in ipairs({ "content", "layout", "child", "item" }) do views(params[key], out) end
 	for _, child in ipairs(params.children or {}) do views(child, out) end
 	return out
 end
@@ -205,4 +205,56 @@ end
 -- The lines the mod logged, one per line.
 function logText()
 	return table.concat(LOG, "\n")
+end
+
+-- What the nameplates need of the game's GUI, added here rather than above:
+-- a test that reads a line number out of a logged refusal (the unknown
+-- ug_require path) would otherwise move when this file grows.
+api.type.Vec2i = { new = function(x, y) return { x = x, y = y } end }
+api.type.Vec3f = { new = function(x, y, z) return { x = x, y = y, z = z } end }
+
+-- The camera: where a world point is on the window. Here it takes the
+-- point as it is, so a preview's place, in the game's metres, is off any
+-- window unless a test sets a camera of its own.
+CAMERA = { width = 1920, height = 1080 }
+api.gui.camera = {
+	getSize = function() return { x = CAMERA.width, y = CAMERA.height } end,
+	world2Screen = function(at) return { x = at.x, y = at.y } end,
+}
+
+for _, view in ipairs({ "FloatingLayout", "FloatingLayoutChild" }) do
+	builtin[view] = setmetatable({ viewName = view }, {
+		__call = function(_, params) return { view = view, params = params } end,
+	})
+end
+-- The layer over the whole window the game mounts a recipe in, which
+-- belongs to the window and not to the extension point's own layout.
+builtin.FullScreenComponent = function(params)
+	return { view = "FullScreenComponent", params = params }
+end
+
+-- What a full-screen recipe says about itself: the game's own does (town.tl),
+-- and a test reads that this one takes no mouse.
+REACT_FLAGS = {}
+function react.setMouseTransparent(on) REACT_FLAGS.mouseTransparent = on end
+function react.setDisableFocusable(on) REACT_FLAGS.disableFocusable = on end
+
+-- Mission markers (api.gui.mission.setMarkerAtPosition):
+api.gui.mission = {
+	markers = {},
+	setMarkerAtPosition = function(key, pos, type, scaling, isSelectable, fireSelectEntity)
+		api.gui.mission.markers[key] = {
+			pos = pos,
+			type = type,
+			scaling = scaling,
+			isSelectable = isSelectable,
+			fireSelectEntity = fireSelectEntity,
+		}
+	end,
+	removeMarker = function(key)
+		api.gui.mission.markers[key] = nil
+	end,
+}
+function react.onUnmount(fn)
+	if current then current.onUnmount = fn end
 end
