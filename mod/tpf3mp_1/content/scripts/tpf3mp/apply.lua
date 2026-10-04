@@ -222,10 +222,6 @@ local function removals(context, part)
 	if not dry then return end
 	local function form(added)
 		local simple = api.type.SimpleProposal.new()
-		-- The form's own name, read by Link:drawPreview when the game refuses
-		-- it, so the log says which shape would not read rather than counting
-		-- forms (2026-10-04).
-		simple.name = added ~= nil and "removed and added back" or "removal only"
 		if part.buildings ~= nil and #part.buildings > 0 then simple.constructionsToRemove = part.buildings end
 		if part.edges ~= nil and #part.edges > 0 then simple.streetProposal.edgesToRemove = part.edges end
 		if added ~= nil and #added > 0 then simple.streetProposal.edgesToAdd = added end
@@ -234,7 +230,7 @@ local function removals(context, part)
 	end
 	local out
 	if part.added ~= nil and #part.added > 0 then
-		out = { form(part.added), form(nil) }
+		out = { form(part.added) }
 	else
 		out = { form(nil) }
 	end
@@ -245,41 +241,26 @@ end
 -- edges, with new negative ids, as the stop's rebuild does with the one it
 -- replaces (rebuildWith). A copy of each edge's own component, which is a
 -- copy the game hands out, so nothing here touches the world.
--- A copy of the component the game hands out is **not** enough: for a removal
--- preview the added edge is read as a *new* one, and then it needs the fields
--- `networkInto` writes for a link's edge — its own kind and structure, its
--- template, style, lane configurations and decorations. A bare copy is read as
--- the edge that is there, draws nothing, and leaves the piece at a dead end
--- undrawn (2026-10-04). So the copy is rebuilt field for field, as a build's
--- own edge is.
 local function edgesAddedBack(ids, network)
 	local BASE_EDGE = api.type.ComponentType.BASE_EDGE
 	local added, nextId = {}, -1
 	for _, id in ipairs(ids) do
-		local own = api.engine.getComponent(id, BASE_EDGE)
-		if own ~= nil then
+		local comp = api.engine.getComponent(id, BASE_EDGE)
+		if comp ~= nil then
 			local s = api.type.SegmentAndEntity.new()
 			s.entity = nextId
 			nextId = nextId - 1
-			local c = s.comp
-			c.node0, c.node1 = own.node0, own.node1
-			c.position0, c.position1 = own.position0, own.position1
-			c.tangent0, c.tangent1 = own.tangent0, own.tangent1
-			c.type, c.typeIndex = own.type, own.typeIndex
-			c.roadTemplate, c.roadStyle, c.roadType = own.roadTemplate, own.roadStyle, own.roadType
-			c.laneConfigs, c.edgeDecorations = own.laneConfigs, own.edgeDecorations
-			c.roadDevelopmentLocked = own.roadDevelopmentLocked
-			if network == "Track" then c.distance = own.distance end
-			-- A street's precedence at its ends, as its own segment carries it,
-			-- so the piece is joined to the streets beside it the same way.
-			if own.streetEdge ~= nil then
-				local ok, street = pcall(function() return api.type.BaseEdgeStreet.new() end)
-				if ok and street ~= nil then
-					street.precedenceNode0, street.precedenceNode1 =
-						own.streetEdge.precedenceNode0, own.streetEdge.precedenceNode1
-					s.streetEdge = street
-				end
-			end
+			s.comp = comp
+			-- The copy carries the edge's own id in `entity`, and that is not
+			-- the new negative one this segment is added under. The
+			-- replicator compares the two and asserts that they are the same
+			-- (`entity == c.entity`, ecs::Replicator::Apply, build 40408),
+			-- which takes the game down — a native assertion, past any
+			-- pcall — as soon as the proposal is only *evaluated* for a
+			-- preview. The applied path never sees it: there the ids are
+			-- resolved on the way in (rebuildWith adds its edge the same
+			-- way, and that removal works).
+			pcall(function() s.comp.entity = s.entity end)
 			s.type = network == "Track" and 1 or 0
 			added[#added + 1] = s
 		end
@@ -287,21 +268,19 @@ local function edgesAddedBack(ids, network)
 	return added
 end
 
--- The lane configurations at the ends of the edges `ids`, which go with them:
--- a configuration names the edges at its node, and the game cannot read a
--- proposal that removes an edge a configuration still names (build 40408,
--- "Unknown exception" out of makeProposalData). So every node at the ends of
--- the removed edges takes the removal of its configuration, and the game builds
--- them again for the edges this proposal adds back. The same set rebuildWith
--- takes for the one edge it replaces, and networkInto for the edges a road
--- splits.
+-- The lane configurations at the ends of the edges `ids`, which go with
+-- them: a configuration names the edges at its node (build 40408, "Unknown
+-- exception" out of makeProposalData), and the game builds them again for
+-- the edges this proposal adds back. The same set rebuildWith takes for the one
+-- edge it replaces, and networkInto for the edges a road splits.
 --
--- Every node takes it, **including one that dead-ends**: the edge added back
--- under a new negative id gives the node a segment to rebuild transitions
--- from, so StreetShapeFactory::PrepareTransitions does not assert on an empty
--- connection list, and dropping the configuration there is what leaves the
--- last piece of a street or a track undrawn (2026-10-04, seen in the game:
--- every segment with a neighbour drew, the piece at a dead end never did).
+-- Every node at the ends of the removed edges takes the removal of its
+-- configuration, including nodes that dead-end: the edge added back under a
+-- new negative id gives the node a segment to rebuild transitions from (so
+-- StreetShapeFactory::PrepareTransitions does not assert on an empty
+-- connection list), and removing the old configuration avoids the "Unknown
+-- exception" from makeProposalData that occurs when an existing configuration
+-- still names the removed edge.
 local function configsAtEndsOf(ids)
 	local BASE_EDGE = api.type.ComponentType.BASE_EDGE
 	local BASE_NODE_CONFIG = api.type.ComponentType.BASE_NODE_CONFIG
