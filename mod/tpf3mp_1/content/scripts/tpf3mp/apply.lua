@@ -214,12 +214,10 @@ end
 -- adding it anew. The same rule applies to streets and edgeobjects"
 -- (api/type.d.tl, build 40408). A street removal that only removed them was
 -- refused with "Unknown exception" out of makeProposalData, in every game of
--- the room (2026-10-04); adding them again is read ("as this game sees it:
--- fine"), but draws as the road that is there now and never changes, so the
--- other member sees nothing. Which shapes the game reads is therefore asked
--- of it at draw time (bridge.lua, Link:drawPreview), and the forms are tried
--- most visible first: `bare` says only what goes, so a form that is read
--- draws the removal itself.
+-- the room (2026-10-04); adding them again is the shape the game reads,
+-- drawn in the hook's renderer for that member (drawing.rs, AddToRenderer).
+-- Where edges are removed, the proposal adds them back with fresh negative
+-- ids (edgesAddedBack); for constructions alone, only what goes is named.
 local function removals(context, part)
 	if not dry then return end
 	local function form(added)
@@ -230,8 +228,12 @@ local function removals(context, part)
 		if part.configs ~= nil and #part.configs > 0 then simple.streetProposal.nodeConfigsToRemove = part.configs end
 		return simple
 	end
-	local out = { form(nil) }
-	if part.added ~= nil and #part.added > 0 then out[#out + 1] = form(part.added) end
+	local out
+	if part.added ~= nil and #part.added > 0 then
+		out = { form(part.added) }
+	else
+		out = { form(nil) }
+	end
 	error({ dry = true, proposals = out, context = context }, 0)
 end
 
@@ -269,47 +271,26 @@ end
 -- The lane configurations at the ends of the edges `ids`, which go with
 -- them: a configuration names the edges at its node (build 40408, "Unknown
 -- exception" out of makeProposalData), and the game builds them again for
--- the edges this proposal adds. The same set rebuildWith takes for the one
+-- the edges this proposal adds back. The same set rebuildWith takes for the one
 -- edge it replaces, and networkInto for the edges a road splits.
 --
--- A node whose every edge of `network` this proposal removes keeps its
--- configuration. The game builds none for a node left with no edge, and its
--- street shape factory asserts on the empty connection list it then has
--- ("!cc.empty()", StreetShapeFactory::PrepareTransitions, build 40408):
--- caught per task, so the shape of a street that dead-ends is never built
--- and the preview draws nothing there (2026-10-04, forty such assertions in
--- one room, while every street with a neighbour drew).
-local function configsAtEndsOf(ids, network)
+-- Every node at the ends of the removed edges takes the removal of its
+-- configuration, including nodes that dead-end: the edge added back under a
+-- new negative id gives the node a segment to rebuild transitions from (so
+-- StreetShapeFactory::PrepareTransitions does not assert on an empty
+-- connection list), and removing the old configuration avoids the "Unknown
+-- exception" from makeProposalData that occurs when an existing configuration
+-- still names the removed edge.
+local function configsAtEndsOf(ids)
 	local BASE_EDGE = api.type.ComponentType.BASE_EDGE
 	local BASE_NODE_CONFIG = api.type.ComponentType.BASE_NODE_CONFIG
-	local streets = api.engine.system.streetSystem
-	local function segmentsAt(node)
-		local ok, list = pcall(function()
-			if network == "Track" then return streets.getNodeTrackSegments(node) end
-			return streets.getNodeStreetSegments(node)
-		end)
-		return ok and list or nil
-	end
-	local going = {}
-	for _, id in ipairs(ids) do going[id] = true end
 	local configs, seen = {}, {}
 	for _, id in ipairs(ids) do
 		local e = api.engine.getComponent(id, BASE_EDGE)
 		for _, node in ipairs({ e and e.node0, e and e.node1 }) do
 			if node ~= nil and not seen[node] then
 				seen[node] = true
-				-- How many of the node's edges stay: none of them, and the
-				-- game has no list to rebuild a configuration from.
-				local at = segmentsAt(node)
-				local left = 0
-				if at == nil then
-					left = 1 -- the game will not say: as it was before
-				else
-					for _, other in ipairs(at) do
-						if not going[other] then left = left + 1 end
-					end
-				end
-				if left > 0 and api.engine.getComponent(node, BASE_NODE_CONFIG) ~= nil then
+				if api.engine.getComponent(node, BASE_NODE_CONFIG) ~= nil then
 					configs[#configs + 1] = node
 				end
 			end
@@ -1223,7 +1204,7 @@ function HANDLERS.Bulldoze(b)
 		local gone, buildings = townBuildingsRemoved(proposal, b.Edges.buildings or {})
 		if dry then
 			removals(context, { buildings = buildings, edges = ids,
-				added = edgesAddedBack(ids, network), configs = configsAtEndsOf(ids, network) })
+				added = edgesAddedBack(ids, network), configs = configsAtEndsOf(ids) })
 		end
 		log("removing " .. network .. " edges " .. table.concat(ids, ",")
 			.. (gone ~= "" and (" and town buildings " .. gone) or ""))

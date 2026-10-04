@@ -3164,50 +3164,35 @@ and `native/src/preview_plugin.cpp` in tpf2-multiplayer).
   > entails removing it and adding it anew. The same rule applies to
   > streets and edgeobjects.
 
-Both halves were found in the room's games on 2026-10-04, and the second
-  is why a street's removal needs two forms:
+Both halves were found in the room's games on 2026-10-04:
   - A street removal that **only removed** the edges was refused with
     **"Unknown exception"** out of `makeProposalData`, in every game of the
-    room — while a road build (which replaces the edges it removes) and a
-    building's removal went through.
+    room — and for dead ends, its lack of edges left behind caused its street
+    shape factory to assert on the empty connection list (`Assertion '!cc.empty()' failed`
+    in `StreetShapeFactory::PrepareTransitions`).
   - Adding the removed edges back (`edgesToAdd`, new negative ids, the same
     shape `rebuildWith` gives the one edge a stop removal replaces, plus
     `nodeConfigsToRemove` at their ends) makes `makeProposalData` accept it:
-    `another member's Bulldoze preview, as this game sees it: fine`. **And it
-    draws as the road that is there**: the same edge removed and added again
-    is no change at all, which is why a station's removal shows and a street's
-    did not. That was seen in the game, not reasoned out.
-- **Which forms the game reads is asked of it, not guessed.** So a preview is
-  a **list** of proposals and the one drawn is the first the game reads
-  (`Link:drawPreview`, `tpf3mp/bridge.lua`; the list comes from
-  `apply.proposalOf`). For a street or a track's removal, most visible first:
-  1. only what goes — `edgesToRemove` and the constructions beside them. It
-     says what is removed, so a form the game reads **draws the removal**.
-  2. the same, and the street itself again in `edgesToAdd` — the form the
-     game is known to read, and the one that draws nothing.
-  Where none is read, every reason is said. So the first run with this in it
-  says which form the game took, and the list shrinks to that one.
+    `another member's Bulldoze preview, as this game sees it: fine`. It draws
+    in the hook's renderer with the tool's highlight.
+- **The preview uses the one form the game reads.** The proposal adds the
+  removed edges back under new negative ids (`edgesAddedBack`, `apply.lua`).
+  Bare removals without added edges are not sent to `makeProposalData`.
   `Construction` and `EdgeObject` have one form each; `Assets` none (a plain
   `Proposal`, and no `SimpleProposal` says it — the dry run says *"an asset
   group's rebuild, which a preview cannot show"* rather than showing the
   wrong thing, and `apply.proposalOf` keeps a handler's own reason where it
   has one).
-- **A node's lane configuration is only taken while an edge is left there.**
-  The second form above takes the configurations at the ends of the edges it
-  removes, and the game builds each of them again from the edges that stay at
-  that node. A node whose every edge of the network the proposal removes is
-  left with none, and the game builds none for it — its street shape factory
-  asserts on the empty connection list, and the assertion is caught per task:
-
-  > `Assertion '!cc.empty()' failed` — `StreetShapeFactory::PrepareTransitions`,
-  > build 40408, `StreetShapeFactory.cpp:979`
-
-  So the shape of a street that **dead-ends** is never built, and nothing of it
-  is drawn: forty of these in one room on 2026-10-04, while every street with a
-  neighbour drew as it should. Such a node therefore **keeps** its
-  configuration (`configsAtEndsOf`, `apply.lua`), which is what the game needs
-  to build the shape at all; a node with an edge left keeps the removal of its
-  configuration, as before.
+- **Node lane configurations are taken at all ends of the removed edges.**
+  A node's lane configuration (`BASE_NODE_CONFIG`) names the edges at it, and
+  `makeProposalData` raises "Unknown exception" if an edge is removed while an
+  existing configuration still references its old id. Because the edges are
+  added back under new negative ids in `edgesToAdd`, every node (including
+  nodes that dead-end or segments unconnected at both ends) has an edge in the
+  proposal — so `StreetShapeFactory::PrepareTransitions` has segments to build
+  from and does not assert, while taking the configurations at all ends
+  (`configsAtEndsOf`) allows `makeProposalData` to evaluate cleanly. Dead-end
+  streets and tracks draw their preview just like connected ones.
 - **An edge added back into a *preview* must carry its new id twice.** The
   second form above adds each removed edge back under a fresh negative id, the
   way the applied path does (`rebuildWith`, for the one edge a stop removal
