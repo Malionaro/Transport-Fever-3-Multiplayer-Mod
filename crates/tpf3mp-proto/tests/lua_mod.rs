@@ -3264,8 +3264,10 @@ fn the_plugin_has_the_hook_draw_each_other_members_preview_and_mounts_nothing() 
         .eval()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert!(
-        refused.starts_with("nil|the game read none of 2 forms of it: refused 1 / refused 2"),
-        "every reason said: {refused}"
+        refused.starts_with(
+            "nil|the game read none of 2 forms of it: form 1: refused 1 / form 2: refused 2"
+        ),
+        "every reason said, each naming the form that gave it: {refused}"
     );
     let one: String = lua
         .load(
@@ -3277,7 +3279,7 @@ fn the_plugin_has_the_hook_draw_each_other_members_preview_and_mounts_nothing() 
         .eval()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
-        one, "nil|the game did not evaluate it: refused 1",
+        one, "nil|the game did not evaluate it: form 1: refused 1",
         "one form refused: the plain reason, as before"
     );
     // The member's tool shows nothing now: the hook clears it.
@@ -4737,12 +4739,14 @@ fn a_bulldozes_preview_is_the_removal_its_build_would_send() {
     .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     let (removed, street, players, sent, logged): (String, String, String, usize, usize) = lua
         .load(
-            "local first, second = STREET[1], STREET[2] \
-             local back = second.streetProposal.edgesToAdd[1] \
+            "local names = {} \
+             for _, f in ipairs(STREET) do names[#names + 1] = f.name end \
+             local back = STREET[2].streetProposal.edgesToAdd[1] \
              return tostring(DEPOT[1].constructionsToRemove[1]), \
-                 #STREET .. '|' .. table.concat(first.streetProposal.edgesToRemove, ',') \
-                     .. '|' .. tostring(first.streetProposal.edgesToAdd == nil) \
-                     .. '|' .. table.concat(second.streetProposal.edgesToRemove, ',') \
+                 table.concat(names, ' / ') .. '|' .. #STREET .. '|' \
+                     .. table.concat(STREET[1].streetProposal.edgesToRemove, ',') \
+                     .. '|' .. tostring(STREET[1].streetProposal.edgesToAdd == nil) \
+                     .. '|' .. table.concat(STREET[2].streetProposal.edgesToRemove, ',') \
                      .. '>' .. back.entity .. ':' .. back.comp.node0 .. '>' .. back.comp.node1, \
                  tostring(C1.player) .. ',' .. tostring(C2.player), #SENT, #HOOK.logged",
         )
@@ -4758,16 +4762,21 @@ fn a_bulldozes_preview_is_the_removal_its_build_would_send() {
         ),
         (
             "5000",
-            // two forms for the street: the first says only that the edge
-            // goes, the second adds the same edge back
-            "2|100|true|100>-1:8>9",
+            // every form the game is asked to read, each named: the first says
+            // only that the edge goes, the rest add it back in each of the
+            // three shapes, with and without the node configurations
+            "removal only / removed and added back (copy) / removed and added \
+             back (copy), no configuration / removed and added back (whole) / \
+             removed and added back (whole), no configuration / removed and \
+             added back (owned) / removed and added back (owned), no \
+             configuration|7|100|true|100>-1:8>9",
             "31,31",
             0,
             0
         ),
-        "the depot as a construction to remove and the street as the edge \
-         removed and added back, each for the sender's company, nothing sent \
-         or said"
+        "the depot as a construction to remove and the street as every form \
+         the game is asked to read, each named, for the sender's company, \
+         nothing sent or said"
     );
     // Not the plain Proposal the removal is really sent as: that is what
     // makeProposalData refused ("SimpleProposal expected, got Proposal").
@@ -6481,7 +6490,7 @@ fn a_town_building_bulldozed_goes_in_every_game_charged_to_the_players_company()
     .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
         lua.load("return KEPT").eval::<String>().unwrap(),
-        "2|100|true|100>-1:8>9||0|0",
+        "7|100|true|100>-1:8>9||0|0",
         "two forms: the first says only that the edge goes, the second adds \
          it back with a new id. Neither takes a configuration: the street \
          dead-ends at both its nodes, so the game would have none to build \
@@ -6578,17 +6587,17 @@ fn a_demolition_preview_can_be_turned_off_without_a_rebuild() {
         .eval::<String>()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
-        both, "nil|the demolition preview is off (TPF3MP_NO_BULLDOZE_PREVIEW)|0|0|2|table|0",
+        both, "nil|the demolition preview is off (TPF3MP_NO_BULLDOZE_PREVIEW)|0|0|7|table|0",
         "with the flag set: nothing proposed, the reason said, nothing sent or \
          logged; without it: the two forms again, and nothing said"
     );
 }
 
-/// The demolition preview's proposal adds each removed edge back under a new
-/// negative id, as the applied path does — but the component copy still names
-/// the edge's own id, and the replicator asserts that the two are the same
-/// (`entity == c.entity`, ecs::Replicator::Apply, build 40408). That is a
-/// native assertion no `pcall` catches, and the game goes down as soon as the
+/// The demolition preview's `copy` form adds the removed edge back under a new
+/// negative id with the copy the game hands out, and the copy carries that same
+/// new id: the replicator compares the two and asserts that they are equal
+/// (`entity == c.entity`, ecs::Replicator::Apply, build 40408), which is a
+/// native assertion past every `pcall`, and the game goes down as soon as the
 /// proposal is only evaluated to draw another member's preview.
 #[test]
 fn a_demolition_preview_adds_each_edge_back_under_its_own_new_id() {
@@ -6599,33 +6608,36 @@ fn a_demolition_preview_adds_each_edge_back_under_its_own_new_id() {
         .load(
             "local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua') \
              HOOK.logged = {} \
-             local p = apply.proposalOf({ Bulldoze = { Edges = { network = 'Street', \
+             local p, why = apply.proposalOf({ Bulldoze = { Edges = { network = 'Street', \
                  edges = { { a = { x = 50, y = -40, z = 0 }, b = { x = 50, y = 40, z = 0 } } }, \
                  buildings = {} } } }, { company = 7 }) \
+             if p == nil then return 'REFUSED: ' .. tostring(why) end \
              local out = {} \
-             for _, s in ipairs(p[2].streetProposal.edgesToAdd) do \
-                 out[#out + 1] = s.entity .. ':' .. tostring(s.comp.entity) end \
+             for _, form in ipairs(p) do \
+                 for _, s in ipairs(form.streetProposal.edgesToAdd or {}) do \
+                     out[#out + 1] = s.entity .. ':' .. tostring(s.comp.entity) end end \
              return table.concat(out, ',')",
         )
         .eval()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
-        ids, "-1:-1",
-        "the segment and the component copy it carries name the same new id, \
-         so the replicator finds them equal"
+        ids, "-1:-1,-1:-1,-1:nil,-1:nil,-1:nil,-1:nil",
+        "six added edges under a new negative id. Only the `copy` form carries \
+         that id in its component, because it passes the game's own copy \
+         through -- the other two build a fresh component, which has no id of \
+         its own to disagree with the segment's"
     );
 }
 
-/// The demolition preview's proposal takes the lane configuration at a node
-/// only while an edge of the network is left there: the game builds the
-/// configuration again from the edges that stay, and its street shape factory
-/// asserts on the empty connection list of a node left with none
-/// ("!cc.empty()", StreetShapeFactory::PrepareTransitions, build 40408). The
-/// shape of a street that dead-ends is never built that way, and nothing of
-/// it is drawn. A node with a neighbour keeps its configuration, so a street
-/// between two others is drawn as before.
+/// The demolition preview's proposal takes the lane configuration at every end
+/// of the removed edges, a dead end included: the edge comes back under a new
+/// id, so the node has a segment to rebuild transitions from and the street
+/// shape factory does not assert on an empty connection list
+/// ("!cc.empty()", StreetShapeFactory::PrepareTransitions, build 40408). A
+/// configuration that still named the removed edge's old id would instead make
+/// `makeProposalData` raise "Unknown exception".
 #[test]
-fn a_demolition_preview_takes_a_nodes_configuration_only_while_an_edge_is_left() {
+fn a_demolition_preview_takes_a_nodes_configuration_at_every_end() {
     let configs = |extra: &str| -> String {
         let (lua, _script) = engine();
         lua.load(FAKE_NETWORK).exec().unwrap();
@@ -6887,8 +6899,8 @@ fn trees_bulldozed_go_in_every_game_behind_the_flag() {
     .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
         lua.load("return BUILT").eval::<String>().unwrap(),
-        "2|5100|100||0|0",
-        "both forms name the town building the game's own removal takes and \
+        "7|5100|100||0|0",
+        "every form names the town building the game's own removal takes and \
          the edge, and no node configuration: the street dead-ends at both its \
          nodes, nothing sent or said"
     );

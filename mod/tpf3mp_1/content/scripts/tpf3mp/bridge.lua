@@ -419,18 +419,24 @@ function Link:drawPreview(from, proposals, context, evaluate)
 	end
 	if type(proposals) ~= "table" then return nil, "a preview is a list of proposals" end
 	local refused = {}
-	for _, proposal in ipairs(proposals) do
+	for index, proposal in ipairs(proposals) do
+		-- The form's own name, so a refusal says *which* shape the game would
+		-- not read. Two forms of the same removal failing alike is a fact about
+		-- the removal; one failing is a fact about that form, and only the named
+		-- message tells the two apart (2026-10-04, after a run in which "the
+		-- game read none of 2 forms of it" named neither).
+		local label = type(proposal.name) == "string" and proposal.name or ("form " .. index)
 		local ok, armed, why = pcall(native.draw, tostring(from))
 		if not ok then return nil, tostring(armed) end
 		if armed ~= true then return nil, tostring(why or "the hook did not arm") end
 		local evaluated, err = pcall(evaluate, proposal, context)
 		local okDrawn, drawn, whyNot = pcall(native.drawn)
 		if not evaluated then
-			refused[#refused + 1] = tostring(err)
+			refused[#refused + 1] = label .. ": " .. tostring(err)
 		elseif not okDrawn then
 			return nil, tostring(drawn)
 		elseif drawn == nil then
-			refused[#refused + 1] = "the game made nothing to draw"
+			refused[#refused + 1] = label .. ": the game made nothing to draw"
 		elseif drawn ~= true then
 			return nil, tostring(whyNot or "not drawn")
 		else

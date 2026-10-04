@@ -222,43 +222,88 @@ end
 -- draws the removal itself.
 local function removals(context, part)
 	if not dry then return end
-	local function form(added)
+	local function form(name, added, configs)
 		local simple = api.type.SimpleProposal.new()
+		-- The form's own name: Link:drawPreview quotes it when the game refuses
+		-- this form, so the log says which shape would not read rather than
+		-- counting forms (2026-10-04, after a run in which "the game read none
+		-- of 2 forms of it" named neither).
+		simple.name = name
 		if part.buildings ~= nil and #part.buildings > 0 then simple.constructionsToRemove = part.buildings end
 		if part.edges ~= nil and #part.edges > 0 then simple.streetProposal.edgesToRemove = part.edges end
 		if added ~= nil and #added > 0 then simple.streetProposal.edgesToAdd = added end
-		if part.configs ~= nil and #part.configs > 0 then simple.streetProposal.nodeConfigsToRemove = part.configs end
+		if configs ~= nil and #configs > 0 then simple.streetProposal.nodeConfigsToRemove = configs end
 		return simple
 	end
-	local out = { form(nil) }
-	if part.added ~= nil and #part.added > 0 then out[#out + 1] = form(part.added) end
+	local out = { form("removal only", nil, part.configs) }
+	for _, how in ipairs({ "copy", "whole", "owned" }) do
+		local added = part.added ~= nil and part.added[how] or nil
+		if added ~= nil and #added > 0 then
+			out[#out + 1] = form("removed and added back (" .. how .. ")", added, part.configs)
+			out[#out + 1] = form("removed and added back (" .. how .. "), no configuration", added, nil)
+		end
+	end
 	error({ dry = true, proposals = out, context = context }, 0)
 end
 
 -- The edges `ids` again, as the SimpleProposal rule above asks: the same
 -- edges, with new negative ids, as the stop's rebuild does with the one it
--- replaces (rebuildWith). A copy of each edge's own component, which is a
--- copy the game hands out, so nothing here touches the world.
-local function edgesAddedBack(ids, network)
+-- replaces (rebuildWith).
+--
+-- `how` picks what the added edge's component carries, because the game reads
+-- a preview's added edge as a *new* one and which fields it needs for that is
+-- asked of the game form by form (removals, below):
+--   copy   what getComponent hands out, passed through, plus the segment's own
+--          id in the copy so the replicator finds the two equal
+--          (`entity == c.entity`, ecs::Replicator::Apply, build 40408)
+--   whole  a fresh component, filled field for field as networkInto fills a
+--          link's edge: the ends and geometry, type and typeIndex so a bridge
+--          stays a bridge, the template, style and type, the edge's own lane
+--          configurations and decorations, and a street's precedence
+--   owned  "whole" and the owning company, as rebuildWith and networkInto give
+--          the edges they add
+local function edgesAddedBack(ids, network, how)
 	local BASE_EDGE = api.type.ComponentType.BASE_EDGE
 	local added, nextId = {}, -1
 	for _, id in ipairs(ids) do
-		local comp = api.engine.getComponent(id, BASE_EDGE)
-		if comp ~= nil then
+		local own = api.engine.getComponent(id, BASE_EDGE)
+		if own ~= nil then
 			local s = api.type.SegmentAndEntity.new()
 			s.entity = nextId
 			nextId = nextId - 1
-			s.comp = comp
-			-- The copy carries the edge's own id in `entity`, and that is not
-			-- the new negative one this segment is added under. The
-			-- replicator compares the two and asserts that they are the same
-			-- (`entity == c.entity`, ecs::Replicator::Apply, build 40408),
-			-- which takes the game down — a native assertion, past any
-			-- pcall — as soon as the proposal is only *evaluated* for a
-			-- preview. The applied path never sees it: there the ids are
-			-- resolved on the way in (rebuildWith adds its edge the same
-			-- way, and that removal works).
-			pcall(function() s.comp.entity = s.entity end)
+			if how == "copy" then
+				s.comp = own
+				pcall(function() s.comp.entity = s.entity end)
+			else
+				local c = s.comp
+				c.node0, c.node1 = own.node0, own.node1
+				c.position0, c.position1 = own.position0, own.position1
+				c.tangent0, c.tangent1 = own.tangent0, own.tangent1
+				c.type, c.typeIndex = own.type, own.typeIndex
+				c.roadTemplate, c.roadStyle, c.roadType = own.roadTemplate, own.roadStyle, own.roadType
+				c.laneConfigs, c.edgeDecorations = own.laneConfigs, own.edgeDecorations
+				c.roadDevelopmentLocked = own.roadDevelopmentLocked
+				if network == "Track" then c.distance = own.distance end
+				if own.streetEdge ~= nil then
+					local ok, street = pcall(function() return api.type.BaseEdgeStreet.new() end)
+					if ok and street ~= nil then
+						street.precedenceNode0, street.precedenceNode1 =
+							own.streetEdge.precedenceNode0, own.streetEdge.precedenceNode1
+						s.streetEdge = street
+					end
+				end
+			end
+			if how == "owned" then
+				local owner = require_companies().ownerOf(api, id)
+				if owner ~= nil then
+					local ok = pcall(function() s.playerOwned.player = owner end)
+					if not ok then
+						local owned = api.type.PlayerOwned.new()
+						owned.player = owner
+						s.playerOwned = owned
+					end
+				end
+			end
 			s.type = network == "Track" and 1 or 0
 			added[#added + 1] = s
 		end
@@ -1331,8 +1376,12 @@ function HANDLERS.Bulldoze(b)
 		-- lookup.
 		local gone, buildings = townBuildingsRemoved(proposal, b.Edges.buildings or {})
 		if dry then
-			removals(context, { buildings = buildings, edges = ids,
-				added = edgesAddedBack(ids, network), configs = configsAtEndsOf(ids, network) })
+			removals(context, { buildings = buildings, edges = ids, configs = configsAtEndsOf(ids, network),
+				added = {
+					copy = edgesAddedBack(ids, network, "copy"),
+					whole = edgesAddedBack(ids, network, "whole"),
+					owned = edgesAddedBack(ids, network, "owned"),
+				} })
 		end
 		log("removing " .. network .. " edges " .. table.concat(ids, ",")
 			.. (gone ~= "" and (" and town buildings " .. gone) or ""))

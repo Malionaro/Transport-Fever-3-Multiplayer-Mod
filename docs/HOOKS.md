@@ -3295,27 +3295,41 @@ Both halves were found in the room's games on 2026-10-04, and the second
   group's rebuild, which a preview cannot show"* rather than showing the
   wrong thing, and `apply.proposalOf` keeps a handler's own reason where it
   has one).
-- **A node's lane configuration is only taken while an edge is left there.**
-  The second form above takes the configurations at the ends of the edges it
-  removes, and the game builds each of them again from the edges that stay at
-  that node. A node whose every edge of the network the proposal removes is
-  left with none, and the game builds none for it — its street shape factory
-  asserts on the empty connection list, and the assertion is caught per task:
+- **A demolition preview asks the game, form by form, and names every form.**
+  A preview's added edge is read by the game as a **new** one, and which fields
+  it needs for that is not documented anywhere, so it is asked rather than
+  guessed. `removals` (`apply.lua`) builds a list of named forms and
+  `Link:drawPreview` (`tpf3mp/bridge.lua`) tries them in turn, quoting the name
+  of the one the game refused:
 
-  > `Assertion '!cc.empty()' failed` — `StreetShapeFactory::PrepareTransitions`,
-  > build 40408, `StreetShapeFactory.cpp:979`
+  > `another member's Bulldoze preview does not show here: the game read none of
+  > 7 forms of it: removal only: Unknown exception / removed and added back
+  > (copy): Unknown exception / …`
 
-  So the shape of a street that **dead-ends** is never built, and nothing of it
-  is drawn: forty of these in one room on 2026-10-04, while every street with a
-  neighbour drew as it should. Such a node therefore **keeps** its
-  configuration (`configsAtEndsOf`, `apply.lua`), which is what the game needs
-  to build the shape at all; a node with an edge left keeps the removal of its
-  configuration, as before.
-- **An edge added back into a *preview* must carry its new id twice.** The
-  second form above adds each removed edge back under a fresh negative id, the
-  way the applied path does (`rebuildWith`, for the one edge a stop removal
-  replaces). But the component copy the game hands out still names the edge's
-  **own** id in its `entity`, and the replicator compares the two:
+  Two forms of one removal failing alike is a fact about the removal; one
+  failing is a fact about that form. Only the named message tells them apart —
+  a run whose log said *"the game read none of 2 forms of it"* named neither,
+  which is why several attempts at this failed by guesswork.
+
+  The three shapes of the added edge, each under new negative ids as the applied
+  path uses (`rebuildWith`), and each offered with and without the node
+  configurations:
+
+  | form | the added edge's component |
+  |---|---|
+  | `copy` | what `getComponent` hands out, passed through, with the segment's own id written into it |
+  | `whole` | a fresh component, filled field for field as `networkInto` fills a link's edge: ends and geometry, `type`/`typeIndex` so a bridge stays a bridge, `roadTemplate`, `roadStyle`, `roadType`, the edge's own `laneConfigs` and `edgeDecorations`, a street's `streetEdge` precedence |
+  | `owned` | `whole` plus the owning company, as `rebuildWith` and `networkInto` give the edges they add |
+
+  A bare copy is read as *the edge that is already there*: it draws nothing and
+  never changes, which is what left the piece at a dead end undrawn (2026-10-04,
+  in the game). `Assets` has no form at all (a plain `Proposal`, and no
+  `SimpleProposal` says it — the dry run says *"an asset group's rebuild, which
+  a preview cannot show"* rather than showing the wrong thing, and
+  `apply.proposalOf` keeps a handler's own reason where it has one).
+- **The `copy` form's component must carry the segment's new id.** The copy the
+  game hands out names the edge's **own** id in its `entity`, and the
+  replicator compares the two:
 
   > `Assertion 'entity == c.entity' failed` — `ecs::Replicator::Apply`
 
@@ -3324,8 +3338,24 @@ Both halves were found in the room's games on 2026-10-04, and the second
   to draw what another member is about to do), so the mismatch survives to the
   replicator — and an assertion in C++ is past every `pcall`: selecting the
   bulldozer took the game down (minidump, `stackTrace: null`, then a hang;
-  2026-10-04). So `edgesAddedBack` gives the copy the segment's new id as well
-  (`s.comp.entity = s.entity`), and the replicator finds them equal.
+  2026-10-04). So `edgesAddedBack` writes the segment's new id into the copy
+  (`s.comp.entity = s.entity`), and the replicator finds them equal. The two
+  forms that build a fresh component have no id of their own to disagree with.
+- **Every node's lane configuration goes with the edges, a dead end included.**
+  A configuration names the edges at its node, and `makeProposalData` raises
+  "Unknown exception" if an edge is removed while a configuration still names
+  its old id. Since every removed edge comes back under a new id, every node —
+  a dead end included — has an edge in the proposal, so
+  `StreetShapeFactory::PrepareTransitions` has segments to build transitions
+  from and does not assert on the empty connection list:
+
+  > `Assertion '!cc.empty()' failed` — `StreetShapeFactory::PrepareTransitions`,
+  > build 40408, `StreetShapeFactory.cpp:979`
+
+  Forty of these in one room on 2026-10-04, while every street with a neighbour
+  drew as it should. So `configsAtEndsOf` (`apply.lua`) takes the configuration
+  at **every** end of the removed edges; it does not distinguish dead ends from
+  junctions, and nothing in this path does.
 - **…and the demolition preview still ends the game, so it can be turned off
   without a rebuild.** With the assertion gone (no `Assertion` line is logged
   any more), selecting the bulldozer took the game down anyway: a plain native
