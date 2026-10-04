@@ -177,6 +177,20 @@ local function load(name)
 		resolveutil.__tpf3mp_before_load = nil
 		return "busy" -- let the menu apply the removal before starting a load
 	end
+	local ok, busy = pcall(function()
+		if not (api and api.modhub and api.modhub.getBackendIDs and api.modhub.getModManagementState) then
+			return false
+		end
+		for _, backendId in ipairs(api.modhub.getBackendIDs()) do
+			local state = api.modhub.getModManagementState(backendId)
+			if state and state.busy then return true end
+		end
+		return false
+	end)
+	if ok and busy then return "busy" end
+	if resolveutil and resolveutil.__tpf3mp_set_page then
+		pcall(resolveutil.__tpf3mp_set_page, "ProgressPage", {})
+	end
 	local info = nil
 	if plan and plan() then
 		-- The room's mods, not the save's: its details first, read by the
@@ -983,6 +997,34 @@ pub(crate) mod tests {
             ))
         );
         assert_eq!(menu.run("return #LOADS"), Ok("1".into()));
+        forget_all();
+    }
+
+    #[test]
+    fn modhub_busy_delays_loading_and_set_page_switches_to_progress_page() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        menu51();
+        forget_all();
+        let menu = Lua::new();
+        menu.run(FAKE_MENU).unwrap();
+        menu.run(
+            r#"
+            PAGE = ''
+            resolveutil = { __tpf3mp_set_page = function(p) PAGE = p end }
+            MODHUB_BUSY = true
+            api.modhub = {
+                getBackendIDs = function() return { 'modio' } end,
+                getModManagementState = function(id) return { busy = MODHUB_BUSY } end,
+            }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(unsafe { adopt(menu.state()) }, Ok(true));
+        assert_eq!(unsafe { serve("room") }, Some(Served::Busy));
+        assert_eq!(menu.run("return #LOADS, PAGE"), Ok("0|".into()));
+        menu.run("MODHUB_BUSY = false").unwrap();
+        assert_eq!(unsafe { serve("room") }, Some(Served::Started));
+        assert_eq!(menu.run("return #LOADS, PAGE"), Ok("1|ProgressPage".into()));
         forget_all();
     }
 

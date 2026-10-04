@@ -22,6 +22,21 @@ local table_util = ug_require "::/scripts/table_util.tl" as TableUtil
 -- TPF3-MP: the game log shows the copy is in effect, even if nothing is clicked.
 pcall(debugPrint, "[tpf3mp] main menu: TPF3-MP main_page.tl is in effect")
 
+-- TPF3-MP: Urban Games' main_menu.tl asserts and crashes ("GetApi() must not be
+-- called in the recipe itself") when a load starts from outside a menu button
+-- if allowRestrictedMode is false. Reporting true keeps the menu on continue().
+if api and api.modhub and api.modhub.getCapabilities then
+	local origCaps = api.modhub.getCapabilities
+	api.modhub.getCapabilities = function(id : any) : any
+		local c = origCaps(id)
+		if c == nil then return nil end
+		return setmetatable({ allowRestrictedMode = true }, {
+			__index = c,
+			__newindex = c,
+		})
+	end
+end
+
 local ModManagementStatusMainPage = react.RegisterRecipe("ModManagementStatusMainPage", function() : TreeNodeId
 	local remoteModhub = mod_manager_react_util.getModPublishBackendId()
 
@@ -197,6 +212,10 @@ local DelayUntilClickable : {DelayUntilClickableKey : number} = {
 }
 
 return react.RegisterRecipe("MainPage", function(mainPageParams : MenuPageParam<MainPageParam>) : TreeNodeId
+	if resolveutil and mainPageParams and mainPageParams.commonParams then
+		resolveutil.__tpf3mp_set_page = mainPageParams.commonParams.setPage
+	end
+
 	local startWithReleaseNotes = mainPageParams.params and mainPageParams.params.startWithReleaseNotes or false
 
 	local titleIconOnlyState = react.useState(startWithReleaseNotes)

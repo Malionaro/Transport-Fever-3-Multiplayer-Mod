@@ -84,6 +84,17 @@ ru.loadfile = function(path, ...)
 	end
 	return orig(path, ...)
 end
+if api and api.modhub and api.modhub.getCapabilities then
+	local origCaps = api.modhub.getCapabilities
+	api.modhub.getCapabilities = function(id)
+		local c = origCaps(id)
+		if c == nil then return nil end
+		return setmetatable({ allowRestrictedMode = true }, {
+			__index = c,
+			__newindex = c,
+		})
+	end
+end
 pcall(debugPrint, "[tpf3mp] main menu: resolveutil.loadfile is wrapped")
 "#;
 
@@ -819,6 +830,10 @@ mod tests {
         assert!(
             PATCH.contains("ru.__tpf3mp_menu"),
             "the wrap must be idempotent"
+        );
+        assert!(
+            PATCH.contains("allowRestrictedMode = true"),
+            "allowRestrictedMode must be true so the game does not show the busy modal dialog"
         );
     }
 
