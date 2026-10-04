@@ -3273,44 +3273,50 @@ Both halves were found in the room's games on 2026-10-04:
     room — and for dead ends, its lack of edges left behind caused its street
     shape factory to assert on the empty connection list (`Assertion '!cc.empty()' failed`
     in `StreetShapeFactory::PrepareTransitions`).
-  - Adding the removed edges back (`edgesToAdd`, new negative ids, the same
-    shape `rebuildWith` gives the one edge a stop removal replaces, plus
-    `nodeConfigsToRemove` at their ends) makes `makeProposalData` accept it:
-    `another member's Bulldoze preview, as this game sees it: fine`. It draws
-    in the hook's renderer with the tool's highlight.
-- **The preview uses the one form the game reads.** The proposal adds the
-  removed edges back under new negative ids (`edgesAddedBack`, `apply.lua`).
-  Bare removals without added edges are not sent to `makeProposalData`.
-  `Construction` and `EdgeObject` have one form each; `Assets` none (a plain
-  `Proposal`, and no `SimpleProposal` says it — the dry run says *"an asset
-  group's rebuild, which a preview cannot show"* rather than showing the
-  wrong thing, and `apply.proposalOf` keeps a handler's own reason where it
-  has one).
-- **Node lane configurations are taken at all ends of the removed edges.**
-  A node's lane configuration (`BASE_NODE_CONFIG`) names the edges at it, and
-  `makeProposalData` raises "Unknown exception" if an edge is removed while an
-  existing configuration still references its old id. Because the edges are
-  added back under new negative ids in `edgesToAdd`, every node (including
-  nodes that dead-end or segments unconnected at both ends) has an edge in the
-  proposal — so `StreetShapeFactory::PrepareTransitions` has segments to build
-  from and does not assert, while taking the configurations at all ends
-  (`configsAtEndsOf`) allows `makeProposalData` to evaluate cleanly. Dead-end
-  streets and tracks draw their preview just like connected ones.
-- **An edge added back into a *preview* must carry its new id twice.** The
-  second form above adds each removed edge back under a fresh negative id, the
-  way the applied path does (`rebuildWith`, for the one edge a stop removal
-  replaces). But the component copy the game hands out still names the edge's
-  **own** id in its `entity`, and the replicator compares the two:
+  - Adding the removed edges back (`edgesToAdd`, new negative ids, rebuilt field
+    for field as `networkInto` builds a link's edge, plus `nodeConfigsToRemove`
+    at their ends) is what `makeProposalData` reads. What it draws is a separate
+    question, and for a removal the answer was found in the game: a bare copy of
+    the removed edge's own component is read as *the edge that is already
+    there* and draws nothing, so the piece at a dead end never appeared.
+- **A demolition preview is a list of forms, each named, and the first the
+  game reads is drawn.** `Link:drawPreview` (`tpf3mp/bridge.lua`) tries each in
+  turn and the log says which one the game refused, by name — `removals`
+  (`apply.lua`) names them *"removed and added back"* and *"removal only"*,
+  so a refusal reads
 
-  > `Assertion 'entity == c.entity' failed` — `ecs::Replicator::Apply`
+  > `the game read none of 2 forms of it: removed and added back: Unknown
+  > exception / removal only: Unknown exception`
 
-  The applied path never sees it, because there the ids are resolved on the way
-  in. A **preview** is only *evaluated* (`makeProposalData`, in the room's game,
-  to draw what another member is about to do), so the mismatch survives to the
-  replicator — and an assertion in C++ is past every `pcall`: selecting the
-  bulldozer took the game down (minidump, `stackTrace: null`, then a hang;
-  2026-10-04). So `edgesAddedBack` gives the copy the segment's new id as well
-  (`s.comp.entity = s.entity`), and the replicator finds them equal.
+  and not a count. `Construction` and `EdgeObject` have one form each;
+  `Assets` none (a plain `Proposal`, and no `SimpleProposal` says it — the dry
+  run says *"an asset group's rebuild, which a preview cannot show"* rather
+  than showing the wrong thing, and `apply.proposalOf` keeps a handler's own
+  reason where it has one).
+- **An edge added back for a preview is rebuilt field for field, not copied.**
+  The game reads an edge in `edgesToAdd` as a **new** one, and for that it needs
+  what `networkInto` writes for a link's edge: its ends and geometry, its
+  `type`/`typeIndex` (so a bridge stays a bridge), its `roadTemplate`,
+  `roadStyle`, `roadType`, its own `laneConfigs` and `edgeDecorations`, and a
+  street's `streetEdge` precedence. A bare copy of what `getComponent` hands
+  out is read as *the edge that is already there*: it draws nothing, it never
+  changes, and the piece at a dead end never appears (2026-10-04, in the game).
+  So `edgesAddedBack` copies the fields onto a fresh `comp` rather than passing
+  the copy through.
+- **Node lane configurations are taken at every end of the removed edges,
+  including a dead end.** A node's lane configuration (`BASE_NODE_CONFIG`) names
+  the edges at it, and `makeProposalData` raises "Unknown exception" if an edge
+  is removed while a configuration still names its old id. Since every removed
+  edge is added back under a new negative id, every node — a dead end included —
+  has an edge in the proposal, so `StreetShapeFactory::PrepareTransitions` has
+  segments to build transitions from and does not assert on an empty connection
+  list. `configsAtEndsOf` therefore takes them at **all** ends; it does not
+  distinguish dead ends from junctions, and nothing in this path does.
+- **The applied path and the preview path differ on purpose.** The preview only
+  *evaluates* (`makeProposalData`, in the room's game, to draw what another
+  member is about to do); the applied path resolves ids on the way in. So a
+  shape that reads for one need not read for the other, which is why the
+  preview asks the game per form rather than reusing the applied proposal.
 - **…and the demolition preview still ends the game, so it can be turned off
   without a rebuild.** With the assertion gone (no `Assertion` line is logged
   any more), selecting the bulldozer took the game down anyway: a plain native
