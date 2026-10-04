@@ -4737,10 +4737,12 @@ fn a_bulldozes_preview_is_the_removal_its_build_would_send() {
     .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     let (removed, street, players, sent, logged): (String, String, String, usize, usize) = lua
         .load(
-            "local s = STREET[1] \
-             local back = s.streetProposal.edgesToAdd[1] \
+            "local first, second = STREET[1], STREET[2] \
+             local back = second.streetProposal.edgesToAdd[1] \
              return tostring(DEPOT[1].constructionsToRemove[1]), \
-                 #STREET .. '|' .. table.concat(s.streetProposal.edgesToRemove, ',') \
+                 #STREET .. '|' .. table.concat(first.streetProposal.edgesToRemove, ',') \
+                     .. '|' .. tostring(first.streetProposal.edgesToAdd == nil) \
+                     .. '|' .. table.concat(second.streetProposal.edgesToRemove, ',') \
                      .. '>' .. back.entity .. ':' .. back.comp.node0 .. '>' .. back.comp.node1, \
                  tostring(C1.player) .. ',' .. tostring(C2.player), #SENT, #HOOK.logged",
         )
@@ -4754,7 +4756,15 @@ fn a_bulldozes_preview_is_the_removal_its_build_would_send() {
             sent,
             logged
         ),
-        ("5000", "1|100>-1:8>9", "31,31", 0, 0),
+        (
+            "5000",
+            // two forms for the street: the first says only that the edge
+            // goes, the second adds the same edge back
+            "2|100|true|100>-1:8>9",
+            "31,31",
+            0,
+            0
+        ),
         "the depot as a construction to remove and the street as the edge \
          removed and added back, each for the sender's company, nothing sent \
          or said"
@@ -6458,10 +6468,12 @@ fn a_town_building_bulldozed_goes_in_every_game_charged_to_the_players_company()
              edges = { { a = { x = 50, y = -40, z = 0 }, b = { x = 50, y = 40, z = 0 } } }, \
              buildings = {} } } }, { company = 7 }) \
          KEPT = table.concat({ #p, \
-             table.concat(p[1].streetProposal.edgesToRemove, ',') \
-                 .. '>' .. p[1].streetProposal.edgesToAdd[1].entity \
-                 .. ':' .. p[1].streetProposal.edgesToAdd[1].comp.node0 \
-                 .. '>' .. p[1].streetProposal.edgesToAdd[1].comp.node1, \
+             table.concat(p[1].streetProposal.edgesToRemove, ','), \
+             tostring(p[1].streetProposal.edgesToAdd == nil), \
+             table.concat(p[2].streetProposal.edgesToRemove, ',') \
+                 .. '>' .. p[2].streetProposal.edgesToAdd[1].entity \
+                 .. ':' .. p[2].streetProposal.edgesToAdd[1].comp.node0 \
+                 .. '>' .. p[2].streetProposal.edgesToAdd[1].comp.node1, \
              table.concat(p[1].streetProposal.nodeConfigsToRemove or {}, ','), \
              #SENT, #HOOK.logged }, '|')",
     )
@@ -6469,10 +6481,13 @@ fn a_town_building_bulldozed_goes_in_every_game_charged_to_the_players_company()
     .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
         lua.load("return KEPT").eval::<String>().unwrap(),
-        "1|100>-1:8>9|8,9|0|0",
-        "the edge removed and added back under a new id, taking the \
-         configurations at both its nodes (including dead-ends, so \
-         makeProposalData builds cleanly). Nothing sent or said"
+        "2|100|true|100>-1:8>9||0|0",
+        "two forms: the first says only that the edge goes, the second adds \
+         it back with a new id. Neither takes a configuration: the street \
+         dead-ends at both its nodes, so the game would have none to build \
+         and its street shape factory asserts on the empty one \
+         (StreetShapeFactory::PrepareTransitions, \"!cc.empty()\"). Nothing \
+         sent or said"
     );
     let eval = |code: &str| -> String {
         lua.load(code).eval::<String>().unwrap_or_else(|error| {
@@ -6563,9 +6578,9 @@ fn a_demolition_preview_can_be_turned_off_without_a_rebuild() {
         .eval::<String>()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
-        both, "nil|the demolition preview is off (TPF3MP_NO_BULLDOZE_PREVIEW)|0|0|1|table|0",
+        both, "nil|the demolition preview is off (TPF3MP_NO_BULLDOZE_PREVIEW)|0|0|2|table|0",
         "with the flag set: nothing proposed, the reason said, nothing sent or \
-         logged; without it: the proposal again, and nothing said"
+         logged; without it: the two forms again, and nothing said"
     );
 }
 
@@ -6588,7 +6603,7 @@ fn a_demolition_preview_adds_each_edge_back_under_its_own_new_id() {
                  edges = { { a = { x = 50, y = -40, z = 0 }, b = { x = 50, y = 40, z = 0 } } }, \
                  buildings = {} } } }, { company = 7 }) \
              local out = {} \
-             for _, s in ipairs(p[1].streetProposal.edgesToAdd) do \
+             for _, s in ipairs(p[2].streetProposal.edgesToAdd) do \
                  out[#out + 1] = s.entity .. ':' .. tostring(s.comp.entity) end \
              return table.concat(out, ',')",
         )
@@ -6601,13 +6616,16 @@ fn a_demolition_preview_adds_each_edge_back_under_its_own_new_id() {
     );
 }
 
-/// The demolition preview's proposal takes the lane configurations at the
-/// ends of the removed edges, including nodes that dead-end: the edge is added
-/// back under a new id, so the node has an edge to rebuild transitions from,
-/// and the old configuration that still referenced the removed edge is
-/// replaced rather than causing an "Unknown exception".
+/// The demolition preview's proposal takes the lane configuration at a node
+/// only while an edge of the network is left there: the game builds the
+/// configuration again from the edges that stay, and its street shape factory
+/// asserts on the empty connection list of a node left with none
+/// ("!cc.empty()", StreetShapeFactory::PrepareTransitions, build 40408). The
+/// shape of a street that dead-ends is never built that way, and nothing of
+/// it is drawn. A node with a neighbour keeps its configuration, so a street
+/// between two others is drawn as before.
 #[test]
-fn a_demolition_preview_takes_node_configurations_at_all_ends_including_dead_ends() {
+fn a_demolition_preview_takes_a_nodes_configuration_only_while_an_edge_is_left() {
     let configs = |extra: &str| -> String {
         let (lua, _script) = engine();
         lua.load(FAKE_NETWORK).exec().unwrap();
@@ -6621,22 +6639,22 @@ fn a_demolition_preview_takes_node_configurations_at_all_ends_including_dead_end
              local p = apply.proposalOf({ Bulldoze = { Edges = { network = 'Street', \
                  edges = { { a = { x = 50, y = -40, z = 0 }, b = { x = 50, y = 40, z = 0 } } }, \
                  buildings = {} } } }, { company = 7 }) \
-             return table.concat(p[1].streetProposal.nodeConfigsToRemove or {}, ',')",
+             return table.concat(p[2].streetProposal.nodeConfigsToRemove or {}, ',')",
         )
         .eval::<String>()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)))
     };
     assert_eq!(
         configs("STREETS[9] = { 100, 101 } EDGES[101].node0 = 10 EDGES[101].node1 = 9"),
-        "8,9",
-        "both configurations taken: node 9 which keeps an edge, and node 8 \
-         which dead-ends"
+        "9",
+        "the configuration of the node that keeps an edge, and not the \
+         dead-end's"
     );
     assert_eq!(
         configs(""),
-        "8,9",
-        "both configurations taken even when the street dead-ends at both its \
-         nodes: the added-back edge gives each node a segment to rebuild from"
+        "",
+        "no configuration taken: the street dead-ends at both its nodes, and \
+         the game builds none for a node left with no edge"
     );
 }
 
@@ -6869,10 +6887,10 @@ fn trees_bulldozed_go_in_every_game_behind_the_flag() {
     .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
         lua.load("return BUILT").eval::<String>().unwrap(),
-        "1|5100|100|8,9|0|0",
-        "names the town building the game's own removal takes, the \
-         edge, and the node configurations at both its ends, nothing sent or \
-         said"
+        "2|5100|100||0|0",
+        "both forms name the town building the game's own removal takes and \
+         the edge, and no node configuration: the street dead-ends at both its \
+         nodes, nothing sent or said"
     );
     let shown = eval(
         "local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua') \
