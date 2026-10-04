@@ -325,6 +325,7 @@ end
 -- nothing, the callbacks waiting on each one's commands, by ticket, and
 -- the answers held back until the GUI sees what they made.
 local guarded = setmetatable({}, { __mode = "k" })
+local wakeReplay = setmetatable({}, { __mode = "k" })
 local waiting = setmetatable({}, { __mode = "k" })
 local held = setmetatable({}, { __mode = "k" })
 
@@ -365,6 +366,13 @@ function guard.install(cmd, env)
 	if guarded[cmd] then return guarded[cmd] end
 	local send = cmd.sendCommand
 	if send == nil then return nil, "api.cmd has no sendCommand" end
+	local event = cmd.makeScriptingSendEventCmd
+	if event then
+		-- This bypass can send only a wake token, never a player's action.
+		wakeReplay[cmd] = function(token)
+			return send(event("", "tpf3mp", "command", token))
+		end
+	end
 
 	-- The factory each command came from, and its arguments, by the command
 	-- itself.
@@ -481,6 +489,16 @@ function guard.install(cmd, env)
 	guarded[cmd] = wrapped
 	waiting[cmd] = {}
 	return wrapped
+end
+
+function guard.wakeReplay(cmd, token)
+	if type(token) ~= "string" or not token:match("^%d+$") or #token > 20 then
+		return nil, "an ordered replay token is a decimal string"
+	end
+	local wake = wakeReplay[cmd]
+	if not wake then return nil, "the GUI cannot wake the game script" end
+	local ok, why = pcall(wake, token)
+	return ok or nil, not ok and tostring(why) or nil
 end
 
 -- What became of the commands the guard handed to the room: `results` is

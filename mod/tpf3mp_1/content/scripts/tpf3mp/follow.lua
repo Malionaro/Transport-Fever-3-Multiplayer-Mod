@@ -32,6 +32,9 @@ follow.sources = follow.sources or {}
 -- getPlayer wrappers this module made, so an install over one of its own is
 -- a no-op and one over a fresh api is told apart.
 follow.wrappers = follow.wrappers or setmetatable({}, { __mode = "k" })
+-- getComponent wrappers this module made, so finance-window following can
+-- also be restored when the GUI gives the state a fresh api table.
+follow.loanWrappers = follow.loanWrappers or setmetatable({}, { __mode = "k" })
 -- How many times getPlayer was put in front of a game's own.
 follow.installs = 0
 -- What the wrappers answered last, for the log (follow.say).
@@ -64,6 +67,12 @@ local function currentApi(given)
 	return ok and g or nil
 end
 
+local function ensureLoanWindow(api)
+	local ok, installed, why = pcall(follow.loans, api, follow.answer)
+	if not ok then return false, tostring(installed) end
+	return installed, why
+end
+
 -- Puts the company in front of api.engine.util.getPlayer in `api` (or the
 -- state's current api) unless it is there already: a wrapper that answers
 -- follow.answer(), or, when that is nil (outside the room, before the roster
@@ -76,7 +85,11 @@ function follow.ensure(api)
 	-- A function, or a callable table, as the game's bindings are (build
 	-- 40408: a table with a metatable).
 	local original = ok and util ~= nil and select(2, pcall(function() return util.getPlayer end)) or nil
-	if follow.wrappers[original] then return true end
+	if follow.wrappers[original] then
+		local loans, loanWhy = ensureLoanWindow(api)
+		if not loans then return false, "the finance window's company loan view cannot follow this api: " .. tostring(loanWhy) end
+		return true
+	end
 	if type(original) ~= "function" and type(original) ~= "table" and type(original) ~= "userdata" then
 		return false, "no api.engine.util.getPlayer (" .. type(util) .. ", " .. type(original) .. ")"
 	end
@@ -104,6 +117,86 @@ function follow.ensure(api)
 	follow.installs = follow.installs + 1
 	if follow.installs > 1 then
 		say("the GUI's getPlayer was the game's own again (a new api in this state); it follows the player's company again")
+	end
+	local loans, loanWhy = ensureLoanWindow(api)
+	if not loans then return false, "the finance window's company loan view cannot follow this api: " .. tostring(loanWhy) end
+	return true
+end
+
+-- The game's finance window reads the loans it lists and offers from the
+-- loan script's state (finances_loan_gui.tl, LoanBoard:
+-- getComponent(getEntityForGameScript(LOAN_SCRIPT), GAME_SCRIPT).state),
+-- which keeps the room's first company's loans only. In this GUI state the
+-- loan script's component is answered, for a player of another company,
+-- with that company's own loans and the offers it can take
+-- (tpf3mp/companies.lua, loanTable); its Obtain and Repay then go to the
+-- room as that company's (tpf3mp/guard.lua). The simulation's states, and
+-- the loan script's own state, are left alone. Where the company's loans
+-- cannot be read, the window shows none and offers none, never the first
+-- company's.
+follow.LOAN_SCRIPT = "::/game_mechanics/finance/loan.gs"
+-- Seconds a company's loans are read for, at most.
+follow.LOANS_EVERY = 0.5
+
+function follow.loans(api, mine)
+	local engine = api.engine
+	local original = engine and engine.getComponent
+	if original == nil then return false, "no api.engine.getComponent" end
+	if follow.loanWrappers[original] then return true end
+	if type(original) ~= "function" and type(original) ~= "table" and type(original) ~= "userdata" then
+		return false, "no api.engine.getComponent (" .. type(original) .. ")"
+	end
+	local function companies()
+		local loaded = type(package) == "table" and package.loaded and package.loaded["tpf3mp.companies"]
+		if loaded then return loaded end
+		return ug_require("tpf3mp_1::/scripts/tpf3mp/companies.lua")
+	end
+	local function now()
+		local ok, t = pcall(os.clock)
+		return ok and t or 0
+	end
+	local loanEntity, cached, cachedFor, cachedAt = nil, nil, nil, nil
+	local function companyLoans(company)
+		local t = now()
+		if cached ~= nil and cachedFor == company and t - cachedAt < follow.LOANS_EVERY then return cached end
+		local table0 = { availableLoans = {}, obtainedLoans = {}, freeId = 0 }
+		local ok, built = pcall(function()
+			local c = companies()
+			local state = c.scriptState(api)
+			local roster = state and state.companies
+			local own = roster and c.byEntity(roster, company)
+			if not own then return nil end
+			local real = original(loanEntity, api.type.ComponentType.GAME_SCRIPT)
+			real = real and real.state
+			return c.loanTable(roster, own.id, real, api.util.getDefaultMonthDuration())
+		end)
+		cached, cachedFor, cachedAt = (ok and built) or table0, company, t
+		return cached
+	end
+	local wrapper = function(entity, kind, ...)
+		if kind ~= nil and entity ~= nil then
+			local isLoans = false
+			pcall(function()
+				if loanEntity == nil or loanEntity < 0 then
+					loanEntity = api.engine.system.gameScriptSystem.getEntityForGameScript(follow.LOAN_SCRIPT)
+				end
+				isLoans = type(loanEntity) == "number" and loanEntity >= 0 and entity == loanEntity
+					and kind == api.type.ComponentType.GAME_SCRIPT
+			end)
+			if isLoans then
+				local got, company = pcall(mine)
+				if got and type(company) == "number" then
+					return { state = companyLoans(company) }
+				end
+			end
+		end
+		return original(entity, kind, ...)
+	end
+	follow.loanWrappers[wrapper] = true
+	local replaced, why = pcall(function() engine.getComponent = wrapper end)
+	local took = replaced and select(2, pcall(function() return api.engine.getComponent == wrapper end))
+	if took ~= true then
+		return false, "api.engine keeps its getComponent" .. (why and (": " .. tostring(why)) or "")
 	end
 	return true
 end

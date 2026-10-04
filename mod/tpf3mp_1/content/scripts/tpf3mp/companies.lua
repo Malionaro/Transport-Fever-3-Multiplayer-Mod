@@ -515,6 +515,19 @@ function companies.mayTouch(roster, company, entity, api, what)
 	return false, "the " .. (what or "thing") .. " belongs to " .. name
 end
 
+-- A company's vehicles use its own depots (DECISIONS.md, D22 station-access
+-- decision). Unlike mayTouch, a depot with no readable owner is not usable in
+-- a multi-company room: do not let a missing PLAYER_OWNED component turn into
+-- permission. With one company, keep the game's native purchase behavior.
+function companies.mayBuyAtDepot(roster, company, depot, api)
+	if not companies.painting(roster) then return true end
+	local owner = companies.ownerOf(api, depot)
+	if owner == company then return true end
+	if owner == nil then return false, "the depot has no company owner" end
+	local other = roster and companies.byEntity(roster, owner)
+	return false, "the depot belongs to " .. (other and other.name or "another company")
+end
+
 -- Whether `company` (a player entity) may have its lines stop at the
 -- station group `group` (D22, proposed): one no company owns, its own, or
 -- another company's that keeps its stations open. Else false and why,
@@ -790,6 +803,132 @@ end
 --                      paid =, rate = (a month), payment = }, ... }
 --   roster.nextLoan = n
 --   roster.month = the last month whose payments were booked
+--   roster.loanOffers = { { company = id, availableLoans = { Loan, ... } }, ... }
+
+companies.LOAN_SCRIPT = "::/game_mechanics/finance/loan.gs"
+
+local function loanState(api)
+	local ok, state = pcall(function()
+		local entity = api.engine.system.gameScriptSystem.getEntityForGameScript(companies.LOAN_SCRIPT)
+		if type(entity) ~= "number" or entity < 0 then return nil end
+		local component = api.engine.getComponent(entity, api.type.ComponentType.GAME_SCRIPT)
+		return component and component.state
+	end)
+	return ok and type(state) == "table" and state or nil
+end
+
+local function copyOffer(offer)
+	if type(offer) ~= "table" then return nil end
+	local out = {}
+	for key, value in pairs(offer) do out[key] = value end
+	return out
+end
+
+local function loanOfferGroup(roster, id)
+	for _, group in ipairs(type(roster) == "table" and roster.loanOffers or {}) do
+		if type(group) == "table" and group.company == id then return group end
+	end
+	return nil
+end
+
+local function createLoan(api, kind)
+	if type(ug_require) ~= "function" or type(kind) ~= "string" then return nil end
+	local ok, util = pcall(ug_require, "::/game_mechanics/finance/loan_util.tl")
+	if not ok or type(util) ~= "table" then return nil end
+	local make = util["create" .. kind .. "Loan"]
+	if type(make) ~= "function" then return nil end
+	ok, util = pcall(make)
+	if not ok or type(util) ~= "table" or util.type ~= kind or type(util.amount) ~= "number"
+		or type(util.duration) ~= "number" or type(util.percentage) ~= "number" then return nil end
+	return copyOffer(util)
+end
+
+-- A founded company starts with its own copy of the native loan offers. A
+-- native cooldown belongs only to the save's player, so draw a fresh offer
+-- of that kind from the game's utility, as the native loan update does.
+-- Called from the ordered simulation update, where the room has seeded
+-- math.random identically in every game.
+local function seedLoanOffers(roster, id, api)
+	if id == 0 or loanOfferGroup(roster, id) then return loanOfferGroup(roster, id) end
+	local real = loanState(api)
+	if type(real) ~= "table" or type(real.availableLoans) ~= "table" then return nil end
+	local offers = {}
+	for i, source in ipairs(real.availableLoans) do
+		local offer = copyOffer(source)
+		if offer and offer.cooldownUntil ~= nil then
+			offer = createLoan(api, offer.type) or offer
+		end
+		if offer then offers[i] = offer end
+	end
+	if #offers == 0 then return nil end
+	roster.loanOffers = roster.loanOffers or {}
+	local group = { company = id, availableLoans = offers }
+	roster.loanOffers[#roster.loanOffers + 1] = group
+	return group
+end
+
+-- Seed companies on the simulation side, including a roster saved before
+-- company offers became persistent. GUI reads never mutate the roster.
+function companies.ensureLoanOffers(roster, api)
+	if type(roster) ~= "table" then return false end
+	local changed = false
+	for _, c in ipairs(companies.live(roster)) do
+		if c.id ~= 0 and not loanOfferGroup(roster, c.id) then
+			if seedLoanOffers(roster, c.id, api) then changed = true end
+		end
+	end
+	return changed
+end
+
+-- Keep the simulation update alive when an old roster needs its offers
+-- initialized, or when one of its independent cooldowns expires.
+function companies.loanOffersNeedInit(roster, api)
+	local real = loanState(api)
+	if type(roster) ~= "table" or type(real) ~= "table" or type(real.availableLoans) ~= "table" then return false end
+	for _, c in ipairs(companies.live(roster)) do
+		if c.id ~= 0 and not loanOfferGroup(roster, c.id) then return true end
+	end
+	return false
+end
+
+local function gameTimeNow(api)
+	local ok, gameTime = pcall(function()
+		local world = api.engine.util.getWorld()
+		local time = api.engine.getComponent(world, api.type.ComponentType.GAME_TIME)
+		return time and time.gameTime
+	end)
+	return ok and type(gameTime) == "number" and gameTime or nil
+end
+
+function companies.loanOffersDue(roster, api)
+	local now = gameTimeNow(api)
+	if now == nil then return false end
+	for _, group in ipairs(type(roster) == "table" and roster.loanOffers or {}) do
+		for _, offer in ipairs(type(group) == "table" and group.availableLoans or {}) do
+			if type(offer) == "table" and type(offer.cooldownUntil) == "number" and offer.cooldownUntil < now then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function companies.refreshLoanOffers(roster, api)
+	local now = gameTimeNow(api)
+	if now == nil then return false, "this game does not say what time it is" end
+	local changed = false
+	for _, group in ipairs(type(roster) == "table" and roster.loanOffers or {}) do
+		for i, offer in ipairs(type(group) == "table" and group.availableLoans or {}) do
+			if type(offer) == "table" and type(offer.cooldownUntil) == "number" and offer.cooldownUntil < now then
+				local fresh = createLoan(api, offer.type)
+				if not fresh then return false, "the game's loan utility cannot replace a cooled-down offer" end
+				group.availableLoans[i] = fresh
+				changed = true
+			end
+		end
+	end
+	return changed
+end
 
 -- The month of the game's calendar now, counted from the game's start; nil
 -- where the game does not say.
@@ -835,25 +974,79 @@ function companies.loansOf(roster, id)
 	return out
 end
 
--- Company `id` takes the loan `terms` (the loan script's own: amount, the
--- duration in the game's milliseconds, the interest a year as a fraction).
-function companies.borrow(roster, id, terms, send, api)
+-- The most loans a company has at once, as the game's loan script allows
+-- (loan_util.tl, maximalObtainableLoans).
+companies.MAX_LOANS = 4
+
+-- The loan script's state (LoanTable, loan.d.tl) as the game's finance
+-- window should show it to a player of company `id`, not the room's first:
+-- the company's persisted offers and loans, each by its room id and amount,
+-- which its Repay sends back (companies.repay). The first company continues
+-- to use the game's own loan state. `monthLength` is the game's.
+function companies.loanTable(roster, id, real, monthLength, fresh)
+	local offers = {}
+	local group = id ~= 0 and loanOfferGroup(roster, id) or nil
+	local source = group and group.availableLoans
+	if not group and id == 0 then source = type(real) == "table" and real.availableLoans end
+	for _, offer in ipairs(type(source) == "table" and source or {}) do
+		local copyOfOffer = copyOffer(offer)
+		if copyOfOffer then offers[#offers + 1] = copyOfOffer end
+	end
+	local obtained = {}
+	for _, loan in ipairs(type(roster) == "table" and companies.loansOf(roster, id) or {}) do
+		obtained[#obtained + 1] = { type = loan.type or "Custom", amount = loan.amount,
+			duration = loan.months * monthLength, percentage = loan.rate * 12,
+			timesPaid = loan.paid, id = loan.id }
+	end
+	return { availableLoans = offers, obtainedLoans = obtained, freeId = type(roster) == "table" and roster.nextLoan or 1 }
+end
+
+local function sameOffer(offer, terms)
+	return type(offer) == "table" and type(terms) == "table"
+		and offer.type == terms.type and offer.amount == terms.amount
+		and offer.duration == terms.duration and offer.percentage == terms.percentage
+end
+
+-- Company `id` takes an exact offer in its own slot. `next` is the fresh
+-- loan the native finance window draws before clicking; like loan.script.tl,
+-- only its type identifies the slot that goes on cooldown.
+function companies.borrow(roster, id, terms, nextTerms, send, api)
 	local c = companies.find(roster, id)
 	if not c or c.gone then return false, "there is no such company" end
-	local amount = type(terms) == "table" and tonumber(terms.amount)
-	local duration = type(terms) == "table" and tonumber(terms.duration)
-	local percentage = type(terms) == "table" and tonumber(terms.percentage) or 0
-	if not amount or amount <= 0 or not duration or duration <= 0 then return false, "a loan needs an amount and a duration" end
+	if #companies.loansOf(roster, id) >= companies.MAX_LOANS then
+		return false, c.name .. " has " .. companies.MAX_LOANS .. " loans already"
+	end
+	local state = loanOfferGroup(roster, id) or seedLoanOffers(roster, id, api)
+	if not state or type(state.availableLoans) ~= "table" then return false, "this company's loan offers are not available" end
+	if type(terms) ~= "table" or type(terms.type) ~= "string" or type(terms.amount) ~= "number"
+		or type(terms.duration) ~= "number" or type(terms.percentage) ~= "number" then
+		return false, "a loan needs a current offered term"
+	end
+	if type(nextTerms) ~= "table" or nextTerms.type ~= terms.type then
+		return false, "the replacement must match the offered loan type"
+	end
+	local slot
+	for i, offer in ipairs(state.availableLoans) do
+		if sameOffer(offer, terms) and offer.cooldownUntil == nil then slot = i break end
+	end
+	if not slot then return false, "that loan offer is no longer available" end
 	local length = monthLength(api)
 	if not length then return false, "this game does not say how long a month is" end
+	local amount, duration, percentage = terms.amount, terms.duration, terms.percentage
+	if amount <= 0 or duration <= 0 or percentage < 0 then return false, "the offered loan terms are invalid" end
 	local months = math.max(1, math.floor(duration / length + 0.5))
-	local rate = math.max(0, percentage) / 12
-	amount = math.floor(amount)
+	local rate = percentage / 12
+	local now = gameTimeNow(api)
+	if now == nil then return false, "this game does not say what time it is" end
+	local minCooldown, maxCooldown = length * 4, length * 8
+	if maxCooldown > 2147483647 then return false, "this game's loan cooldown is out of range" end
+	local cooldown = math.random(minCooldown, maxCooldown)
 	book(api, send, c.entity, amount, "LOAN")
+	state.availableLoans[slot] = { type = terms.type, cooldownUntil = now + cooldown }
 	roster.loans = roster.loans or {}
 	roster.nextLoan = (roster.nextLoan or 1)
 	roster.loans[#roster.loans + 1] = { id = roster.nextLoan, company = id, amount = amount, remaining = amount,
-		months = months, paid = 0, rate = rate, payment = annuity(amount, rate, months) }
+		months = months, paid = 0, rate = rate, payment = annuity(amount, rate, months), type = terms.type }
 	roster.nextLoan = roster.nextLoan + 1
 	roster.month = roster.month or companies.monthNow(api)
 	return true
@@ -1167,6 +1360,7 @@ function companies.run(roster, player, op, send, api, seal)
 		roster.next = id + 1
 		roster.list[#roster.list + 1] = { id = id, entity = entity, name = name, color = color, founder = player }
 		setMember(roster, player, id)
+		companies.ensureLoanOffers(roster, api)
 		return true, nil, id
 	elseif kind == "Join" then
 		local c = companies.find(roster, body)

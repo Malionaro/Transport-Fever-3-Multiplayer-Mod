@@ -99,6 +99,10 @@ local function module(name)
 	return require("tpf3mp." .. name)
 end
 
+-- Which of an edit's removed street pieces are the old construction's own
+-- (capture.ownStreets, below), and the street part without them.
+local ownRemovals, withoutOwn
+
 -- One construction placed with the construction tool: stations, depots and
 -- the rest (tpf3mp_proto action::ConstructionBuild). Returns the action
 -- table, or nil and why the room cannot carry it yet.
@@ -162,14 +166,22 @@ function capture.construction(proposal)
 	local ok, transform = pcall(capture.transform, get(con, "transf"))
 	if not ok then return nil, tostring(transform) end
 	if replaced then
-		-- The street part of an edit is the construction's own: every game
-		-- makes the new one's again as it builds it. One that removes a
-		-- street or track not its own changes the streets around it, which
-		-- an edit does not carry.
-		local own, why = capture.ownStreets(street, replaced.component)
-		if not own then return nil, why end
-		return { BuildConstruction = { file = file, transform = transform, params = list, name = name,
+		-- The street part of an edit is mostly the construction's own: every
+		-- game makes the new one's again as it builds it, and removes the old
+		-- one's with the old construction. What it changes around it (a new
+		-- exit onto a road the station did not join, which splits that road
+		-- through a new junction, 2026-10-03) travels as its connection, as a
+		-- new construction's does, without what the old one takes with it.
+		local action = { BuildConstruction = { file = file, transform = transform, params = list, name = name,
 			replaces = replaces } }
+		local ownSegments, ownNodes, others = ownRemovals(street, replaced.component)
+		if not others then return action end
+		local connection, whyNot = capture.connection(withoutOwn(street, ownSegments, ownNodes))
+		local around = "a construction edit that changes the streets around it"
+		if connection == nil then return nil, around .. ": " .. tostring(whyNot) end
+		if connection == false then return nil, around end
+		action.BuildConstruction.connection = connection
+		return action
 	end
 	local connection, whyNot = capture.connection(proposal)
 	if connection == nil then return nil, whyNot end
@@ -195,26 +207,24 @@ function capture.replaced(component)
 	return { file = file, at = { x = x, y = y, z = z } }
 end
 
--- Whether an edit's street part removes only the old construction's own
--- nodes and edges. Track ends may not be in frozenNodes (Steam 40408:
--- a two-track station has 50 nodes, only 46 frozen). Such a node belongs
--- to the rebuild only if every incident edge is frozen in this construction
--- and is being removed. Shared endpoints touching external tracks refuse.
--- true, or nil and why not.
-function capture.ownStreets(street, component)
+-- Which nodes and edges an edit's street part removes of the old
+-- construction's own, as two sets of entities, and whether it removes
+-- anything else. Track ends may not be in frozenNodes (Steam 40408: a
+-- two-track station has 50 nodes, only 46 frozen). Such a node belongs to
+-- the rebuild only if every incident edge is frozen in this construction
+-- and is being removed; a shared endpoint touching external track is not
+-- its own.
+function ownRemovals(street, component)
 	local own = { frozenNodes = {}, frozenEdges = {} }
 	for _, key in ipairs({ "frozenNodes", "frozenEdges" }) do
 		local list = get(component, key)
 		for i = 1, (length(list) or 0) do own[key][get(list, i)] = true end
 	end
-	local removed = {}
+	local removed, nodesGone, others = {}, {}, false
 	local segments = get(street, "removedSegments")
 	for i = 1, (length(segments) or 0) do
 		local id = get(get(segments, i), "entity")
-		if not own.frozenEdges[id] then
-			return nil, "a construction edit that changes the streets around it"
-		end
-		removed[id] = true
+		if own.frozenEdges[id] then removed[id] = true else others = true end
 	end
 	local function ownEnd(id)
 		local ok, edges = pcall(function() return api.engine.system.streetSystem.getNodeSegments(id) end)
@@ -228,11 +238,112 @@ function capture.ownStreets(street, component)
 	local nodes = get(street, "removedNodes")
 	for i = 1, (length(nodes) or 0) do
 		local id = get(get(nodes, i), "entity")
-		if not own.frozenNodes[id] and not ownEnd(id) then
-			return nil, "a construction edit that changes the streets around it"
+		if own.frozenNodes[id] or ownEnd(id) then nodesGone[id] = true else others = true end
+	end
+	return removed, nodesGone, others
+end
+
+-- Whether an edit's street part removes only the old construction's own
+-- nodes and edges: true, or nil and why not.
+function capture.ownStreets(street, component)
+	local _, _, others = ownRemovals(street, component)
+	if others then return nil, "a construction edit that changes the streets around it" end
+	return true
+end
+
+-- An edit's street part without the old construction's own removals
+-- (ownRemovals), which every game removes with the old construction: in the
+-- street part as well, the game would be asked to remove them twice.
+function withoutOwn(street, ownSegments, ownNodes)
+	local view = {}
+	for _, key in ipairs({ "addedNodes", "addedSegments", "edgeObjectsToAdd", "edgeObjectsToRemove",
+		"nodeConfigsToAdd", "nodeConfigsToRemove" }) do
+		view[key] = get(street, key)
+	end
+	local function kept(key, own)
+		local out, items = {}, get(street, key)
+		for i = 1, (length(items) or 0) do
+			local item = get(items, i)
+			if not own[get(item, "entity")] then out[#out + 1] = item end
+		end
+		return out
+	end
+	view.removedSegments = kept("removedSegments", ownSegments)
+	view.removedNodes = kept("removedNodes", ownNodes)
+	return { proposal = view }
+end
+
+-- The module editor's edit, as the hook read it (tpf3mp_native.built,
+-- crates/tpf3mp-hook/src/modules.rs): the construction it replaces, the new
+-- one's file, parameters, matrix and name, and of its street part the
+-- entities it removes, but only how many nodes and edges it adds. An edit
+-- whose street part is the old construction's own needs no more
+-- (capture.construction). One that changes the streets around it (a new
+-- exit onto a road the station did not join, which splits that road,
+-- 2026-10-03) is asked of the game again, as the construction menu asks it
+-- for a construction's new parameters (api.engine.util.proposal
+-- .createProposalReplaceConstruction, gui/construction/construction.tl):
+-- with the editor's parameters it proposes the editor's street part (seen
+-- on build 40408). Its street part travels only when it is the same edit
+-- as far as the hook read it: the same construction replaced by the same
+-- file, as many nodes and edges added, the same nodes and edges removed,
+-- no stop or signal on either side, and the construction where the editor
+-- put it; else the edit is refused, with why. The construction itself is
+-- the one the hook read. Returns the action, or nil and why.
+function capture.moduleEdit(native)
+	local street = get(native, "proposal")
+	local toRemove = get(native, "toRemove")
+	local old = length(toRemove) == 1 and get(toRemove, 1) or nil
+	local c = old and api.engine.getComponent(old, api.type.ComponentType.CONSTRUCTION)
+	if c == nil or (length(get(c, "townBuildings")) or 0) > 0 then return capture.construction(native) end
+	local _, _, others = ownRemovals(street, c)
+	if not others then return capture.construction(native) end
+	local con = get(get(native, "toAdd"), 1)
+	local proposals = api.engine.util and api.engine.util.proposal
+	local make = proposals and proposals.createProposalReplaceConstruction
+	if make == nil then return nil, "a construction edit that changes the streets around it" end
+	local ok, full = pcall(make, old, get(con, "params"))
+	if not ok or full == nil then
+		return nil, "a construction edit the game will not propose again: " .. tostring(full)
+	end
+	local function differs(what) return nil, "a construction edit the game proposes otherwise: " .. what end
+	local fullRemove, fullAdd = get(full, "toRemove"), get(full, "toAdd")
+	if length(fullRemove) ~= 1 or get(fullRemove, 1) ~= old then return differs("the construction it replaces") end
+	if length(fullAdd) ~= 1 or get(get(fullAdd, 1), "fileName") ~= get(con, "fileName") then
+		return differs("the construction it builds")
+	end
+	local okA, a = pcall(capture.transform, get(get(fullAdd, 1), "transf"))
+	local okB, b = pcall(capture.transform, get(con, "transf"))
+	if not okA or not okB then return differs("where it stands") end
+	local function far(x, y) return math.abs(x - y) > 0.01 end
+	for i = 1, 9 do if far(a.basis[i], b.basis[i]) then return differs("where it stands") end end
+	for _, k in ipairs({ "x", "y", "z" }) do if far(a.origin[k], b.origin[k]) then return differs("where it stands") end end
+	local fullStreet = get(full, "proposal")
+	for _, key in ipairs({ "addedNodes", "addedSegments" }) do
+		local n = length(get(street, key))
+		if n == nil or length(get(fullStreet, key)) ~= n then return differs("what it adds") end
+	end
+	for _, key in ipairs({ "edgeObjectsToAdd", "edgeObjectsToRemove" }) do
+		if (length(get(street, key)) or 0) ~= 0 or (length(get(fullStreet, key)) or 0) ~= 0 then
+			return nil, "a construction edit with a stop or signal"
 		end
 	end
-	return true
+	local function entities(list)
+		local out, seen = {}, {}
+		for i = 1, (length(list) or 0) do
+			local id = get(get(list, i), "entity")
+			if type(id) ~= "number" or seen[id] then return nil end
+			seen[id] = true
+			out[#out + 1] = id
+		end
+		table.sort(out)
+		return table.concat(out, ",")
+	end
+	for _, key in ipairs({ "removedNodes", "removedSegments" }) do
+		local mine, theirs = entities(get(street, key)), entities(get(fullStreet, key))
+		if mine == nil or theirs == nil or mine ~= theirs then return differs("what it removes") end
+	end
+	return capture.construction({ toRemove = toRemove, toAdd = get(native, "toAdd"), proposal = fullStreet })
 end
 
 -- Keeps of a construction's network part only the edges joined, through each

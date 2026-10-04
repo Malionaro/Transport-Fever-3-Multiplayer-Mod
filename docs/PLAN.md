@@ -169,6 +169,17 @@ Dev A where it can):
   including pause; guests' buttons and keyboard speed shortcuts are
   disabled with "Host controls speed" help. The host still requests changes
   through the game's speed helper. Two-game visual acceptance is pending.
+  *Added (2026-10-03):* ordered actions apply between simulation updates,
+  including while paused, through a token-only wake of the game script.
+  The driver holds updates and room saves until replay and script-state
+  storage finish. Duplicate/stale wakes and failed or timed-out replay are
+  covered by automated tests. *Tried 2026-10-03 on two local games, build
+  40408, from the plain fixture:* with the host paused at Apr 16, the guest
+  built a 72 m road. Both games showed it before resuming, the guest paid
+  $11,129 and the host paid nothing, and the date held. A guest loan take
+  and repayment also applied while paused; after resuming, both games had
+  the same step-2200 world probe digest. The probe helper could not compare
+  every step because the host omitted its earlier step-1100 sample.
 - [ ] *Added:* whether the stock tools send their commands through
   `api.cmd.sendCommand`. If they do, the caller-RVA filter cannot tell a
   click from our replay (HOOKS.md), and the hook needs another way to

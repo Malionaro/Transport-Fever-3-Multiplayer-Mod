@@ -334,6 +334,14 @@ pub fn current_step() -> Option<u64> {
     CURRENT_STEP.load(Ordering::Acquire).checked_sub(1)
 }
 
+/// Scope nested script events to the ordered command's step, without
+/// starting an Engine::Update or advancing either game-time counter.
+pub(crate) fn command_step(step: Option<u64>) -> Option<u64> {
+    CURRENT_STEP
+        .swap(step.map_or(0, |s| s + 1), Ordering::AcqRel)
+        .checked_sub(1)
+}
+
 /// From the step driver, on the simulation thread, right before it runs
 /// the game's step: the room's next step and the updates this call runs.
 /// Arms the per-update reseed for exactly those updates; anything else

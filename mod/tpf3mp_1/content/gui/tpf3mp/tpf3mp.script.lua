@@ -348,7 +348,10 @@ function data()
 	local function serve()
 		if not link then return end
 		local request = link:poll()
-		if request and request.save then
+		if request and request.replay then
+			local ok, why = require("tpf3mp.guard").wakeReplay(guardedCmd, request.replay)
+			if not ok then link:replayed(request.replay, false, why) end
+		elseif request and request.save then
 			local name = request.save
 			local ok, err = pcall(app.saveGame, name, function()
 				link:saved(name, true)
@@ -410,15 +413,26 @@ function data()
 		local roster = state and state.companies
 		if type(roster) ~= "table" or type(roster.list) ~= "table" then return nil, "" end
 		local out, sign = { list = {}, members = roster.members or {}, loans = roster.loans or {} }, {}
-		-- The loans the game offers now (its loan script's), which another
-		-- company takes on the same terms.
+		-- A founded company reads its own persisted offers. Company zero keeps
+		-- the native finance window and its loan script state.
 		pcall(function()
+			local status = ui().status
+			local companies = require("tpf3mp.companies")
+			local follow = require("tpf3mp.follow")
+			local entity = follow.companyOf(roster, status and status.me_id)
+			local own = entity and companies.byEntity(roster, entity)
+			if not own or own.id == 0 then return end
 			local e = api.engine.system.gameScriptSystem.getEntityForGameScript("::/game_mechanics/finance/loan.gs")
 			local c = type(e) == "number" and e >= 0 and api.engine.getComponent(e, api.type.ComponentType.GAME_SCRIPT)
-			local offers = c and c.state and c.state.availableLoans
-			if type(offers) == "table" then out.offers = offers end
+			local real = c and c.state
+			local month = api.util.getDefaultMonthDuration()
+			local loans = companies.loanTable(roster, own.id, real, month)
+			if type(loans.availableLoans) == "table" then out.offers = loans.availableLoans end
 		end)
-		for _, offer in ipairs(out.offers or {}) do sign[#sign + 1] = tostring(offer.type) .. tostring(offer.amount) end
+		for _, offer in ipairs(out.offers or {}) do
+			sign[#sign + 1] = table.concat({ tostring(offer.type), tostring(offer.amount),
+				tostring(offer.duration), tostring(offer.percentage), tostring(offer.cooldownUntil) }, ":")
+		end
 		for _, loan in ipairs(out.loans) do sign[#sign + 1] = loan.id .. ":" .. loan.remaining end
 		for _, c in ipairs(roster.list) do
 			if not c.gone then
@@ -644,6 +658,17 @@ function data()
 		local function button(label, tooltip, onClick)
 			return builtin.Button{ meta = { class = "secondary", tooltip = tooltip },
 				content = builtin.TextView{ meta = { class = "font-scale-body" }, text = label }, onClick = onClick }
+		end
+		local function replacementOffer(offer)
+			local ok, util = pcall(ug_require, "::/game_mechanics/finance/loan_util.tl")
+			if not ok or type(util) ~= "table" then return nil end
+			local make = util["create" .. tostring(offer.type) .. "Loan"]
+			if type(make) ~= "function" then return nil end
+			ok, util = pcall(make)
+			if not ok or type(util) ~= "table" or util.type ~= offer.type
+				or type(util.amount) ~= "number" or type(util.duration) ~= "number"
+				or type(util.percentage) ~= "number" then return nil end
+			return util
 		end
 		-- A field for a draft, sent with `act` on Enter or its button.
 		local function field(draft, placeholder, secret, act)
@@ -883,10 +908,16 @@ function data()
 					offers[#offers + 1] = button("Borrow " .. money(offer.amount),
 						string.format("Borrow %s at %g%% a year", money(offer.amount), (offer.percentage or 0) * 100),
 						function()
+							local nextOffer = replacementOffer(offer)
+							if not nextOffer then
+								shared.companyNote = "The game's loan utility could not draw the next " .. tostring(offer.type) .. " offer"
+								shared.version = shared.version + 1
+								return
+							end
 							local terms = { type = offer.type, amount = offer.amount, duration = offer.duration,
 								percentage = offer.percentage }
 							companyOp(shared, nil, "Borrowing " .. money(offer.amount),
-								{ Loan = { Take = { next = terms, offer = terms } } })
+								{ Loan = { Take = { next = nextOffer, offer = terms } } })
 						end)
 				end
 			end

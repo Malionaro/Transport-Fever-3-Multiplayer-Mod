@@ -329,3 +329,25 @@ company's with a station group of its own; the line was not drawn.
   `sub_7edbd0`, stored at 0x7eddc0).
 - Fix: the call at 0x7f3f12 answers every company's lines in a room
   (guiplayer.rs, `lines_for`).
+
+### The store's depot (2026-10-02, build 45b8ed5)
+
+- **seen** p1 (company #2) built a road depot (action 2) and bought from
+  the line window: `the store buys at depot entity 317114 (owned by
+  214443)`.
+- **seen** `findBestDepotForLine` (registered at 0x253c13f) and
+  `findBestLineAndDepotForVehicle` (0x253c094) reach `sub_2689fd0` (owner
+  test at 0x268a335) and `sub_2689dd0` (owner test at 0x2689eeb, through
+  `sub_5ab270`, a `PlayerOwned` read), each comparing with
+  `[GameState+0x20c]`, the save's player. Their only callers are the two
+  bindings; their only Lua callers are `line_util.tl`,
+  `manager_window.tl` and `vehicle_store_window.tl`.
+- Fix: both tests spliced (guiplayer.rs), on the GUI's thread outside the
+  step only.
+- **closed in replay** A room action could name another company's depot
+  because `BuyVehicle` checked only that the depot existed. The line-store
+  view patch filters the GUI choice, and the replay now requires exact depot
+  ownership by the acting company whenever more than one company is live;
+  a missing or unreadable `PLAYER_OWNED` fails closed. A one-company room
+  keeps the game's native purchase behavior. The D22 station-access decision
+  explicitly does not grant use of another company's depots.

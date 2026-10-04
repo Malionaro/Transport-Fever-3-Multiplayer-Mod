@@ -354,9 +354,9 @@ construction by file and place, and every game replaces it within 2 m in
 one proposal mapped old to new, as the game's own upgrade does
 ([HOOKS.md](HOOKS.md), "The build tools"). The construction tool's
 proposals, the construction menu's parameters and the station window's
-cargo buttons are carried so; one replacing more than one construction,
-one the room cannot name, or one that changes streets around it is
-refused. The module editor itself tells game scripts nothing of its
+cargo buttons are carried so, with the streets an edit changes around the
+construction as its connection (below); one replacing more than one
+construction or one the room cannot name is refused. The module editor itself tells game scripts nothing of its
 proposals on build 40408 (read from the binary: `UI::CGameUI` forwards
 `builder.proposalCreate` for six other tools only), so the hook reads its
 proposal natively at its call of `CommandList::Add` and hands the GUI the
@@ -380,6 +380,44 @@ also applied in both games; all 54 shared network checkpoints through step
 2700 agreed. This proves those edits, not every module type or an edit that
 also rebuilds external connecting track. One host startup failed before
 testing and succeeded on rejoin; that loading failure remains unresolved.
+
+A road station placed by a road snapped onto it, but came loose as soon as
+it was edited (2026-10-03, adding a second entrance at its other end, and
+in both games, the editing player's too, since every game replays the
+edit): its street pieces no longer joined the road or made junctions with
+it. The replacement builds the new construction alone, and a scripted
+build makes the entrance again unsnapped, ending short of the road, as a
+fresh build does; the fresh build is refreshed afterwards, the edit was
+not. Every game now refreshes the new construction after an edit too,
+which snaps its entrances onto the streets beside them. `lua_mod.rs`
+covers the refresh, a refresh with nothing to snap (nothing sent) and a
+refused one (the edit stands, logged). Seen in the game the same day: a
+plain edit snapped again (`snapping 72194 +e-2:-1>57114 -e71473`).
+
+A new exit onto a road the station did not join was refused: the module
+editor's proposal splits that road through a new junction (three nodes and
+four edges added; the station's own entrance node and edge and the road's
+edge removed), and an edit carried no street change around its
+construction. The hook reads only how many nodes and edges the editor
+adds. Asked again in the game's console with the editor's parameters,
+`createProposalReplaceConstruction` proposed exactly the editor's street
+part. So the editing player's game asks it so, checks it against what the
+hook read, and the edit carries the streets around it as its connection,
+without the old construction's own removals; every game builds the
+connection in the replacing proposal, the station's own entrances peeled
+off as for a new station, then refreshes the station. The old entrance's
+junction, where the split road ends at it, keeps no settings (they would
+name the old entrance, which goes with the old station). Every edge a
+construction's connection removes or splits must be the acting company's
+or no company's, for new stations too, which did not check it. Covered by
+`lua_mod.rs` (the capture and its refusals, the replay, a road of another
+company, the old entrance's junction and another company's road at it, a
+refused refresh after the split). Seen in two launcher-started games on
+the local server the same day: a new exit onto another road was carried
+from the module editor and replayed alike in both games (`building
++n-3(-1042.6,-1959.4,11.0) +e-1/0:48073>-3 … +e-2/0:-3>71864 … -e71975`,
+then `snapping 72116 +e-3:-1>73619 +e-4:-2>71600 -e72101 -e73645`), both
+entrances joined to their roads, and edits after it too.
 
 ### Demolish
 

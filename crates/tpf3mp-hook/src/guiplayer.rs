@@ -29,7 +29,9 @@
 #![allow(unsafe_code)]
 #![cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use tpf3mp_hookcore::detour::{SavedRegs, Splice};
 use tpf3mp_hookcore::profile::ResolvedProfile;
@@ -83,7 +85,7 @@ pub struct Site {
     pub what: &'static str,
 }
 
-pub const SITES: [Site; 17] = [
+pub const SITES: [Site; 19] = [
     Site {
         name: "view: HudIconManager::PreemptiveOctreeTraversal/player",
         expected: &[0x4C, 0x89, 0x75, 0xB8, 0x48, 0x89, 0x5D, 0xC0],
@@ -203,7 +205,29 @@ pub const SITES: [Site; 17] = [
         kind: Kind::IconOwner,
         what: "the map's icons of every company",
     },
+    Site {
+        name: "view: findBestDepot depot owner test",
+        expected: &[0x8B, 0x91, 0x0C, 0x02, 0x00, 0x00, 0x39, 0x10],
+        reg: Reg::Rax,
+        kind: Kind::Owner,
+        what: "the depot the line window's store buys at",
+    },
+    Site {
+        name: "view: findBestDepot owner test",
+        expected: &[0x8B, 0x89, 0x0C, 0x02, 0x00, 0x00, 0x39, 0x08],
+        reg: Reg::Rax,
+        kind: Kind::Owner,
+        what: "the line and depot the store chooses",
+    },
 ];
+
+/// The sites only the GUI's Lua reaches but a game script could too: the
+/// owner tests inside `api.engine.util.vehicle.findBestDepotForLine` and
+/// `findBestLineAndDepotForVehicle` (`sub_2689fd0`, `sub_2689dd0`, reached
+/// only through those two bindings, which only the game's GUI scripts call
+/// on build 40408). They answer the company only on the GUI's thread
+/// outside the simulation's step; anywhere else, as the game.
+pub const GUI_THREAD_ONLY_FROM: usize = 17;
 
 /// The site whose owner test also passes every company of the room (the map
 /// layers' colours, for lines and stations).
@@ -227,7 +251,27 @@ static COMPANIES: [AtomicI64; MAX_COMPANIES] = [const { AtomicI64::new(-1) }; MA
 /// Whether the map shows every company ([`ALL_ENV`]).
 static ALL: AtomicBool = AtomicBool::new(false);
 /// Per site, how many reads it answered with the company; the first is said.
-static ANSWERED: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+static ANSWERED: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+/// The GUI's thread, as the menu's frame runs on it ([`refresh`]); 0 while
+/// unknown.
+static GUI_THREAD: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(windows)]
+fn thread_id() -> u32 {
+    // SAFETY: reads the calling thread's id; no arguments, no failure.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
+
+#[cfg(not(windows))]
+fn thread_id() -> u32 {
+    0
+}
+
+/// Whether a site of [`GUI_THREAD_ONLY_FROM`] on may answer the company
+/// here: on the GUI's thread, and not inside the simulation's step.
+pub fn on_gui_thread(gui: u32, here: u32, in_step: bool) -> bool {
+    gui != 0 && gui == here && !in_step
+}
 
 fn noted(key: &str) -> Option<i64> {
     crate::lua::noted(key)
@@ -270,6 +314,7 @@ pub fn refresh() {
     for (k, slot) in COMPANIES.iter().enumerate() {
         slot.store(listed.get(k).copied().unwrap_or(-1), Ordering::Release);
     }
+    GUI_THREAD.store(thread_id(), Ordering::Release);
     COMPANY.store(company, Ordering::Release);
 }
 
@@ -541,6 +586,15 @@ fn at_site(index: usize, regs: *mut SavedRegs) {
             return false;
         }
         let site = SITES[index];
+        if index >= GUI_THREAD_ONLY_FROM
+            && !on_gui_thread(
+                GUI_THREAD.load(Ordering::Acquire),
+                thread_id(),
+                crate::order::in_step(),
+            )
+        {
+            return false;
+        }
         // SAFETY: the stub's block, held until the hook returns.
         let regs = unsafe { &mut *regs };
         match site.kind {
@@ -635,7 +689,7 @@ macro_rules! hooks {
                 at_site($index, regs);
             }
         )*
-        const HOOKS: [tpf3mp_hookcore::detour::SpliceHook; 17] = [$($name),*];
+        const HOOKS: [tpf3mp_hookcore::detour::SpliceHook; 19] = [$($name),*];
     };
 }
 
@@ -657,6 +711,8 @@ hooks!(
     h14 = 14,
     h15 = 15,
     h16 = 16,
+    h17 = 17,
+    h18 = 18,
 );
 
 /// The `getPlayer` binding's push of its answer (rva 0x24ed2d2, a `call` of
@@ -1036,6 +1092,30 @@ mod tests {
     }
 
     #[test]
+    fn the_store_depot_tests_answer_only_on_the_guis_thread() {
+        assert!(on_gui_thread(7, 7, false));
+        assert!(
+            !on_gui_thread(7, 7, true),
+            "inside the simulation's step: the game's"
+        );
+        assert!(!on_gui_thread(7, 8, false), "another thread: the game's");
+        assert!(
+            !on_gui_thread(0, 0, false),
+            "the GUI's thread not known yet: the game's"
+        );
+        // Both are owner tests: a load of the player and its compare.
+        for site in &SITES[GUI_THREAD_ONLY_FROM..] {
+            assert_eq!(site.kind, Kind::Owner);
+            assert_eq!(site.reg, Reg::Rax);
+            assert_eq!(site.expected[6], 0x39, "{}: then a compare", site.name);
+        }
+        // A depot of the player's company is the player's; the first
+        // company's is not.
+        assert_eq!(owner(372_609, 372_609, 214_443), Some(true));
+        assert_eq!(owner(214_443, 372_609, 214_443), Some(false));
+    }
+
+    #[test]
     fn off_unless_wanted() {
         let empty = ResolvedProfile {
             name: String::new(),
@@ -1044,7 +1124,7 @@ mod tests {
         };
         assert!(install_with(&empty, false)[0].contains("off"));
         let lines = install_with(&empty, true);
-        assert!(lines[0].starts_with(&format!("{FIX}: 0 of 17")));
+        assert!(lines[0].starts_with(&format!("{FIX}: 0 of 19")));
         refresh();
         assert_eq!(COMPANY.load(Ordering::Relaxed), -1);
     }

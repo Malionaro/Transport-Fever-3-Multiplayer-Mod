@@ -530,7 +530,7 @@ HOOK = { logged = {}, commands = {}, batch = nil, request = nil, saved = {}, wor
          dump = nil, dumped = {} }
 tpf3mp_native = {
     copy = function(text) HOOK.copied = text return true end,
-    version = 12,
+    version = 13,
     note = function(key, value)
         HOOK.notes = HOOK.notes or {}
         if value == nil then return HOOK.notes[key] end
@@ -551,6 +551,15 @@ tpf3mp_native = {
         local batch, origins, seals = HOOK.batch, HOOK.origins, HOOK.seals
         HOOK.batch, HOOK.origins, HOOK.seals = nil, nil, nil
         return batch, origins, seals
+    end,
+    takeReplay = function(token)
+        if token ~= HOOK.replayToken or HOOK.replayTaken then return nil end
+        HOOK.replayTaken = true
+        local batch = HOOK.replayBatch
+        return batch, HOOK.replayOrigins, HOOK.replaySeals
+    end,
+    replayed = function(token, ok, why)
+        HOOK.replayDone = { token = token, ok = ok, why = why }
     end,
     log = function(line) HOOK.logged[#HOOK.logged + 1] = line end,
     poll = function()
@@ -875,7 +884,7 @@ fn a_hook_of_another_version_is_not_used() {
     run_frames(&lua, 1);
     assert!(
         log(&lua).ends_with(
-            "[tpf3mp] the hook speaks bridge version 1, the mod 12; this is the plain game"
+            "[tpf3mp] the hook speaks bridge version 1, the mod 13; this is the plain game"
         ),
         "{}",
         log(&lua)
@@ -968,7 +977,7 @@ fn attach_refuses_a_partial_hook() {
              local function why(t) local _, r = BRIDGE.attach(t); out[#out + 1] = r end
              why(nil)
              why('hook')
-             why({ version = 12, command = print, log = print })
+             why({ version = 13, command = print, log = print })
              return out",
         )
         .eval()
@@ -1171,10 +1180,10 @@ fn the_guard_goes_on_once_and_a_hook_that_cannot_say_means_the_room() {
              out[#out + 1] = select(2, guard.install(nil, env))
              out[#out + 1] = select(2, guard.install({}, env))
              local bridge = ug_require('tpf3mp_1::/scripts/tpf3mp/bridge.lua')
-             local native = { version = 12 }
+             local native = { version = 13 }
              for _, n in ipairs({ 'command', 'take', 'log', 'poll', 'saved', 'world',
                                   'checkpoint', 'lanes', 'clicks', 'replaying', 'applied', 'results',
-                                  'status', 'chat', 'say' }) do
+                                  'status', 'chat', 'say', 'takeReplay', 'replayed' }) do
                  native[n] = function() end
              end
              native.room = function() error('gone') end
@@ -2193,6 +2202,7 @@ fn the_game_script_applies_the_rooms_actions_as_the_players_own_builds() {
     assert_eq!(lua.load("return #SENT").eval::<usize>().unwrap(), 0);
     // update only takes the actions; the world changes in postUpdate, as
     // the game's own scripts change it.
+    lua.load(STATION_REFRESH).exec().unwrap();
     lua.load(format!(
         "HOOK.batch = {{ {DEPOT} }} WORK = SCRIPT.update({{}}, STATE, 0.2)"
     ))
@@ -2242,6 +2252,62 @@ fn the_game_script_applies_the_rooms_actions_as_the_players_own_builds() {
 }
 
 #[test]
+fn a_paused_game_applies_ordered_builds_without_running_an_update() {
+    let (lua, _) = engine();
+    lua.load(format!(
+        "HOOK.room=true HOOK.replayToken='1' HOOK.replayBatch={{ {DEPOT} }} \
+        SCRIPT.handleEvent({{}}, STATE, '', '', 'handleLegacy', {{}}) \
+        assert(STATE.subscribed.replay) \
+        SCRIPT.handleEvent({{}}, STATE, '', 'tpf3mp', 'replay', 'stale') \
+        assert(#SENT == 0) \
+        SCRIPT.handleEvent({{}}, STATE, '', 'tpf3mp', 'command', '1') \
+        assert(#SENT == 1 and #HOOK.applied == 1 and HOOK.replayDone.ok) \
+        assert(STATE.value and STATE.value.registry and STATE.value.companies) \
+        assert(HOOK.lanes == nil and HOOK.replaying[#HOOK.replaying] == false) \
+        SCRIPT.handleEvent({{}}, STATE, '', 'tpf3mp', 'command', '1') \
+        assert(#SENT == 1 and #HOOK.applied == 1)"
+    ))
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn a_replay_script_error_is_reported_and_always_clears_the_build_bypass() {
+    let (lua, _) = engine();
+    lua.load(format!(
+        "HOOK.room=true HOOK.replayToken='1' HOOK.replayBatch={{ {DEPOT} }} \
+        STATE.set=function() error('state storage failed') end \
+        SCRIPT.handleEvent({{}}, STATE, '', 'tpf3mp', 'command', '1') \
+        assert(not HOOK.replayDone.ok and HOOK.replayDone.why:find('state storage failed',1,true)) \
+        assert(HOOK.replaying[#HOOK.replaying] == false)"
+    ))
+    .exec()
+    .unwrap();
+}
+
+#[test]
+fn the_gui_wakes_only_the_ordered_replay_and_never_forwards_its_payload() {
+    let lua = gui();
+    lua.load(FAKE_HOOK).exec().unwrap();
+    lua.load(FAKE_CMD).exec().unwrap();
+    run_frames(&lua, 1);
+    lua.load("HOOK.room=true HOOK.request={ replay='123' }")
+        .exec()
+        .unwrap();
+    run_frames(&lua, 1);
+    lua.load(
+        "assert(#SENT == 1, 'sent=' .. #SENT .. ' wake=' .. tostring(HOOK.replayDone and HOOK.replayDone.why) .. ' logs=' .. table.concat(HOOK.logged, ' | ')) local c=SENT[1].command \
+        assert(c.id=='tpf3mp' and c.name=='command' and c.param=='123') \
+        local guard=require('tpf3mp.guard') \
+        assert(not guard.wakeReplay(api.cmd, { BuildRoad={} })) \
+        api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd('', 'tpf3mp', 'replay', '123')) \
+        assert(#SENT == 1)",
+    )
+    .exec()
+    .unwrap();
+}
+
+#[test]
 fn the_game_script_takes_and_repays_loans_through_the_loan_scripts_events() {
     let (lua, _script) = engine();
     lua.load(format!(
@@ -2282,6 +2348,196 @@ const CONSTRUCTION_PROPOSAL: &str = "{ \
                            -421.93572998047, -252.93925476074, 0.50797754526138, 1 }, \
                 params = { modules = { [3801] = { name = 'depot/module.module', variant = 2 } }, \
                            year = 1990, seed = 0, scale = 1.5, lit = true } } } }";
+
+/// A PLAYER_OWNED component as build 40408 hands it to Lua: userdata, its
+/// `player` read through the binding, never a table.
+struct NativeOwner(i64);
+
+impl mlua::UserData for NativeOwner {
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("player", |_, this| Ok(this.0));
+    }
+}
+
+/// A company's depots did not count as its own (2026-10-02: "0
+/// construction(s)" after a depot built by company #1, and its vehicles
+/// bought from a far depot). The owner read took the game's userdata
+/// component for no one's; and the room never made sure of what the engine
+/// made from the build. Every game now hands the new construction, its
+/// depots, stations, their own group and its own edges to the acting
+/// company where anyone else owns them, and reads an owner through the
+/// binding.
+#[test]
+fn a_depot_the_room_builds_is_the_acting_companys() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    let owned = lua
+        .create_function(|lua, player: i64| lua.create_userdata(NativeOwner(player)))
+        .unwrap();
+    lua.globals().set("NATIVE_OWNER", owned).unwrap();
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         ACTION = capture.construction({CONSTRUCTION_PROPOSAL})"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(
+        "local CT = api.type.ComponentType \
+         CT.STATION_GROUP, CT.PLAYER_OWNED = 9, 15 \
+         OWNERS = { [5010] = 25, [5020] = 30 } \
+         EDGES[5020] = { node0 = 8, node1 = 9, objects = { { 5030, 0 } } } \
+         api.engine.system.stationGroupSystem = { getStationGroup = function(s) \
+             if s == 5040 then return 5050 end return -1 end } \
+         local get = api.engine.getComponent \
+         api.engine.getComponent = function(e, kind) \
+             if kind == 15 then return OWNERS[e] and NATIVE_OWNER(OWNERS[e]) or nil end \
+             if kind == 9 and e == 5050 then return { stations = { 5040 } } end \
+             return get(e, kind) \
+         end \
+         api.cmd.makeEntitySetPlayerCmd = function(entity, player) \
+             return { setPlayer = entity, player = player } end \
+         local send = api.cmd.sendCommand \
+         api.cmd.sendCommand = function(cmd, ...) \
+             local r = send(cmd, ...) \
+             if cmd.setPlayer then OWNERS[cmd.setPlayer] = cmd.player end \
+             local c = CONSTRUCTIONS[5000] \
+             if c and not c.depots then \
+                 c.depots, c.stations, c.frozenEdges = { 5010 }, { 5040 }, { 5020 } \
+                 OWNERS[5000] = 901 \
+             end \
+             return r \
+         end \
+         A = string.rep('a', 64) \
+         HOOK.batch = { { CompanyOp = { Create = { name = 'Rival' } } } } HOOK.origins = { A } \
+         UPDATE({}, STATE, 0.2) \
+         SENT = {} HOOK.applied = {} \
+         HOOK.batch = { ACTION } HOOK.origins = { A } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}"));
+    let (ok, built, owners): (bool, String, String) = lua
+        .load(
+            "local o = {} \
+             for _, e in ipairs({ 5000, 5010, 5020, 5030, 5040, 5050 }) do o[#o + 1] = e .. '=' .. tostring(OWNERS[e]) end \
+             local p = SENT[1].proposal \
+             return HOOK.applied[1].ok == true, \
+                 p.constructionsToAdd[1].playerEntity .. '>' .. SENT[1].context.player, table.concat(o, ' ')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(ok, "{}", hook_log(&lua));
+    assert_eq!(built, "901>901", "built for the acting company, paid by it");
+    assert_eq!(
+        owners, "5000=901 5010=901 5020=901 5030=901 5040=901 5050=901",
+        "the construction, its depot, its own edge and what stands on it, its station and group"
+    );
+    let log = hook_log(&lua);
+    assert!(
+        log.contains(
+            "the new ::/depots/road/road_maint_station.con made the acting company's (901): \
+             depot 5010 (was 25), station 5040 (was nil), station group 5050 (was nil), \
+             edge 5020 (was 30), edge object 5030 (was nil)"
+        ),
+        "{log}"
+    );
+}
+
+/// A construction may already exist when its ownership cannot be settled.
+/// The room must hear that its build was not applied, and a missing result
+/// lookup must not be silently reported as success.
+#[test]
+fn a_construction_owner_command_or_lookup_failure_is_not_applied() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load(format!("DEPOT_ACTION = {DEPOT}")).exec().unwrap();
+    lua.load(
+        r#"
+        api.type.ComponentType.PLAYER_OWNED = 15
+        OWNERS, FAIL_OWNER, HIDE_CONSTRUCTION, FAIL_READ_OWNER = {}, false, false, false
+        local get = api.engine.getComponent
+        api.engine.getComponent = function(e, kind)
+            if kind == 15 and e == 5000 and FAIL_READ_OWNER then error('owner component read failed') end
+            if kind == 15 then return OWNERS[e] and { player = OWNERS[e] } end
+            return get(e, kind)
+        end
+        local list = api.engine.getEntitiesWithComponent
+        api.engine.getEntitiesWithComponent = function(kind)
+            if kind == 2 and HIDE_CONSTRUCTION then return {} end
+            return list(kind)
+        end
+        api.cmd.makeEntitySetPlayerCmd = function(entity, player)
+            return { setPlayer = entity, player = player }
+        end
+        local send = api.cmd.sendCommand
+        api.cmd.sendCommand = function(cmd, ...)
+            if cmd.setPlayer then
+                if FAIL_OWNER then error('the game refused owner settlement') end
+                OWNERS[cmd.setPlayer] = cmd.player
+            elseif cmd.proposal and cmd.proposal.constructionsToAdd
+                and cmd.proposal.constructionsToAdd[1] then
+                local result = send(cmd, ...)
+                -- The game committed the construction before owner settlement.
+                OWNERS[5000] = 25
+                return result
+            end
+            return send(cmd, ...)
+        end
+        A = string.rep('a', 64)
+        HOOK.batch = { { CompanyOp = { Create = { name = 'Rival' } } } }
+        HOOK.origins = { A }
+        UPDATE({}, STATE, 0.2)
+        function buildWithFailure(fail_owner, hide_construction, fail_read_owner)
+            FAIL_OWNER, HIDE_CONSTRUCTION, FAIL_READ_OWNER = fail_owner, hide_construction, fail_read_owner
+            HOOK.applied = {}
+            HOOK.batch = { DEPOT_ACTION }
+            HOOK.origins = { A }
+            UPDATE({}, STATE, 0.2)
+            local result = HOOK.applied[1]
+            return result.ok, result.why, CONSTRUCTIONS[5000] ~= nil
+        end
+        "#,
+    )
+    .exec()
+    .unwrap();
+
+    let (applied, why, construction_exists): (bool, String, bool) = lua
+        .load("return buildWithFailure(true, false, false)")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(!applied, "a refused owner command cannot report success");
+    assert!(why.contains("the game refused owner settlement"), "{why}");
+    assert!(
+        construction_exists,
+        "the engine build happened before settlement"
+    );
+
+    let (applied, why, construction_exists): (bool, String, bool) = lua
+        .load("return buildWithFailure(false, false, true)")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(!applied, "an owner lookup failure cannot report success");
+    assert!(why.contains("owner component read failed"), "{why}");
+    assert!(
+        construction_exists,
+        "the engine build happened before owner lookup"
+    );
+
+    let (applied, why, construction_exists): (bool, String, bool) = lua
+        .load("return buildWithFailure(false, true, false)")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", hook_log(&lua)));
+    assert!(
+        !applied,
+        "a missing construction lookup cannot report success"
+    );
+    assert!(why.contains("no depot/road_depot_era_a.con there"), "{why}");
+    assert!(
+        construction_exists,
+        "the lookup failure follows the engine build"
+    );
+}
 
 #[test]
 fn a_construction_the_tool_placed_becomes_the_rooms_action() {
@@ -2472,7 +2728,7 @@ fn an_edit_of_a_station_travels_with_the_station_it_replaces() {
             "a construction that replaces more than one",
             "a construction the room cannot name",
             "removing something that is no construction",
-            "a construction edit that changes the streets around it",
+            "a construction edit that changes the streets around it: roadTemplate is not a resource name: nil",
             "a bulldozer proposal that builds"
         ]
     );
@@ -2890,6 +3146,7 @@ fn a_dry_run_makes_a_builds_proposal_and_sends_nothing() {
         .unwrap();
     assert_eq!(why, "nil no preview of Subsidy");
     // The next action applies as before: the dry run left nothing behind.
+    lua.load(STATION_REFRESH).exec().unwrap();
     lua.load(format!(
         "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua')          local apply = ug_require('tpf3mp_1::/scripts/tpf3mp/apply.lua')          OK = apply.run(assert(capture.construction({CONSTRUCTION_PROPOSAL})), {{}})"
     ))
@@ -3082,17 +3339,27 @@ fn every_game_replaces_the_edited_station_in_one_proposal() {
         "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
          ACTION = capture.construction({EDIT_PROPOSAL}) \
          CONSTRUCTIONS[910] = CONSTRUCTIONS[77] CONSTRUCTIONS[77] = nil \
+         api.type.ComponentType.PLAYER_OWNED = 15 OWNERS = {{ [910] = 25 }} \
+         local getComponent = api.engine.getComponent \
+         api.engine.getComponent = function(e, kind) \
+             if kind == 15 then return OWNERS[e] and {{ player = OWNERS[e] }} end \
+             return getComponent(e, kind) end \
          ASKED = {{}} \
          api.engine.util.proposal = {{ makeProposalData = function(p, context) \
              ASKED[#ASKED + 1] = {{ sent = #SENT, removes = p.constructionsToRemove[1] }} \
-             return {{ errorState = {{ critical = false, messages = {{}} }} }} end }} \
+             return {{ errorState = {{ critical = false, messages = {{}} }} }} end, \
+             refreshConstruction = function(e) return REFRESH(e) end }} \
+         REFRESH = function(e) return {{ refreshed = e, \
+             proposal = {{ addedSegments = {{ {{ entity = -2, comp = {{ node0 = -1, node1 = 7777 }} }} }}, \
+                          removedSegments = {{ {{ entity = 6000 }} }} }} }} end \
          local send = api.cmd.sendCommand \
          api.cmd.sendCommand = function(cmd, ...) \
              local p = cmd.proposal \
              for _, e in ipairs(p and p.constructionsToRemove or {{}}) do CONSTRUCTIONS[e] = nil end \
              local c = p and p.constructionsToAdd and p.constructionsToAdd[1] \
              if c then CONSTRUCTIONS[911] = {{ fileName = c.fileName, \
-                 transf = {{ 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 }} }} end \
+                 transf = {{ 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 }} }} \
+                 OWNERS[911] = 25 end \
              return send(cmd, ...) \
          end \
          HOOK.batch = {{ ACTION }} UPDATE({{}}, STATE, 0.2)"
@@ -3113,27 +3380,71 @@ fn every_game_replaces_the_edited_station_in_one_proposal() {
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
     assert_eq!(
         built,
-        "1|1|0|910|1|910|0\
+        "2|1|0|910|1|910|0\
          |::/stations/street/modular_street_station/modular_terminal.con|Okehampton Station|3\
          |station/platform.module|25|25|true|true|true|true|nil|true",
         "the verdict, then one proposal removing this game's station and adding the new one, \
          mapped old to new, as the player's own build"
     );
-    // The next edit finds the new station where the old one stood.
-    lua.load("SENT = {} HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
-        .exec()
-        .unwrap();
-    let again: String = lua
-        .load("return SENT[1].proposal.constructionsToRemove[1] .. '|' .. tostring(HOOK.applied[2].ok)")
+    // Then the new station's refresh, which snaps its entrance onto the
+    // street again, free, as no player's click: a road station edited by
+    // the street came loose from it (2026-10-03).
+    let refreshed: String = lua
+        .load(
+            "local r = SENT[2] return table.concat({ r.proposal.refreshed, tostring(r.context), \
+                 tostring(r.ignoreErrors), tostring(r.playerInitiated) }, '|')",
+        )
         .eval()
         .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
-    assert_eq!(again, "911|true");
+    assert_eq!(refreshed, "911|nil|true|false");
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l == "snapping 911 +e-2:-1>7777 -e6000"),
+        "{logged:?}"
+    );
+    // The next edit finds the new station where the old one stood. Its
+    // refresh has nothing to snap: nothing more is sent.
+    lua.load(
+        "SENT = {} REFRESH = function(e) return { refreshed = e, \
+             proposal = { addedSegments = {}, removedSegments = {} } } end \
+         HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let again: String = lua
+        .load("return #SENT .. '|' .. SENT[1].proposal.constructionsToRemove[1] .. '|' .. tostring(HOOK.applied[2].ok)")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(again, "1|911|true");
+    // A refresh the game refuses leaves the edit standing, the same in
+    // every game, and says so in the log.
+    lua.load(
+        "SENT = {} REFRESH = function(e) error('Construction Not Possible') end \
+         HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let refused: String = lua
+        .load("return #SENT .. '|' .. tostring(HOOK.applied[3].ok) .. '|' .. tostring(CONSTRUCTIONS[911] ~= nil)")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(refused, "1|true|true");
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        logged.iter().any(
+            |l| l.starts_with("the edited construction stays unsnapped: ")
+                && l.contains("Construction Not Possible")
+        ),
+        "{logged:?}"
+    );
     // A station that is not there is refused with why, and nothing is sent.
     lua.load("SENT = {} CONSTRUCTIONS = {} HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
         .exec()
         .unwrap();
     let (sent, ok, why): (usize, bool, String) = lua
-        .load("return #SENT, HOOK.applied[3].ok, HOOK.applied[3].why")
+        .load("return #SENT, HOOK.applied[4].ok, HOOK.applied[4].why")
         .eval()
         .unwrap();
     assert_eq!(sent, 0);
@@ -3141,6 +3452,373 @@ fn every_game_replaces_the_edited_station_in_one_proposal() {
     assert_eq!(
         why,
         "no ::/stations/street/modular_street_station/modular_terminal.con there"
+    );
+}
+
+/// The station 77 by FAKE_NETWORK's node 7: its own entrance, edge 6000
+/// from its street node 6001 to node 7, frozen in it. As the game, a built
+/// construction is listed, and a new one takes entity 911, the acting
+/// company's (25).
+const STATION_AT_NODE_7: &str = r#"
+api.type.ComponentType.CONSTRUCTION = 2
+api.type.ComponentType.PLAYER_OWNED = 14
+NODES[6001] = { x = 70, y = 0, z = 0 }
+EDGES[6000] = { node0 = 6001, node1 = 7, tangent0 = { x = -70, y = 0, z = 0 },
+    tangent1 = { x = -70, y = 0, z = 0 }, objects = {},
+    roadTemplate = '::/street/town_small.street_template' }
+STREETS[7] = { 101, 6000 }
+STREETS[6001] = { 6000 }
+OWNERS = {}
+CONSTRUCTIONS = { [77] = { fileName = '::/stations/street/modular_street_station/modular_terminal.con',
+    transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 80,0,0,1 }, townBuildings = {},
+    frozenEdges = { 6000 }, frozenNodes = { 6001 }, params = { seed = 7, length = 2 } } }
+local get = api.engine.getComponent
+api.engine.getComponent = function(e, kind)
+    if kind == 2 then return CONSTRUCTIONS[e] end
+    if kind == 14 then return OWNERS[e] and { player = OWNERS[e] } end
+    return get(e, kind)
+end
+api.engine.getEntitiesWithComponent = function(kind)
+    local l = {}
+    if kind == 2 then for e in pairs(CONSTRUCTIONS) do l[#l + 1] = e end end
+    table.sort(l)
+    return l
+end
+api.engine.util.getEntityName = function(e) if e == 77 then return 'Okehampton Station' end end
+local send = api.cmd.sendCommand
+api.cmd.sendCommand = function(cmd, ...)
+    local p = cmd.proposal
+    for _, e in ipairs(p and p.constructionsToRemove or {}) do CONSTRUCTIONS[e] = nil end
+    local c = p and p.constructionsToAdd and p.constructionsToAdd[1]
+    if c then CONSTRUCTIONS[911] = { fileName = c.fileName,
+        transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 } }
+        OWNERS[911] = 25 end
+    return send(cmd, ...)
+end
+REFRESH = function(e) return { refreshed = e,
+    proposal = { addedSegments = { { entity = -2, comp = { node0 = -1, node1 = 7 } } },
+                 removedSegments = { { entity = 6100 } } } } end
+REGENERATED = 0
+api.engine.util.proposal = {
+    refreshConstruction = function(e) return REFRESH(e) end,
+    createProposalReplaceConstruction = function(e, params)
+        REGENERATED = REGENERATED + 1
+        return FULL(e, params)
+    end,
+}
+"#;
+
+/// Station 77 given a second exit at its other end, onto the road {ROAD}
+/// (FAKE_NETWORK's 100, 8-9, or 101, 10-7), as the game proposes it: its
+/// own entrance made again (-1 to node 7, 6000 and 6001 removed), its exit
+/// node -2, and the road split through a new junction -3 the exit joins
+/// (seen on build 40408, 2026-10-03). `{EXTRA}` adds to the lists.
+const EDIT_SPLIT: &str = "{ toRemove = { 77 }, \
+    toAdd = { { fileName = '::/stations/street/modular_street_station/modular_terminal.con', \
+                name = 'Okehampton Station', \
+                transf = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 80, 0, 0, 1 }, \
+                params = { seed = 7, length = 2, modules = { [12] = { name = 'station/exit.module' } } } } }, \
+    proposal = { \
+    addedNodes = { { entity = -1, comp = { position = { x = 70, y = 0, z = 0 } } }, \
+                   { entity = -2, comp = { position = { X2, Y2, z = 0 } } }, \
+                   { entity = -3, comp = { position = { X3, Y3, z = 0 } } } }, \
+    addedSegments = { \
+        { entity = -4, type = 0, comp = { node0 = -1, node1 = 7, type = 0, typeIndex = -1, \
+          tangent0 = { x = -70, y = 0, z = 0 }, tangent1 = { x = -70, y = 0, z = 0 }, \
+          roadTemplate = '::/street/town_small.street_template', roadStyle = '' } }, \
+        { entity = -5, type = 0, comp = { node0 = -2, node1 = -3, type = 0, typeIndex = -1, \
+          tangent0 = { x = 0, y = -10, z = 0 }, tangent1 = { x = 0, y = -10, z = 0 }, \
+          roadTemplate = '::/street/town_small.street_template', roadStyle = '' } }, \
+        { entity = -6, type = 0, comp = { node0 = A, node1 = -3, type = 0, typeIndex = -1, \
+          tangent0 = { TA }, tangent1 = { TA }, \
+          roadTemplate = '::/street/country.street_template', roadStyle = '' } }, \
+        { entity = -7, type = 0, comp = { node0 = -3, node1 = B, type = 0, typeIndex = -1, \
+          tangent0 = { TA }, tangent1 = { TA }, \
+          roadTemplate = '::/street/country.street_template', roadStyle = '' } } }, \
+    removedSegments = { { entity = 6000, type = 0, comp = { node0 = 6001, node1 = 7 } }, \
+                        { entity = ROAD, type = 0, comp = { node0 = A, node1 = B } } {EXTRA} }, \
+    removedNodes = { { entity = 6001, comp = { position = { x = 70, y = 0, z = 0 } } } }, \
+    edgeObjectsToAdd = {}, edgeObjectsToRemove = {} } }";
+
+/// EDIT_SPLIT onto road `road`, with `extra` in its removed segments.
+fn edit_split(road: u32, extra: &str) -> String {
+    let (a, b, x2, y2, x3, y3, ta) = if road == 100 {
+        (
+            8,
+            9,
+            "x = 50",
+            "y = 20",
+            "x = 50",
+            "y = 10",
+            "x = 0, y = 40, z = 0",
+        )
+    } else {
+        (
+            10,
+            7,
+            "x = -30",
+            "y = 10",
+            "x = -30",
+            "y = 0",
+            "x = 30, y = 0, z = 0",
+        )
+    };
+    EDIT_SPLIT
+        .replace("{EXTRA}", extra)
+        .replace("ROAD", &road.to_string())
+        .replace("X2", x2)
+        .replace("Y2", y2)
+        .replace("X3", x3)
+        .replace("Y3", y3)
+        .replace("TA", ta)
+        .replace("node0 = A", &format!("node0 = {a}"))
+        .replace("node1 = A", &format!("node1 = {a}"))
+        .replace("node0 = B", &format!("node0 = {b}"))
+        .replace("node1 = B", &format!("node1 = {b}"))
+}
+
+/// The module editor's edit as the hook reads it: the construction, and of
+/// the street part what it removes, and how many nodes and edges it adds.
+const NATIVE_OF: &str = "function NATIVE_OF(full) \
+    local s = full.proposal \
+    local function blanks(n) local l = {} for i = 1, n do l[i] = {} end return l end \
+    local function ids(l) local out = {} for i, x in ipairs(l) do out[i] = { entity = x.entity } end return out end \
+    return { toRemove = full.toRemove, toAdd = full.toAdd, proposal = { \
+        addedNodes = blanks(#s.addedNodes), addedSegments = blanks(#s.addedSegments), \
+        removedNodes = ids(s.removedNodes), removedSegments = ids(s.removedSegments), \
+        edgeObjectsToAdd = {}, edgeObjectsToRemove = {} } } \
+end";
+
+/// A module editor's edit that changes the streets around its station (a
+/// new exit splitting a road, 2026-10-03) is asked of the game again, and
+/// travels with its connection when the game proposes the same edit as the
+/// hook read: else it is refused, with why. An edit of its own streets only
+/// is not asked again.
+#[test]
+fn a_module_edit_that_splits_a_road_travels_with_the_split() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_AT_NODE_7).exec().unwrap();
+    lua.load(NATIVE_OF).exec().unwrap();
+    let split = edit_split(100, "");
+    lua.load(format!(
+        "capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         FULL = function() return {split} end \
+         ACTION, WHY = capture.moduleEdit(NATIVE_OF(FULL()))"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let carried: String = lua
+        .load(
+            "assert(ACTION, WHY) local b = ACTION.BuildConstruction local c = b.connection \
+             local out = { REGENERATED, b.replaces.file, b.replaces.at.x, b.name, #c.links, #c.removals, \
+                 tostring(schema_check(ACTION)) } \
+             for _, r in ipairs(c.removals) do \
+                 out[#out + 1] = r.ends.a.x .. ',' .. r.ends.a.y .. '>' .. r.ends.b.x .. ',' .. r.ends.b.y end \
+             return table.concat(out, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        carried,
+        "1|::/stations/street/modular_street_station/modular_terminal.con|80|Okehampton Station|4|1|true\
+         |50,-40>50,40",
+        "the road it splits travels, not the old station's own entrance, which goes with the station"
+    );
+    // The game proposes another edit than the hook read: refused.
+    for (full, why) in [
+        (
+            edit_split(100, "").replace("{ entity = 100,", "{ entity = 101,"),
+            "a construction edit the game proposes otherwise: what it removes",
+        ),
+        (
+            edit_split(
+                100,
+                ", { entity = 100, type = 0, comp = { node0 = 8, node1 = 9 } }",
+            ),
+            "a construction edit the game proposes otherwise: what it removes",
+        ),
+        (
+            edit_split(100, "").replace("0, 0, 1, 0, 80, 0, 0, 1", "0, 0, 1, 0, 85, 0, 0, 1"),
+            "a construction edit the game proposes otherwise: where it stands",
+        ),
+        (
+            edit_split(100, "").replace(
+                "edgeObjectsToAdd = {}",
+                "edgeObjectsToAdd = { { entity = -9 } }",
+            ),
+            "a construction edit with a stop or signal",
+        ),
+    ] {
+        let got: String = lua
+            .load(format!(
+                "local native = NATIVE_OF({split}) \
+                 FULL = function() return {full} end \
+                 local a, why = capture.moduleEdit(native) \
+                 return tostring(a) .. ' ' .. tostring(why)"
+            ))
+            .eval()
+            .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+        assert_eq!(got, format!("nil {why}"));
+    }
+    // A game that cannot propose it again: refused as before.
+    let got: String = lua
+        .load(format!(
+            "api.engine.util.proposal.createProposalReplaceConstruction = nil \
+             local a, why = capture.moduleEdit(NATIVE_OF({split})) \
+             return tostring(a) .. ' ' .. tostring(why)"
+        ))
+        .eval()
+        .unwrap();
+    assert_eq!(
+        got,
+        "nil a construction edit that changes the streets around it"
+    );
+    // An edit of its own streets only travels as the hook read it.
+    let (regenerated, connection): (i64, String) = lua
+        .load(format!(
+            "REGENERATED = 0 \
+             local a = assert(capture.moduleEdit(NATIVE_OF({EDIT_PROPOSAL}))) \
+             return REGENERATED, tostring(a.BuildConstruction.connection)"
+        ))
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!((regenerated, connection.as_str()), (0, "nil"));
+}
+
+/// Every game builds such an edit in one proposal: the old station removed,
+/// the new one added, the road split through the junction its exit meets,
+/// without the station's own entrances, which it makes itself; then its
+/// refresh snaps them. A road of another company it may not split (D21),
+/// and a refused refresh leaves the edit and the split standing.
+#[test]
+fn every_game_builds_an_edit_with_the_road_it_splits() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_AT_NODE_7).exec().unwrap();
+    lua.load(NATIVE_OF).exec().unwrap();
+    let split = edit_split(100, "");
+    lua.load(format!(
+        "local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         FULL = function() return {split} end \
+         ACTION = assert(capture.moduleEdit(NATIVE_OF(FULL()))) \
+         SAVED = {{}} for k, v in pairs(CONSTRUCTIONS) do SAVED[k] = v end \
+         HOOK.batch = {{ ACTION }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let built: String = lua
+        .load(
+            "local p = SENT[1].proposal local s = p.streetProposal \
+             local out = { tostring(HOOK.applied[1].ok), #SENT, p.constructionsToRemove[1], p.old2new[77], \
+                 p.constructionsToAdd[1].fileName, #s.nodesToAdd, table.concat(s.edgesToRemove, ','), \
+                 tostring(s.nodesToRemove) } \
+             for _, e in ipairs(s.edgesToAdd) do out[#out + 1] = e.comp.node0 .. '>' .. e.comp.node1 end \
+             out[#out + 1] = tostring(SENT[2].proposal.refreshed) \
+             return table.concat(out, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        built,
+        "true|2|77|0|::/stations/street/modular_street_station/modular_terminal.con|1|100|nil\
+         |8>-3|-3>9|911",
+        "one proposal: the station replaced and the road split, its entrances left to it; then its refresh"
+    );
+    // A road of another company: refused in every game, nothing sent.
+    lua.load(
+        "SENT = {} CONSTRUCTIONS = {} for k, v in pairs(SAVED) do CONSTRUCTIONS[k] = v end \
+         OWNERS[100] = 900 HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let (sent, ok, why): (usize, bool, String) = lua
+        .load("return #SENT, HOOK.applied[2].ok, HOOK.applied[2].why")
+        .eval()
+        .unwrap();
+    assert_eq!((sent, ok), (0, false));
+    assert!(
+        why.ends_with("the road or track belongs to another company"),
+        "{why}"
+    );
+    // A refresh the game refuses: the edit and the split stand.
+    lua.load(
+        "SENT = {} CONSTRUCTIONS = {} for k, v in pairs(SAVED) do CONSTRUCTIONS[k] = v end \
+         OWNERS[100] = nil REFRESH = function() error('Construction Not Possible') end \
+         HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let (sent, ok): (usize, bool) = lua.load("return #SENT, HOOK.applied[3].ok").eval().unwrap();
+    assert_eq!((sent, ok), (1, true));
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.starts_with("the edited construction stays unsnapped: ")),
+        "{logged:?}"
+    );
+}
+
+/// A road split next to the junction the old station's entrance meets: the
+/// settings kept for that junction would name the old entrance, which goes
+/// with the old station. So that junction keeps none; the new station and
+/// its refresh give it the game's own, the same in every game.
+#[test]
+fn an_edit_leaves_the_junction_at_its_old_entrance_to_the_station() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_NETWORK).exec().unwrap();
+    lua.load(STATION_AT_NODE_7).exec().unwrap();
+    lua.load(NATIVE_OF).exec().unwrap();
+    let split = edit_split(101, "");
+    lua.load(format!(
+        "CONFIGS[7] = true \
+         local capture = ug_require('tpf3mp_1::/scripts/tpf3mp/capture.lua') \
+         FULL = function() return {split} end \
+         ACTION = assert(capture.moduleEdit(NATIVE_OF(FULL()))) \
+         SAVED = {{}} for k, v in pairs(CONSTRUCTIONS) do SAVED[k] = v end \
+         HOOK.batch = {{ ACTION }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let built: String = lua
+        .load(
+            "local s = SENT[1].proposal.streetProposal \
+             local added = {} for _, n in ipairs(s.nodeConfigsToAdd or {}) do added[#added + 1] = n.entity end \
+             return table.concat({ tostring(HOOK.applied[1].ok), table.concat(s.edgesToRemove, ','), \
+                 table.concat(s.nodeConfigsToRemove or {}, ','), table.concat(added, ',') }, '|')",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(built, "true|101|7|");
+    let logged: Vec<String> = lua.load("return HOOK.logged").eval().unwrap();
+    assert!(
+        logged.iter().any(
+            |l| l == "left to the construction: the settings of 1 junction(s) at its old edges"
+        ),
+        "{logged:?}"
+    );
+    // Another company's road at that junction: its settings are not this
+    // company's to drop (D21), and nothing is sent.
+    lua.load(
+        "SENT = {} CONSTRUCTIONS = {} for k, v in pairs(SAVED) do CONSTRUCTIONS[k] = v end \
+         NODES[12] = { x = 0, y = -60, z = 0 } \
+         EDGES[102] = { node0 = 7, node1 = 12, tangent0 = { x = 0, y = -60, z = 0 }, \
+             tangent1 = { x = 0, y = -60, z = 0 }, objects = {}, \
+             roadTemplate = '::/street/town_small.street_template' } \
+         STREETS[7] = { 101, 6000, 102 } STREETS[12] = { 102 } OWNERS[102] = 900 \
+         HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
+    )
+    .exec()
+    .unwrap();
+    let (sent, ok, why): (usize, bool, String) = lua
+        .load("return #SENT, HOOK.applied[2].ok, HOOK.applied[2].why")
+        .eval()
+        .unwrap();
+    assert_eq!((sent, ok), (0, false));
+    assert!(
+        why.ends_with("the junction edge belongs to another company"),
+        "{why}"
     );
 }
 
@@ -3332,28 +4010,10 @@ fn a_station_by_a_road_travels_with_the_junction_that_joins_it() {
     // which the station makes again unsnapped; then the game's refresh of
     // the new station, which snaps its entrance onto the junction. As the
     // game: a built construction is listed, and refreshed on request.
-    lua.load(
-        "api.type.ComponentType.CONSTRUCTION = 2 \
-         CONSTRUCTIONS = {} \
-         local get = api.engine.getComponent \
-         api.engine.getComponent = function(e, kind) \
-             if kind == 2 then return CONSTRUCTIONS[e] end return get(e, kind) end \
-         api.engine.getEntitiesWithComponent = function(kind) \
-             local l = {} if kind == 2 then for e in pairs(CONSTRUCTIONS) do l[#l + 1] = e end end return l end \
-         local send = api.cmd.sendCommand \
-         api.cmd.sendCommand = function(cmd, ...) \
-             local c = cmd.proposal and cmd.proposal.constructionsToAdd and cmd.proposal.constructionsToAdd[1] \
-             if c then CONSTRUCTIONS[5000] = { fileName = c.fileName, \
-                 transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 } } end \
-             return send(cmd, ...) \
-         end \
-         api.engine.util.proposal = { refreshConstruction = function(e) return { refreshed = e, \
-             proposal = { addedSegments = { { entity = -2, comp = { node0 = -1, node1 = 7777 } } }, \
-                          removedSegments = { { entity = 6000 } } } } end } \
-         HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
-    )
-    .exec()
-    .unwrap();
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
     let built: String = lua
         .load(
             "local p = SENT[1].proposal local s = p.streetProposal \
@@ -3393,17 +4053,22 @@ fn a_station_by_a_road_travels_with_the_junction_that_joins_it() {
 /// As the game: a built construction is listed, and refreshed on request,
 /// its refresh snapping its entrance onto node 7777.
 const STATION_REFRESH: &str = "api.type.ComponentType.CONSTRUCTION = 2 \
-    CONSTRUCTIONS = {} \
+    api.type.ComponentType.PLAYER_OWNED = 15 \
+    CONSTRUCTIONS, OWNERS = {}, {} \
     local get = api.engine.getComponent \
     api.engine.getComponent = function(e, kind) \
-        if kind == 2 then return CONSTRUCTIONS[e] end return get(e, kind) end \
+        if kind == 2 then return CONSTRUCTIONS[e] end \
+        if kind == 15 then return OWNERS[e] and { player = OWNERS[e] } end \
+        return get(e, kind) end \
     api.engine.getEntitiesWithComponent = function(kind) \
         local l = {} if kind == 2 then for e in pairs(CONSTRUCTIONS) do l[#l + 1] = e end end return l end \
+    api.cmd.makeEntitySetPlayerCmd = function(entity, player) return { setPlayer = entity, player = player } end \
     local send = api.cmd.sendCommand \
     api.cmd.sendCommand = function(cmd, ...) \
         local c = cmd.proposal and cmd.proposal.constructionsToAdd and cmd.proposal.constructionsToAdd[1] \
         if c then CONSTRUCTIONS[5000] = { fileName = c.fileName, \
-            transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 } } end \
+            transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 } } \
+            OWNERS[5000] = cmd.context and cmd.context.player or api.engine.util.getPlayer() end \
         return send(cmd, ...) \
     end \
     api.engine.util.proposal = { refreshConstruction = function(e) return { refreshed = e, \
@@ -3428,6 +4093,7 @@ fn a_station_the_room_builds_names_its_group_as_the_tool_named_it() {
         lua.load(STATION_REFRESH).exec().unwrap();
         lua.load(format!(
             "api.type.ComponentType.STATION_GROUP = 9 \
+             OWNERS[5001], OWNERS[5002] = api.engine.util.getPlayer(), api.engine.util.getPlayer() \
              NAMES = {{ [5002] = {before} }} \
              api.engine.util.getEntityName = function(e) return NAMES[e] end \
              api.engine.system.stationGroupSystem = {{ getStationGroup = function(s) \
@@ -3564,28 +4230,14 @@ fn a_construction_whose_own_track_the_tool_snapped_is_built_alone_then_snapped()
          api.res.streetTemplateRep.find = function(n) \
              if n == '::/track/standard.track_template' then return 6 end return find(n) end \
          api.res.streetTemplateRep.get = function(id) \
-             if id == 6 then return { laneConfigs = { 'track lanes' }, streetStyle = '' } end return get(id) end \
-         api.type.ComponentType.CONSTRUCTION = 2 \
-         CONSTRUCTIONS = {} \
-         local getc = api.engine.getComponent \
-         api.engine.getComponent = function(e, kind) \
-             if kind == 2 then return CONSTRUCTIONS[e] end return getc(e, kind) end \
-         api.engine.getEntitiesWithComponent = function(kind) \
-             local l = {} if kind == 2 then for e in pairs(CONSTRUCTIONS) do l[#l + 1] = e end end return l end \
-         local send = api.cmd.sendCommand \
-         api.cmd.sendCommand = function(cmd, ...) \
-             local c = cmd.proposal and cmd.proposal.constructionsToAdd and cmd.proposal.constructionsToAdd[1] \
-             if c then CONSTRUCTIONS[5000] = { fileName = c.fileName, \
-                 transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1], c.transf[4][2], c.transf[4][3], 1 } } end \
-             return send(cmd, ...) \
-         end \
-         api.engine.util.proposal = { refreshConstruction = function(e) return { refreshed = e, \
-             proposal = { addedSegments = { { entity = -1, comp = { node0 = 8, node1 = -2 } } }, \
-                          removedSegments = { { entity = 6000 } } } } end } \
-         HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)",
+             if id == 6 then return { laneConfigs = { 'track lanes' }, streetStyle = '' } end return get(id) end",
     )
     .exec()
     .unwrap();
+    lua.load(STATION_REFRESH).exec().unwrap();
+    lua.load("HOOK.batch = { ACTION } UPDATE({}, STATE, 0.2)")
+        .exec()
+        .unwrap();
     let built: String = lua
         .load(
             "local p = SENT[1].proposal local s = p.streetProposal \
@@ -4746,6 +5398,66 @@ fn the_game_script_buys_the_vehicle_and_tells_the_buyer_which() {
         .eval()
         .unwrap();
     assert_eq!(saved, 2);
+}
+
+/// The sender's GUI filters another company's depot, but every game's replay
+/// must enforce the same rule for old or forged actions. An absent owner is
+/// refused too; with one company the existing native behavior remains.
+#[test]
+fn every_game_buys_only_at_its_companys_owned_depot() {
+    let (lua, _script) = engine();
+    lua.load(FAKE_FLEET).exec().unwrap();
+    lua.load(format!(
+        "api.cmd.makeEntitySetColorCmd = function(e, color) return {{ paint = e }} end \
+         local CT = api.type.ComponentType CT.PLAYER_OWNED = 13 \
+         local base = api.engine.getComponent \
+         api.engine.getComponent = function(e, kind) \
+             if kind == CT.PLAYER_OWNED then \
+                 if e == 202 then return {{ player = 901 }} end \
+                 if e == 203 then return {{ player = 25 }} end \
+                 return nil \
+             end \
+             if kind == CT.CONSTRUCTION and e == 201 then \
+                 local c = base(e, kind) c.depots = {{ 202, 203, 204 }} return c \
+             end \
+             return base(e, kind) \
+         end \
+         ROSTER = {{ next = 2, list = {{ \
+             {{ id = 0, entity = 25, name = 'First', color = {{ 0.80, 0.16, 0.12 }} }}, \
+             {{ id = 1, entity = 901, name = 'Rival', color = {{ 0.13, 0.42, 0.85 }} }} }}, \
+             members = {{ {{ player = 'rival-player', company = 1 }} }} }} \
+         STATE.value = {{ companies = ROSTER }} \
+         HOOK.room = true UPDATE({{}}, STATE, 0.2) \
+         local function buy(index) local action = {BUY_BUS} \
+             action.BuyVehicle.depot_index = index return action end \
+         HOOK.origins = {{ 'rival-player', 'rival-player', 'rival-player' }} \
+         HOOK.batch = {{ buy(0), buy(1), buy(2) }} UPDATE({{}}, STATE, 0.2)"
+    ))
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let result: (usize, i64, i64, bool, bool, String, bool, String) = lua
+        .load(
+            "local buys = {} for _, c in ipairs(SENT) do if c.buy then buys[#buys + 1] = c.buy end end \
+             return #buys, buys[1].player, buys[1].depot, \
+                 HOOK.applied[1].ok, HOOK.applied[2].ok, HOOK.applied[2].why, \
+                 HOOK.applied[3].ok, HOOK.applied[3].why",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        result,
+        (
+            1,
+            901,
+            202,
+            true,
+            false,
+            "the depot belongs to First".to_owned(),
+            false,
+            "the depot has no company owner".to_owned(),
+        ),
+        "only the acting company's owned depot is purchased; foreign and ownerless depots fail closed"
+    );
 }
 
 #[test]
@@ -8618,6 +9330,7 @@ fn what_a_player_does_is_booked_to_their_company() {
         -- A's loan, for Rival: 1200 over 12 months at 12 % a year; and B's,
         -- who plays for the first company, through the game's loan script.
         OFFER = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12 }
+        STATE.value.companies.loanOffers = { { company = 1, availableLoans = { OFFER } } }
         HOOK.batch = { { Loan = { Take = { next = OFFER, offer = OFFER } } },
                        { Loan = { Take = { next = OFFER, offer = OFFER } } } }
         HOOK.origins = { A, B }
@@ -10494,6 +11207,7 @@ fn only_the_company_that_borrowed_pays_its_loan() {
         UPDATE({}, STATE, 0.2)
         -- Ann (901) borrows 1200 over 12 months at 12 % a year.
         OFFER = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12 }
+        STATE.value.companies.loanOffers = { { company = 1, availableLoans = { OFFER } } }
         HOOK.batch = { { Loan = { Take = { next = OFFER, offer = OFFER } } } } HOOK.origins = { A }
         UPDATE({}, STATE, 0.2)
         function BOOKED()
@@ -10551,6 +11265,164 @@ fn only_the_company_that_borrowed_pays_its_loan() {
     );
     let booked: String = lua.load("return BOOKED()").eval().unwrap();
     assert_eq!(booked, "LOAN-912@901");
+    // Four loans at once, as the game's loan script allows: a fifth is
+    // refused.
+    let why: String = lua
+        .load(
+            "for i = 1, 4 do STATE.value.companies.loans[i] = { id = i, company = 1, amount = 1, remaining = 1, months = 1, paid = 0, rate = 0, payment = 1 } end              HOOK.batch = { { Loan = { Take = { next = OFFER, offer = OFFER } } } } HOOK.origins = { A } UPDATE({}, STATE, 0.2)              return tostring(HOOK.applied[#HOOK.applied].why)",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}
+{}", log(&lua)));
+    assert_eq!(why, "Ann has 4 loans already");
+}
+
+/// Founded companies get loan offers from their own persistent copy. The
+/// exact displayed terms are required, a taken slot cools down, and neither
+/// another company nor the save player's native loan table is changed.
+#[test]
+fn founded_company_loan_offers_are_checked_consumed_and_company_scoped() {
+    let (lua, _script) = engine();
+    lua.load(
+        r#"
+        GAME_T = 0
+        HOOK.seed = 12345
+        api.type.ComponentType.GAME_TIME = 99
+        api.type.ComponentType.GAME_SCRIPT = 7
+        api.engine.util.getWorld = function() return 1 end
+        api.engine.system.gameScriptSystem = {}
+        api.engine.system.gameScriptSystem.getEntityForGameScript = function(name)
+            if name == '::/game_mechanics/finance/loan.gs' then return 40 end
+            return -1
+        end
+        api.engine.getComponent = function(e, kind)
+            if e == 1 and kind == 99 then return { gameTime = GAME_T } end
+            if e == 40 and kind == 7 then return { state = LOANS } end
+        end
+        api.util = { getDefaultMonthDuration = function() return 1000 end }
+        api.type.JournalEntry = { new = function() return { category = {} } end,
+                                  Type = { LOAN = 'LOAN', INTEREST = 'INTEREST' } }
+        api.cmd.makeJournalBookAssetCmd = function(e, entry) return { journal = entry, entity = e } end
+        LOANS = { availableLoans = {
+            { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12, birthDay = 0 },
+            { type = 'Medium', amount = 2400, duration = 24000, percentage = 0.08, birthDay = 0 },
+            { type = 'Large', amount = 3600, duration = 36000, percentage = 0.10, birthDay = 0 },
+            { type = 'ExtraLarge', amount = 4800, duration = 48000, percentage = 0.12, birthDay = 0 },
+        }, obtainedLoans = {}, freeId = 0 }
+        GAME_MODULES = { ['::/game_mechanics/finance/loan_util.tl'] = {
+            createSmallLoan = function() return { type = 'Small', amount = 1300, duration = 12000, percentage = 0.10, birthDay = GAME_T } end,
+            createMediumLoan = function() return { type = 'Medium', amount = 2500, duration = 24000, percentage = 0.07, birthDay = GAME_T } end,
+            createLargeLoan = function() return { type = 'Large', amount = 3700, duration = 36000, percentage = 0.09, birthDay = GAME_T } end,
+            createExtraLargeLoan = function() return { type = 'ExtraLarge', amount = 4900, duration = 48000, percentage = 0.11, birthDay = GAME_T } end,
+        } }
+        A, B = string.rep('a', 64), string.rep('b', 64)
+        HOOK.room = true
+        HOOK.batch = { { CompanyOp = { Create = { name = 'Ann' } } },
+                       { CompanyOp = { Create = { name = 'Bob' } } } }
+        HOOK.origins = { A, B }
+        UPDATE({}, STATE, 0.2)
+        ANN, BOB = STATE.value.companies.list[2].id, STATE.value.companies.list[3].id
+        assert(#STATE.value.companies.loanOffers == 2)
+        OFFER = { type = 'Small', amount = 1200, duration = 12000, percentage = 0.12 }
+        NEXT = { type = 'Small', amount = 1300, duration = 12000, percentage = 0.10, birthDay = GAME_T }
+        function TAKE(player, offer, next)
+            HOOK.batch = { { Loan = { Take = { next = next, offer = offer } } } }
+            HOOK.origins = { player }
+            UPDATE({}, STATE, 0.2)
+            return HOOK.applied[#HOOK.applied].ok, HOOK.applied[#HOOK.applied].why
+        end
+        function JOURNALS()
+            local n = 0
+            for _, c in ipairs(SENT) do
+                if c.journal and c.journal.category.type == 'LOAN' and c.journal.amount > 0 then n = n + 1 end
+            end
+            return n
+        end
+        "#,
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+
+    let forged: (bool, String) = lua
+        .load("local ok, why = TAKE(A, { type = 'Small', amount = 999999, duration = 12000, percentage = 0.12 }, NEXT) return ok, why")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        forged,
+        (false, "that loan offer is no longer available".into())
+    );
+    let forged_rate: (bool, String) = lua
+        .load("local ok, why = TAKE(A, { type = 'Small', amount = 1200, duration = 12000, percentage = 0.01 }, NEXT) return ok, why")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        forged_rate,
+        (false, "that loan offer is no longer available".into())
+    );
+    let forged_duration: (bool, String) = lua
+        .load("local ok, why = TAKE(A, { type = 'Small', amount = 1200, duration = 24000, percentage = 0.12 }, NEXT) return ok, why")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        forged_duration,
+        (false, "that loan offer is no longer available".into())
+    );
+    let wrong_replacement: (bool, String) = lua
+        .load("local ok, why = TAKE(A, OFFER, { type = 'Medium', amount = 2500, duration = 24000, percentage = 0.07 }) return ok, why")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        wrong_replacement,
+        (
+            false,
+            "the replacement must match the offered loan type".into()
+        )
+    );
+    let accepted: (bool, Option<String>) = lua.load("return TAKE(A, OFFER, NEXT)").eval().unwrap();
+    assert_eq!(accepted, (true, None));
+    let after_first = lua
+        .load(
+            "local roster = STATE.value.companies local offers = roster.loanOffers \
+             return offers[1].availableLoans[1].cooldownUntil, offers[2].availableLoans[1].amount, \
+                 LOANS.availableLoans[1].amount, JOURNALS()",
+        )
+        .eval::<(i64, i64, i64, i64)>()
+        .unwrap();
+    assert!(after_first.0 >= 4_000 && after_first.0 <= 8_000);
+    assert_eq!(after_first.1, 1200, "Bob's same slot remains available");
+    assert_eq!(after_first.2, 1200, "the native offer remains untouched");
+    assert_eq!(after_first.3, 1, "one loan booking only");
+    let reused: (bool, String) = lua
+        .load("local ok, why = TAKE(A, OFFER, NEXT) return ok, why")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        reused,
+        (false, "that loan offer is no longer available".into())
+    );
+    let bob: (bool, Option<String>) = lua.load("return TAKE(B, OFFER, NEXT)").eval().unwrap();
+    assert_eq!(
+        bob,
+        (true, None),
+        "another company's offer slot stays independent"
+    );
+    let journals: i64 = lua.load("return JOURNALS()").eval().unwrap();
+    assert_eq!(journals, 2, "the refused reuse made no duplicate charge");
+    let refreshed: (i64, i64, Option<i64>, i64) = lua
+        .load(
+            "local roster = STATE.value.companies local untilTime = roster.loanOffers[1].availableLoans[1].cooldownUntil \
+             GAME_T = untilTime + 1 UPDATE({}, STATE, 0.2) \
+             return roster.loanOffers[1].availableLoans[1].amount, \
+                 roster.loanOffers[2].availableLoans[1].amount, \
+                 roster.loanOffers[1].availableLoans[1].cooldownUntil, JOURNALS()",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        refreshed,
+        (1300, 1300, None, 2),
+        "both slots refresh independently after cooldown"
+    );
 }
 
 /// A headquarters as the game's resources declare one
@@ -10588,6 +11460,12 @@ fn each_company_builds_one_headquarters_of_its_own() {
             if kind == 2 then return CONS[e] end
             if kind == 55 then return OWNERS[e] and { player = OWNERS[e] } end
         end
+        api.engine.getEntitiesWithComponent = function(kind)
+            local entities = {}
+            if kind == 2 then for e in pairs(CONS) do entities[#entities + 1] = e end end
+            table.sort(entities)
+            return entities
+        end
         api.engine.forEachEntityWithComponent = function(fn, kind)
             if kind == 2 then for e in pairs(CONS) do fn(e) end end
         end
@@ -10597,7 +11475,9 @@ fn each_company_builds_one_headquarters_of_its_own() {
         api.cmd.makeWorldBuildProposalCmd = function(proposal, context, ...)
             for _, e in ipairs(proposal.constructionsToAdd or {}) do
                 NEXT_CON = NEXT_CON + 1
-                CONS[NEXT_CON] = { fileName = e.fileName }
+                CONS[NEXT_CON] = { fileName = e.fileName,
+                    transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0,
+                        e.transf[4][1], e.transf[4][2], e.transf[4][3], 1 } }
                 OWNERS[NEXT_CON] = e.playerEntity
             end
             return make(proposal, context, ...)
@@ -10623,7 +11503,11 @@ fn each_company_builds_one_headquarters_of_its_own() {
     };
     // Rival builds its headquarters, then the first company its own.
     assert_eq!(eval(&format!("return built({HQ}, A)")), "true");
-    assert_eq!(eval(&format!("return built({HQ}, B)")), "true");
+    let second_hq = HQ.replace(
+        "origin = { x = 100, y = 200, z = 5 }",
+        "origin = { x = 200, y = 200, z = 5 }",
+    );
+    assert_eq!(eval(&format!("return built({second_hq}, B)")), "true");
     // A second one is refused, alike in every game; other buildings not.
     assert_eq!(
         eval(&format!("return built({HQ}, A)")),
@@ -12491,4 +13375,132 @@ fn the_simulation_notes_the_save_player_for_native_company_tools() {
         .eval()
         .unwrap();
     assert_eq!(noted, "214443");
+}
+
+/// The game's finance window reads the loan script's state, which keeps
+/// the room's first company's loans only. In the GUI it shows a player of
+/// another company that company's own loans and the offers it can take; a
+/// player of the first company sees the loan script's own, as before. The
+/// simulation's view of the loan script is never changed.
+#[test]
+fn the_finance_window_shows_a_founded_companys_own_loans() {
+    let lua = gui();
+    lua.load(FAKE_HOOK).exec().unwrap();
+    lua.load(FAKE_CMD).exec().unwrap();
+    lua.load(
+        r#"
+        ME = string.rep("b", 64)
+        ROSTER = { next = 2, nextLoan = 3,
+                   list = { { id = 0, entity = 25, name = "First", color = { 1, 0, 0 } },
+                            { id = 1, entity = 901, name = "Rival", color = { 0, 0, 1 } } },
+                   members = {},
+                   loanOffers = { { company = 1, availableLoans = {
+                       { type = "Small", amount = 5000000, duration = 3000, percentage = 0.03 },
+                       { type = "Medium", amount = 5000, duration = 6000, percentage = 0.05 },
+                   } } },
+                   loans = { { id = 2, company = 1, amount = 1200, remaining = 1105, months = 12, paid = 1,
+                               rate = 0.01, payment = 107, type = "Small" },
+                             { id = 1, company = 7, amount = 99, remaining = 99, months = 1, paid = 0,
+                               rate = 0, payment = 99 } } }
+        LOANS = { availableLoans = { { type = "Small", amount = 5000000, duration = 3000, percentage = 0.03 },
+                                     { type = "Medium", cooldownUntil = 5000 } },
+                  obtainedLoans = { { id = 0 }, { id = 1 }, { id = 2 }, { id = 3 } }, freeId = 4 }
+        api.engine = api.engine or {}
+        api.engine.util = { getPlayer = function() return 25 end }
+        api.engine.system = api.engine.system or {}
+        api.engine.system.gameScriptSystem = { getEntityForGameScript = function(name)
+            if name == "tpf3mp_1::/tpf3mp_sim/tpf3mp_sim.gs" then return 77 end
+            if name == "::/game_mechanics/finance/loan.gs" then return 40 end
+            return -1 end }
+        api.type = api.type or {}
+        api.type.ComponentType = api.type.ComponentType or {}
+        api.type.ComponentType.GAME_SCRIPT = 7
+        api.util = api.util or {}
+        api.util.getDefaultMonthDuration = function() return 1000 end
+        api.engine.getComponent = function(e, kind)
+            if e == 77 and kind == 7 then return { state = { companies = ROSTER } } end
+            if e == 40 and kind == 7 then return { state = LOANS } end
+        end
+        local realGetComponent = api.engine.getComponent
+        function FRESH_API()
+            return { engine = { util = { getPlayer = function() return 25 end },
+                                system = api.engine.system, getComponent = realGetComponent },
+                     type = api.type, util = api.util, cmd = api.cmd }
+        end
+        HOOK.status = { room = "r", players = { { name = "b", id = ME, me = true, connected = true } }, me_id = ME }
+        function BOARD()
+            local s = api.engine.getComponent(api.engine.system.gameScriptSystem.getEntityForGameScript(
+                "::/game_mechanics/finance/loan.gs"), api.type.ComponentType.GAME_SCRIPT).state
+            local out = {}
+            for _, l in ipairs(s.availableLoans) do out[#out + 1] = l.type .. ":" .. tostring(l.amount or l.cooldownUntil) end
+            out[#out + 1] = "|"
+            for _, l in ipairs(s.obtainedLoans) do
+                out[#out + 1] = tostring(l.id) .. ":" .. tostring(l.amount) .. ":" .. tostring(l.duration) .. ":"
+                    .. tostring(l.percentage) .. ":" .. tostring(l.timesPaid)
+            end
+            return table.concat(out, " ")
+        end
+        "#,
+    )
+    .exec()
+    .unwrap();
+    run_frames(&lua, 20);
+    let board: String = lua.load("return BOARD()").eval().unwrap();
+    assert_eq!(
+        board,
+        "Small:5000000 Medium:5000 | 0:nil:nil:nil:nil 1:nil:nil:nil:nil 2:nil:nil:nil:nil 3:nil:nil:nil:nil",
+        "the first company's player: the loan script's own"
+    );
+    lua.load("ROSTER.members = { { player = ME, company = 1 } }")
+        .exec()
+        .unwrap();
+    run_frames(&lua, 20);
+    let board: String = lua.load("return BOARD()").eval().unwrap();
+    assert_eq!(
+        board, "Small:5000000 Medium:5000 | 2:1200:12000:0.12:1",
+        "Rival's player: Rival's one loan, the offers it can take"
+    );
+    let refreshed: String = lua
+        .load(
+            "api = FRESH_API(); assert(package.loaded['tpf3mp.follow'].ensure(api)); return BOARD()",
+        )
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(
+        refreshed, "Small:5000000 Medium:5000 | 2:1200:12000:0.12:1",
+        "a refreshed GUI api still shows Rival's loans"
+    );
+    let unchanged: bool = lua
+        .load(
+            "return LOANS.availableLoans[2].cooldownUntil == 5000 and #LOANS.obtainedLoans == 4 and ROSTER.loans[1].id == 2 and ROSTER.loans[1].paid == 1",
+        )
+        .eval()
+        .unwrap();
+    assert!(
+        unchanged,
+        "reading the finance window does not change simulation state"
+    );
+    // The window's Repay of it goes to the room as Rival's, by its id and
+    // amount, which every game's companies.repay takes.
+    lua.load(
+        "HOOK.room = true \
+         local s = api.engine.getComponent(40, 7).state \
+         api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd('', 'Loan', 'Repay', { nil, s.obtainedLoans[1] }))",
+    )
+    .exec()
+    .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    let repay: String = lua
+        .load("local l = HOOK.commands[#HOOK.commands].Loan.Repay.loan return l.id .. ':' .. l.amount")
+        .eval()
+        .unwrap_or_else(|error| panic!("{error}\n{}", log(&lua)));
+    assert_eq!(repay, "2:1200");
+    // Where Rival's loans cannot be read, the window shows none and offers
+    // none: never the first company's as Rival's.
+    let board: String = lua
+        .load(
+            "package.loaded['tpf3mp.follow'].LOANS_EVERY = -1              package.loaded['tpf3mp.companies'].loanTable = function() error('unreadable') end              local s = api.engine.getComponent(40, 7).state              return #s.availableLoans .. ' ' .. #s.obtainedLoans",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(board, "0 0");
 }

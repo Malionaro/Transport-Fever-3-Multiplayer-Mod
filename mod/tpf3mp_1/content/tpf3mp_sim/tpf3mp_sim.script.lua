@@ -106,7 +106,7 @@ function data()
 	-- The events the script needs: its console event, and the build tools'
 	-- proposals. Each by name, since a save may carry an older mod's
 	-- subscriptions.
-	local EVENTS = { "command", "builder.proposalCreate", "builder.proposalPrepareForApply",
+	local EVENTS = { "command", "replay", "builder.proposalCreate", "builder.proposalPrepareForApply",
 		"startProspection", "endProspection" }
 
 	-- What a build tool shows in the room's game.
@@ -161,7 +161,7 @@ function data()
 		end
 		local removes = type(proposal.toRemove) == "table" and #proposal.toRemove > 0
 		local ok, action, whyNot = true, nil, "an edit that replaces no construction"
-		if removes then ok, action, whyNot = pcall(capture.construction, proposal) end
+		if removes then ok, action, whyNot = pcall(capture.moduleEdit, proposal) end
 		if not ok then action, whyNot = nil, tostring(action) end
 		if action and action.BuildConstruction.replaces == nil then
 			action, whyNot = nil, "an edit that replaces no construction"
@@ -447,7 +447,8 @@ function data()
 		end
 	end
 
-	return {
+	local script
+	script = {
 		update = function(_params, state, _dt)
 			local l = linked()
 			if not l then return nil end
@@ -469,6 +470,12 @@ function data()
 			-- A month begun since the companies' loans were last charged.
 			local month = companies.monthNow(api)
 			local monthly = l:room() and type(saved) == "table" and companies.due(saved.companies, month)
+			-- Founded companies keep their own offers: initialize old rosters
+			-- once and refresh each independent cooldown when it expires.
+			local loanInit = l:room() and type(saved) == "table"
+				and companies.loanOffersNeedInit(saved.companies, api)
+			local loanRefresh = l:room() and type(saved) == "table"
+				and companies.loanOffersDue(saved.companies, api)
 			-- A quarter of a month begun since the companies' scores were
 			-- last sampled, with more than one company (tpf3mp/progression.lua).
 			local quarter = progression.quarterNow(api)
@@ -480,24 +487,29 @@ function data()
 			-- The entities the hook's edge watch reads in this update.
 			local watch = l:edgewatch()
 			if not actions and not checkpoint and not begin and not monthly and not sample and not subsidies
+				and not loanInit and not loanRefresh
 				and not watch then
 				return nil
 			end
 			return { actions = actions, origins = origins, seals = seals, checkpoint = checkpoint,
 				begin = begin, monthly = monthly and month or nil, sample = sample and quarter or nil,
-				subsidies = subsidies and day or nil, watch = watch }
+				subsidies = subsidies and day or nil, loanInit = loanInit, loanRefresh = loanRefresh, watch = watch }
 		end,
 
 		postUpdate = function(_params, state, _dt, work)
 			local l = linked()
 			if not l or type(work) ~= "table" then return end
-			if work.actions or work.begin or work.monthly or work.sample then
+			if work.actions or work.begin or work.monthly or work.sample or work.loanInit or work.loanRefresh then
 				local saved = state:get()
 				if type(saved) ~= "table" then saved = {} end
 				local reg, _, failed = registry.sync(saved.registry)
 				-- The room's companies: begun at its first update, as the
 				-- registry, the same in every game (tpf3mp/companies.lua).
 				local roster = companies.ensure(saved.companies, api)
+				if work.loanInit then
+					local ok, why = pcall(companies.ensureLoanOffers, roster, api)
+					if not ok then l:log("the companies' loan offers were not initialized: " .. tostring(why)) end
+				end
 				-- What each company owns, once in this game's state, with
 				-- more than one company: whether a world loaded from a save
 				-- kept its owners (read only, tpf3mp/companies.lua).
@@ -586,6 +598,12 @@ function data()
 				if work.monthly then
 					local ok, why = pcall(companies.chargeMonths, roster, work.monthly, apply.send, api)
 					if not ok then l:log("the companies' loans were not charged: " .. tostring(why)) end
+				end
+				if work.loanRefresh then
+					local ok, refreshed, why = pcall(companies.refreshLoanOffers, roster, api)
+					if not ok or (refreshed == false and why) then
+						l:log("the companies' cooled-down loan offers were not refreshed: " .. tostring(ok and why or refreshed))
+					end
 				end
 				if work.sample then
 					local ok, why = progression.sample(prog, roster, api, work.sample,
@@ -815,6 +833,35 @@ function data()
 		end,
 
 		handleEvent = function(_params, state, _src, id, name, param)
+			-- The game's lifecycle events also run before the first update.
+			-- Register on load, including saves with older subscriptions, so
+			-- a room that starts paused can receive its first build.
+			if id == "" and (name == "handleLegacy" or tostring(name):find("init", 1, true) == 1) then
+				if state and state.subscribeToEvent then
+					for _, event in ipairs(EVENTS) do state:subscribeToEvent(event) end
+					subscribed = true
+				end
+				return
+			end
+			if id == "tpf3mp" and (name == "replay" or name == "command") and type(param) == "string" then
+				local l = linked()
+				if not l or not l:room() or type(param) ~= "string" then return end
+				local actions, origins, seals = l:takeReplay(param)
+				if not actions then return end -- stale or duplicate wake
+				local ok, why = pcall(function()
+					local seed = l:seed()
+					if seed then math.randomseed(seed) end
+					-- Only action processing: no monthly charges, progression
+					-- sampling, simulation updates or checkpoint reports.
+					script.postUpdate(_params, state, 0, {
+						actions = actions, origins = origins, seals = seals,
+					})
+				end)
+				l:replaying(false)
+				applying = false
+				l:replayed(param, ok, why)
+				return
+			end
 			if id == "Company" and (name == "startProspection" or name == "endProspection") then
 				prospected(state, name, param)
 				return
@@ -830,4 +877,5 @@ function data()
 			end
 		end,
 	}
+	return script
 end

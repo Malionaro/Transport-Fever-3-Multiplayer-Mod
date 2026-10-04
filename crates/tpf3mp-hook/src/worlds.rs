@@ -255,6 +255,22 @@ pub fn running(_pid: u32) -> bool {
 }
 
 impl GameControl for GuiWorlds {
+    fn request_replay(
+        &mut self,
+        step: u64,
+        actions: &[crate::step::Ordered],
+    ) -> Result<(), String> {
+        lua::request_replay(step, actions)
+    }
+
+    fn replay_result(&mut self) -> Option<Result<(), String>> {
+        lua::take_replay_result()
+    }
+
+    fn cancel_replay(&mut self) {
+        lua::cancel_replay();
+    }
+
     fn request_save(&mut self, name: &str) {
         lua::request_save(name);
     }

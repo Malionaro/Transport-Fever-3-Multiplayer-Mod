@@ -1602,3 +1602,29 @@ signature = "48 8B C4 48 89 58 10 48 89 70 18 48 89 78 20 55 41 56 41 57 48 8D A
 offset = 0
 prologue = "48 8B C4 48 89 58 10 48 89 70 18 48 89 78 20"
 required = false
+
+# The depot the line window's store buys at (guiplayer.rs): the bindings
+# api.engine.util.vehicle.findBestDepotForLine (registered at 0x253c13f by
+# sub_24929a0; closure sub_24fe290 -> sub_24f5470 -> sub_2517cf0) and
+# findBestLineAndDepotForVehicle (0x253c094, sub_24921a0; sub_24fe210 ->
+# sub_24f5260 -> sub_268a7b0) both reach sub_2689fd0, and it sub_2689dd0;
+# nothing else calls those four. Each keeps only what the GameState's player
+# owns: mov reg,[GameState+0x20c]; cmp [rax],reg; jne skip, rax the owner's
+# PlayerOwned. Spliced at the load and compare (no branch lands inside; rax
+# is dead after on both paths): on the GUI's thread outside the step, an
+# owner that is the player's company passes and the save's player's does
+# not. Only the game's GUI scripts call the bindings on build 40408
+# (line_util.tl, manager_window.tl, vehicle_store_window.tl).
+[[target]]
+name = "view: findBestDepot depot owner test"
+signature = "49 8B 0E 8B 91 0C 02 00 00 39 10 0F 85"
+offset = 3
+prologue = "8B 91 0C 02 00 00 39 10"
+required = false
+
+[[target]]
+name = "view: findBestDepot owner test"
+signature = "48 8B 4D 80 8B 89 0C 02 00 00 39 08 75"
+offset = 4
+prologue = "8B 89 0C 02 00 00 39 08"
+required = false

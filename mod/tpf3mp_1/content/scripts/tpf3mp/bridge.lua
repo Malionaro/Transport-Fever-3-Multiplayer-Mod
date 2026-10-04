@@ -5,19 +5,22 @@
 -- `print` one global table, so the mod prints before it looks for it:
 --
 --   tpf3mp_native = {
---     version = 12,                 -- bridge.VERSION; anything else is refused
+--     version = 13,                 -- bridge.VERSION; anything else is refused
 --     command = function(action, password), -- the player acted: an action
 --                                   -- table, for the room to order, and a
 --                                   -- company's password for joining or
 --                                   -- locking it, which the room seals
 --                                   -- -> true, ticket | false, why
---     take    = function(),         -- in a game script's update: the actions
---                                   -- the room ordered for this update, or nil,
---                                   -- who sent each (64 hex digits), and each
---                                   -- one's seal, { scope =, tag = } or false
+--     take    = function(),         -- marks a simulation update begun;
+--                                   -- nil actions in runtime update batches
+--     takeReplay = function(token), -- ordered actions, origins and seals,
+--                                   -- once, in the engine's handleEvent
+--     replayed = function(token, ok, why), -- done after action reports and
+--                                   -- script-state persistence
 --     log     = function(line),     -- a line for hook.log
 --     poll    = function(),         -- in the GUI, every frame: what the hook
---                                   -- asks, { save = name } or { load = name }
+--                                   -- asks, { replay = token }, { save = name }
+--                                   -- or { load = name }
 --                                   -- (the game's own save folder), or nil
 --     saved   = function(name, ok, why), -- the GUI's answer to a save
 --     world   = function(),         -- a world's GUI started
@@ -121,6 +124,8 @@ local acceptance = ug_require and ug_require("tpf3mp_1::/scripts/tpf3mp/acceptan
 
 local bridge = {}
 
+-- 13: token-only ordered replay wakes, takeReplay and replayed, so actions
+--     run between simulation updates while paused as well as while running.
 -- 12: company passwords: `command` takes a password beside the action,
 -- which the room seals, and `take` hands each action's seal third;
 -- 11: `note`, a short string one of the game's Lua states notes for the
@@ -137,7 +142,7 @@ local bridge = {}
 -- 4: the GUI saves and loads the room's world (`poll`, `saved`, `world`);
 -- 3: the room's actions are taken by the game script (`take`); 2 called the
 -- GUI's handlers; 1 passed bytes the mod encoded itself.
-bridge.VERSION = 12
+bridge.VERSION = 13
 bridge.GLOBAL = "tpf3mp_native"
 
 local Link = {}
@@ -153,7 +158,7 @@ function bridge.attach(native)
 	end
 	for _, name in ipairs({ "command", "take", "log", "poll", "saved", "world", "room",
 			"checkpoint", "lanes", "clicks", "replaying", "applied", "results", "status", "chat",
-			"say" }) do
+			"say", "takeReplay", "replayed" }) do
 		if type(native[name]) ~= "function" then
 			return nil, "the hook has no " .. name .. "()"
 		end
@@ -194,6 +199,18 @@ end
 -- (from 1), and the entity it made, if any.
 function Link:applied(index, ok, entity, why)
 	pcall(self.native.applied, index, ok == true, entity, why and tostring(why) or nil)
+end
+
+-- A wake carries only a token. Ordered actions come from the hook, once,
+-- in the engine's handleEvent, even when no simulation update runs.
+function Link:takeReplay(token)
+	local ok, actions, origins, seals = pcall(self.native.takeReplay, token)
+	if not ok or type(actions) ~= "table" then return nil end
+	return actions, origins, seals
+end
+
+function Link:replayed(token, ok, why)
+	pcall(self.native.replayed, token, ok == true, why and tostring(why) or nil)
 end
 
 -- In the GUI: what became of the player's own actions since the last call,

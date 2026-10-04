@@ -3,10 +3,12 @@
 -- track over the construction's own track, as Steam build 40408 did in
 -- the relay playtest on 2026-10-01.
 api.type.ComponentType.CONSTRUCTION = 2
-CONSTRUCTIONS = {}
+api.type.ComponentType.PLAYER_OWNED = 15
+CONSTRUCTIONS, OWNERS = {}, {}
 local get = api.engine.getComponent
 api.engine.getComponent = function(e, kind)
     if kind == 2 then return CONSTRUCTIONS[e] end
+    if kind == 15 then return OWNERS[e] and { player = OWNERS[e] } end
     return get(e, kind)
 end
 api.engine.getEntitiesWithComponent = function(kind)
@@ -14,6 +16,7 @@ api.engine.getEntitiesWithComponent = function(kind)
     if kind == 2 then for e in pairs(CONSTRUCTIONS) do out[#out + 1] = e end end
     return out
 end
+api.cmd.makeEntitySetPlayerCmd = function(entity, player) return { setPlayer = entity, player = player } end
 local send = api.cmd.sendCommand
 api.cmd.sendCommand = function(cmd, callback)
     local p = cmd.proposal
@@ -21,6 +24,7 @@ api.cmd.sendCommand = function(cmd, callback)
     if c then
         CONSTRUCTIONS[5000] = { fileName = c.fileName,
             transf = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.transf[4][1],c.transf[4][2],c.transf[4][3],1 } }
+        OWNERS[5000] = c.playerEntity
         -- The depot generates its own six edges. For the bus station,
         -- only the country road's two replacement edges are external.
         DUPLICATE_TRACK = false

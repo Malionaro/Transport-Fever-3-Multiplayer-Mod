@@ -479,7 +479,7 @@ unsafe extern "C" fn step_detour(this: usize, a: usize, b: usize, c: usize) {
                 Updates::Exactly(updates) => updates,
                 Updates::Own => 0,
             };
-            match lua::begin_batch(batch.actions, updates, batch.lanes, batch.dump) {
+            match lua::begin_batch(&[], updates, batch.lanes, batch.dump) {
                 Ok(()) => {
                     unsafe { run_step(original, batch.updates, batch.room, this, a, b, c) };
                     if let Some(first) = batch.first_step {
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rooms_actions_reach_the_game_script_in_the_first_update_of_their_step() {
+    fn the_rooms_actions_hold_updates_until_the_event_replay_finishes() {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         lua51();
         lua::take_commands();
@@ -1115,9 +1115,9 @@ mod tests {
         ORIGINAL.store(detour.trampoline() as usize, Ordering::Release);
         let step: extern "C" fn(usize, usize, usize, usize) = std::hint::black_box(fake_step);
 
-        // One call runs steps 1 and 2; step 1's first update takes the depot.
+        // The first call queues the replay without running any updates.
         step(0x1111, 0x2222, 0x3333, 0x4444);
-        assert_eq!(game_script.run("return TAKEN"), Ok("1".into()));
+        assert_eq!(game_script.run("return TAKEN"), Ok("nil".into()));
         assert!(!BROKEN.load(Ordering::SeqCst));
         // The player's action goes to the room from the step as well.
         game_script
@@ -1125,7 +1125,7 @@ mod tests {
             .unwrap();
         step(0x1111, 0x2222, 0x3333, 0x4444);
         assert!(lua::take_commands().is_empty(), "handed to the room");
-        assert_eq!(*CALLS.lock().unwrap(), vec![2, 0]);
+        assert_eq!(*CALLS.lock().unwrap(), vec![0, 2]);
 
         ORIGINAL.store(0, Ordering::Release);
         // SAFETY: nothing runs fake_step now.
@@ -1149,10 +1149,9 @@ mod tests {
         script
             .events
             .push_back(vec![command_event(1, 1, &depot_build())]);
-        *DRIVER.lock().unwrap() = Some(Box::new(StepDriver::new(
-            script,
-            Box::new(FakeControl::default()),
-        )));
+        let control = FakeControl::default();
+        control.state.lock().unwrap().replay_wait = true;
+        *DRIVER.lock().unwrap() = Some(Box::new(StepDriver::new(script, Box::new(control))));
         let target = fake_step as *mut u8;
         // SAFETY: as above.
         let detour = unsafe { InlineDetour::install(target, step_detour as *const u8) }.unwrap();
@@ -1162,8 +1161,8 @@ mod tests {
         step(0x1111, 0x2222, 0x3333, 0x4444);
         assert_eq!(
             *CALLS.lock().unwrap(),
-            vec![2, 0],
-            "the steps ran once without the action, then the world stood still"
+            vec![0, 0],
+            "no update runs while the ordered replay is unfinished"
         );
         let driver = DRIVER.lock().unwrap().take().unwrap();
         assert!(driver.in_room(), "held, not left");
@@ -1451,7 +1450,7 @@ mod tests {
         let results = unsafe { print_detour(state.state()) };
         assert_eq!(results, 0);
         assert_eq!(PRINTED.load(Ordering::SeqCst), 1, "the game's print ran");
-        assert_eq!(state.run("return tpf3mp_native.version"), Ok("12".into()));
+        assert_eq!(state.run("return tpf3mp_native.version"), Ok("13".into()));
         PRINT_ORIGINAL.store(0, Ordering::Release);
     }
 }

@@ -17,17 +17,19 @@
 //!   action, or when it never will. A password, for joining or locking a
 //!   company only, goes with the action to the room, which seals it
 //!   ([`tpf3mp_proto::Secret`]); nothing here logs it.
-//! - `take()`: the actions the room ordered for this simulation update, as
-//!   tables ([`action_to_lua`]), or `nil`; second, who sent each (64 hex
-//!   digits); third, each one's seal, `{ scope =, tag = }` (the tag as 64
-//!   hex digits), or `false`. The step gate begins a batch of
-//!   updates at the step the room ordered them for ([`begin_batch`]), and
-//!   the first update that asks gets them: the mod's game script asks in its
-//!   `update`, which the game runs once per simulation update, where a
-//!   command runs at once, the same update on every game.
+//! - `take()`: marks one simulation update begun, so the last update of a
+//!   batch can read checkpoint lanes. Runtime action batches use the
+//!   engine-event path below; `take()` also supports the legacy batch
+//!   action tables in the link's isolated tests.
+//! - `takeReplay(token)`: the engine event takes the matching ordered
+//!   actions once, plus their player identities and seals. The hook keeps
+//!   the actions until this call; the GUI carries only a wake token.
+//! - `replayed(token, ok, why)`: the engine script has applied and reported
+//!   every action and persisted its state, or failed. The step gate then
+//!   releases updates and world operations, or holds the world.
 //! - `log(line)`: a line for `hook.log`.
 //! - `poll()`: in the GUI, every frame: what the hook asks of the game, a
-//!   table `{ save = name }` or `{ load = name }` (a save of the game's own
+//!   table `{ replay = token }`, `{ save = name }` or `{ load = name }` (a save of the game's own
 //!   save folder), once, or `nil`. The GUI saves with `app.saveGame` and
 //!   loads with `app.loadGame` ([`request_save`], [`request_load`]).
 //! - `saved(name, ok, why)`: the GUI's answer to a save ([`take_save_answer`]).
@@ -149,7 +151,7 @@ const TSTRING: c_int = 4;
 const TTABLE: c_int = 5;
 
 /// The contract's version: `bridge.lua`'s `VERSION`.
-pub const VERSION: f64 = 12.0;
+pub const VERSION: f64 = 13.0;
 /// The table's name in each state's globals.
 pub const GLOBAL: &CStr = c"tpf3mp_native";
 
@@ -244,6 +246,22 @@ pub fn api() -> Option<&'static LuaApi> {
 enum Request {
     Save(String),
     Load(String),
+    Replay(String),
+}
+
+/// A replay is separate from update batches: paused frames may run while
+/// the GUI's wake command is in flight. No frame may overwrite this work.
+struct Replay {
+    token: String,
+    step: u64,
+    actions: Option<Vec<LuaValue>>,
+    origins: Vec<String>,
+    seals: Vec<Option<Seal>>,
+    tickets: Vec<Option<u64>>,
+    applied: Vec<bool>,
+    taken: bool,
+    previous_step: Option<u64>,
+    result: Option<Result<(), String>>,
 }
 
 /// What the table's functions share with the step gate.
@@ -300,6 +318,8 @@ struct Shared {
     answers: VecDeque<Answer>,
     /// The batch running.
     batch: Batch,
+    replay: Option<Replay>,
+    next_replay: u64,
     /// Lines for the hook's log.
     log: VecDeque<String>,
     /// Lane dump entries for the hook's log, after `log`'s lines.
@@ -372,6 +392,8 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
         lanes: None,
         dump: None,
     },
+    replay: None,
+    next_replay: 0,
     log: VecDeque::new(),
     dumped: Vec::new(),
     request: None,
@@ -418,6 +440,68 @@ pub fn in_room() -> bool {
 /// tickets and passwords.
 pub fn take_commands() -> Vec<Handed> {
     shared().commands.drain(..).collect()
+}
+
+/// Publish one ordered replay. Its token wakes the engine's game script;
+/// the actions and identities stay in the hook until that script takes them.
+pub fn request_replay(step: u64, actions: &[Ordered]) -> Result<(), String> {
+    if actions.is_empty() || step == u64::MAX {
+        return Err("an ordered replay needs actions and a valid step".into());
+    }
+    let tables = actions
+        .iter()
+        .map(|o| {
+            action_to_lua(&o.action).map_err(|e| format!("an ordered action has no Lua form: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut s = shared();
+    if s.replay.is_some() || s.request.is_some() {
+        return Err("another replay or world request is still pending".into());
+    }
+    s.next_replay = s
+        .next_replay
+        .checked_add(1)
+        .ok_or("replay numbers exhausted")?;
+    let token = s.next_replay.to_string();
+    s.replay = Some(Replay {
+        token: token.clone(),
+        step,
+        actions: Some(tables),
+        origins: actions
+            .iter()
+            .map(|o| crate::lobby::hex(&o.player))
+            .collect(),
+        seals: actions.iter().map(|o| o.seal).collect(),
+        tickets: actions.iter().map(|o| o.ticket).collect(),
+        applied: vec![false; actions.len()],
+        taken: false,
+        previous_step: None,
+        result: None,
+    });
+    s.request = Some(Request::Replay(token));
+    Ok(())
+}
+
+pub fn take_replay_result() -> Option<Result<(), String>> {
+    let mut s = shared();
+    let result = s.replay.as_mut()?.result.take()?;
+    s.replay = None;
+    Some(result)
+}
+
+/// On the simulation thread, after it held or closed the old world.
+/// No Lua state pointer is kept or called here.
+pub fn cancel_replay() {
+    let mut s = shared();
+    if let Some(r) = s.replay.take()
+        && r.taken
+        && r.result.is_none()
+    {
+        crate::seeds::command_step(r.previous_step);
+    }
+    if matches!(s.request, Some(Request::Replay(_))) {
+        s.request = None;
+    }
 }
 
 /// One of the player's actions will never happen: `results()` says so for
@@ -701,6 +785,8 @@ pub unsafe fn register(api: &LuaApi, l: State) {
             for (name, function) in [
                 (&b"command"[..], native_command as CFunction),
                 (b"take", native_take),
+                (b"takeReplay", native_take_replay),
+                (b"replayed", native_replayed),
                 (b"log", native_log),
                 (b"poll", native_poll),
                 (b"saved", native_saved),
@@ -1108,6 +1194,104 @@ unsafe fn string_arg(api: &LuaApi, l: State, index: c_int, max: usize) -> Option
     }
 }
 
+/// `takeReplay(token)`: only a matching wake may take the pending actions,
+/// once. It is called from handleEvent on the simulation side.
+unsafe extern "C-unwind" fn native_take_replay(l: State) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    // SAFETY: Lua's live state, on its own thread.
+    let token = unsafe { string_arg(api, l, 1, 32) };
+    let mut s = shared();
+    let Some(r) = s
+        .replay
+        .as_mut()
+        .filter(|r| Some(&r.token) == token.as_ref() && !r.taken && r.result.is_none())
+    else {
+        unsafe { (api.pushnil)(l) };
+        return 1;
+    };
+    let list = |values: Vec<LuaValue>| {
+        LuaValue::Table(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    (
+                        LuaValue::Integer(i64::try_from(i + 1).unwrap_or(i64::MAX)),
+                        v,
+                    )
+                })
+                .collect(),
+        )
+    };
+    let Some(actions) = r.actions.as_ref() else {
+        unsafe { (api.pushnil)(l) };
+        return 1;
+    };
+    let top = unsafe { (api.gettop)(l) };
+    let pushed = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        push(api, l, &list(actions.clone()), 0)?;
+        push(
+            api,
+            l,
+            &list(r.origins.iter().map(|p| LuaValue::string(p)).collect()),
+            0,
+        )?;
+        push(
+            api,
+            l,
+            &list(r.seals.iter().map(|v| seal_to_lua(v.as_ref())).collect()),
+            0,
+        )
+    }));
+    if matches!(pushed, Ok(Ok(()))) {
+        r.actions = None;
+        r.taken = true;
+        r.previous_step = crate::seeds::command_step(Some(r.step));
+        return 3;
+    }
+    unsafe {
+        (api.settop)(l, top);
+        (api.pushnil)(l);
+    }
+    1
+}
+
+/// Complete after state:set. Missing action reports or a script exception
+/// hold the room's world; a command refused normally still has a report.
+unsafe extern "C-unwind" fn native_replayed(l: State) -> c_int {
+    let Some(api) = API.get() else {
+        return 0;
+    };
+    let (token, ok, why) = unsafe {
+        (
+            string_arg(api, l, 1, 32),
+            (api.toboolean)(l, 2) != 0,
+            string_arg(api, l, 3, MAX_LOG_LINE),
+        )
+    };
+    let mut s = shared();
+    if let Some(r) = s
+        .replay
+        .as_mut()
+        .filter(|r| Some(&r.token) == token.as_ref() && r.result.is_none())
+    {
+        let result = if !ok {
+            Err(why.unwrap_or_else(|| "the replay wake or game script failed".into()))
+        } else if !r.taken || r.applied.iter().any(|reported| !reported) {
+            Err("the game script did not report every ordered action".into())
+        } else {
+            Ok(())
+        };
+        if r.taken {
+            crate::seeds::command_step(r.previous_step);
+        }
+        r.result = Some(result);
+    }
+    0
+}
+
 /// `poll()`.
 unsafe extern "C-unwind" fn native_poll(l: State) -> c_int {
     let Some(api) = API.get() else {
@@ -1129,6 +1313,9 @@ unsafe extern "C-unwind" fn native_poll(l: State) -> c_int {
         }
         Some(Request::Load(name)) => {
             LuaValue::Table(vec![(LuaValue::string("load"), LuaValue::string(&name))])
+        }
+        Some(Request::Replay(token)) => {
+            LuaValue::Table(vec![(LuaValue::string("replay"), LuaValue::string(&token))])
         }
     };
     // SAFETY: Lua calls this with its own state, on its thread.
@@ -2030,12 +2217,22 @@ unsafe extern "C-unwind" fn native_applied(l: State) -> c_int {
         return 0;
     };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let ticket = shared()
-        .batch
-        .tickets
-        .get(index as usize - 1)
-        .copied()
-        .flatten();
+    let ticket = {
+        let mut s = shared();
+        let i = index as usize - 1;
+        if let Some(r) = s.replay.as_mut().filter(|r| r.taken && r.result.is_none()) {
+            let Some(reported) = r.applied.get_mut(i) else {
+                return 0;
+            };
+            if *reported {
+                return 0;
+            }
+            *reported = true;
+            r.tickets.get(i).copied().flatten()
+        } else {
+            s.batch.tickets.get(i).copied().flatten()
+        }
+    };
     if let Some(ticket) = ticket {
         answer(Answer {
             ticket,
@@ -2606,6 +2803,8 @@ pub(crate) mod tests {
         take_log();
         let mut shared = shared();
         shared.answers.clear();
+        shared.replay = None;
+        shared.request = None;
         shared.room = RoomStatus {
             info: None,
             me: None,
@@ -2625,6 +2824,101 @@ pub(crate) mod tests {
             player: PlayerId(FixedBytes([7; 32])),
             seal: None,
         }
+    }
+
+    #[test]
+    fn a_replay_survives_paused_frames_and_reports_each_action_once() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        lua51();
+        let lua = Lua::new();
+        lua.register();
+        let previous = crate::seeds::current_step();
+        request_replay(
+            42,
+            &[
+                ordered(depot_build(), Some(77)),
+                ordered(depot_build(), None),
+            ],
+        )
+        .unwrap();
+        lua.run("TOKEN = tpf3mp_native.poll().replay").unwrap();
+        assert_eq!(
+            lua.run("return tpf3mp_native.takeReplay('wrong')"),
+            Ok("nil".into())
+        );
+        begin_batch(&[], 0, false, None).unwrap();
+        end_batch().unwrap();
+        assert_eq!(
+            lua.run("local a,p = tpf3mp_native.takeReplay(TOKEN) return #a, #p"),
+            Ok("2|2".into())
+        );
+        assert_eq!(crate::seeds::current_step(), Some(42));
+        assert_eq!(
+            lua.run("return tpf3mp_native.takeReplay(TOKEN)"),
+            Ok("nil".into())
+        );
+        assert!(request_replay(42, &[ordered(depot_build(), None)]).is_err());
+        lua.run(
+            "tpf3mp_native.applied(1, true, 123) tpf3mp_native.applied(1, true, 123) \
+            tpf3mp_native.applied(2, false, nil, 'collision') tpf3mp_native.replayed(TOKEN, true)",
+        )
+        .unwrap();
+        assert_eq!(take_replay_result(), Some(Ok(())));
+        assert_eq!(crate::seeds::current_step(), previous);
+        assert_eq!(
+            lua.run("local r=tpf3mp_native.results() return #r,r[1].ticket,r[1].entity"),
+            Ok("1|77|123".into())
+        );
+        lua.run("tpf3mp_native.replayed(TOKEN, true)").unwrap();
+        assert_eq!(take_replay_result(), None);
+    }
+
+    #[test]
+    fn a_replay_cannot_finish_without_reports_and_a_failed_wake_is_reported() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        lua51();
+        let lua = Lua::new();
+        lua.register();
+        for take in [false, true] {
+            request_replay(1, &[ordered(depot_build(), None)]).unwrap();
+            lua.run("TOKEN=tpf3mp_native.poll().replay").unwrap();
+            if take {
+                lua.run("tpf3mp_native.takeReplay(TOKEN)").unwrap();
+            }
+            lua.run("tpf3mp_native.replayed(TOKEN, true)").unwrap();
+            assert!(take_replay_result().unwrap().is_err());
+        }
+        request_replay(1, &[ordered(depot_build(), None)]).unwrap();
+        lua.run("local token=tpf3mp_native.poll().replay tpf3mp_native.replayed(token, false, 'wake failed')").unwrap();
+        assert_eq!(take_replay_result(), Some(Err("wake failed".into())));
+    }
+
+    #[test]
+    fn cancelling_a_replay_invalidates_delayed_wakes_even_in_another_world() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        reset();
+        lua51();
+        let lua = Lua::new();
+        lua.register();
+        request_replay(1, &[ordered(depot_build(), None)]).unwrap();
+        lua.run("OLD=tpf3mp_native.poll().replay").unwrap();
+        cancel_replay();
+        request_replay(1, &[ordered(depot_build(), None)]).unwrap();
+        lua.run("NEW=tpf3mp_native.poll().replay").unwrap();
+        assert_eq!(
+            lua.run("return OLD ~= NEW, tpf3mp_native.takeReplay(OLD)"),
+            Ok("true|nil".into())
+        );
+        lua.run("tpf3mp_native.replayed(OLD, false, 'old world')")
+            .unwrap();
+        assert_eq!(take_replay_result(), None);
+        cancel_replay();
+        assert_eq!(
+            lua.run("return tpf3mp_native.takeReplay(NEW)"),
+            Ok("nil".into())
+        );
     }
 
     /// A brand-new world after a room's world: the last world's company,
@@ -3013,7 +3307,7 @@ my_timetables";
                  type(tpf3mp_native.applied), type(tpf3mp_native.results),                  type(tpf3mp_native.status), type(tpf3mp_native.chat), type(tpf3mp_native.say), \
                  type(tpf3mp_native.dump), type(tpf3mp_native.dumped), type(tpf3mp_native.note)"
             ),
-            Ok("12|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
+            Ok("13|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function|function".into())
         );
         // A second print keeps the first table.
         lua.run("rawset(tpf3mp_native, 'mark', true)").unwrap();

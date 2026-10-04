@@ -213,8 +213,8 @@ tools\game\console.ps1 -GamePid 43256 -File query.lua   # quotes survive in a fi
 
 Look at the hook logs, not only the screen. For one action, the acting
 player's `hook.log` says `handed the player's action N to the room` (or a
-refusal, with why), and **every** player's says `the game applied 1
-action(s) the room ordered`. Things worth grepping for:
+refusal, with why), and **every** player's says `the game applied the
+room's actions between simulation updates`. Things worth grepping for:
 
 | line | means |
 |---|---|

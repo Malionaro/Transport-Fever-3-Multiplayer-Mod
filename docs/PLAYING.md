@@ -366,6 +366,9 @@ protected folder such as Program Files.
   it. Guests' speed buttons highlight the room's accepted speed,
   including pause. Their buttons and speed shortcuts are disabled;
   their tooltip and the Multiplayer window say **Host controls speed**.
+  You can build while the room is paused. Everyone receives the ordered
+  build and its normal construction costs without advancing game time or
+  moving vehicles. Editing and demolition follow the same room ordering.
   Outside a multiplayer game the normal controls return.
 - **Joining later.** You can join a game that is already running: the
   room sends you its world, and your game loads it and catches up.
@@ -401,8 +404,11 @@ protected folder such as Program Files.
   that have ended, when your game starts and each time it loads a room's
   world; the copy of a game still running stays. Your own saves are never
   touched.
-- **Loans.** Take and pay back loans in the company window as usual: every
-  player's game books them together.
+- **Loans.** Take and pay back loans in the finance window as usual: every
+  player's game books them together. Each company has its own offers and
+  loans, up to four loans at once. An offer you take goes on a four-to-eight
+  month cooldown before that slot gets a new offer; the interest and
+  repayments are your company's alone.
 - **Subsidies, entity renaming, vehicle recolouring, line waypoints, bridge/tunnel
   window type changes, Industry Greenification marketing campaigns and Historic Preservation.**
   These new channels are refused pending a two-player game acceptance run.
@@ -464,9 +470,9 @@ protected folder such as Program Files.
   depots, stations and roads) is theirs: you cannot change or remove it.
   The game's own windows show your company: its money in the corner, and
   your things as yours. A new company starts with no money: borrow on the
-  terms the game offers in the Multiplayer window, which also shows its
-  loans and pays them back (the game's finance window keeps the room's
-  first company's loans). With more than one company, vehicles and their
+  terms shown in the Multiplayer window, which also shows its loans and pays
+  them back. The finance window shows that company's own offers and loans.
+  With more than one company, vehicles and their
   markers on the map wear their company's colour, and a new colour
   repaints them. The colour button offers the companies' colours first,
   then the game's own.

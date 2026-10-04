@@ -11,7 +11,7 @@ branch. It is not evidence of a fresh two-player game acceptance run.
 | Content | Fingerprint the installed multiplayer mod; exclude generated portraits so cosmetic extraction does not split rooms | Content/fingerprint tests |
 | Lobby | Loading stages, banners/portraits, copy invite, change starting save before play | Lua window and server tests |
 | Companies | Read the game's balance, order loans, check HQ ownership and permits | Lua capture/replay fixtures |
-| Vehicles | Buy onto a line, including bursts; use isolated harbour/airport depots and the selected second depot; buy planes at an airfield's or airport's hangar (its hangar module's subconstruction), refusing an airfield without one and an ambiguous depot with the reason | Lua capture/replay fixtures |
+| Vehicles | Buy onto a line, including bursts; use isolated harbour/airport depots and the selected second depot; buy planes at an airfield's or airport's hangar (its hangar module's subconstruction), refusing an airfield without one and an ambiguous depot with the reason; in multi-company replay, buy only at the acting company's owned depot (foreign and ownerless depots refused); preserve one-company native purchases | Lua capture/replay fixtures |
 | Roads | Refuse street demolition if its affected town buildings changed; preserve junction settings and street precedence | Lua capture/replay fixtures |
 | Command guard | Install the guard in the HUD's separate Lua state | Lua guard fixtures |
 

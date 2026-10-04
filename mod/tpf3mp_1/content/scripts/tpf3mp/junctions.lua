@@ -245,10 +245,16 @@ end
 -- Add configs to a SimpleProposal. Match in three dimensions and reject
 -- ambiguous parallel edges/nodes instead of picking a game's lowest id.
 -- `preserve` names the existing nodes whose incident edges are rebuilt.
-function junctions.into(proposal, changes, preserve, mine)
+-- `gone` names edges the proposal removes otherwise (an edit's old
+-- construction's own, constructionsToRemove): no setting may name them, and
+-- a preserved node at one keeps no settings; the construction and its
+-- refresh give it the game's own, the same in every game. Returns the nodes
+-- left so.
+function junctions.into(proposal, changes, preserve, mine, gone)
 	if #(changes or {}) == 0 and #(preserve or {}) == 0 then return end
 	local s = proposal.streetProposal
 	local w = world(s)
+	for id in pairs(gone or {}) do w.removed[id] = true end
 	local removedNodes = {}
 	for _, id in ipairs(list(s.nodesToRemove)) do removedNodes[id] = true end
 	local allEdges, allNodes = {}, {}
@@ -318,7 +324,30 @@ function junctions.into(proposal, changes, preserve, mine)
 	-- A geometry rebuild must not throw away settings. The original turns
 	-- keep their order (and hence phase indices); their old edges are mapped
 	-- to the unique replacement leaving this same node in the same direction.
+	local left = {}
+	local function atGone(node)
+		for _, kind in ipairs({"Street", "Track"}) do
+			for _, id in ipairs(list(api.engine.system.streetSystem["getNode"..kind.."Segments"](node))) do
+				if gone[id] then return true end
+			end
+		end
+		return false
+	end
 	for _, node in ipairs(preserve or {}) do
+		if gone and not handled[node] and not removedNodes[node] and node >= 0 and atGone(node) then
+			handled[node] = true
+			-- Its settings go as a change of them would: only where the
+			-- acting company may change every edge at it (D21).
+			if mine then
+				for _, kind in ipairs({"Street", "Track"}) do
+					for _, id in ipairs(list(api.engine.system.streetSystem["getNode"..kind.."Segments"](node))) do
+						mine(id, "junction edge")
+					end
+				end
+			end
+			remove(node)
+			left[#left+1] = node
+		end
 		if not handled[node] and not removedNodes[node] then
 			handled[node] = true
 			local old = component(node, "BASE_NODE_CONFIG")
@@ -370,6 +399,7 @@ function junctions.into(proposal, changes, preserve, mine)
 	end
 	if #adds > 0 then s.nodeConfigsToAdd = adds end
 	if #removes > 0 then s.nodeConfigsToRemove = removes end
+	return left
 end
 
 -- Canonical, portable rows for checkpoints. Phase indices are expressed as

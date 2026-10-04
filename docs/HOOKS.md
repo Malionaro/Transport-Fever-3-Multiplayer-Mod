@@ -758,22 +758,22 @@ for the table (`bridge.find`). Its contract is in
   one, scoped to that company (`tpf3mp_proto::Secret`); it goes to the room
   with the action and is never logged, and no refusal quotes it (version
   12).
-- `tpf3mp_native.take()`: the actions the room ordered for this simulation
-  update, as `action_to_lua` tables, or `nil` (below), and second, who
-  sent each, a list of player ids (64 hex digits) beside it ("Companies"
-  below), and third, each one's seal, `{ scope =, tag = }` (the tag as 64
-  hex digits), or `false` (version 12). A list's items are
-  in its table's array part, so `next` walks them in order. The game
-  copies a list it is handed (a stop's loading flags, a consist's groups)
-  into its own vector in the order `next` gives, and what a game script's
-  `update` returns reaches `postUpdate` as the game's own copy, whose
-  lists `next` walks in hash order all the same (build 40408: a bus line's
-  stops set to load grain, one cargo over from passengers). So `apply.lua`
-  hands the game every such list afresh, filled in order (`seq`).
+- `tpf3mp_native.take()`: marks a simulation update begun, so its
+  checkpoint can be read after the batch's last update. Runtime update
+  batches return `nil` actions; ordered actions use the event path below.
+- `tpf3mp_native.takeReplay(token)`: once, in the engine's `handleEvent`,
+  the actions ordered for the next room step, as `action_to_lua` tables;
+  second, each sender (64 hex digits); third, each seal, `{ scope =,
+  tag = }` or `false` (version 13). A stale or duplicate token returns
+  `nil`. Lists keep their array order; `apply.lua` fills every list passed
+  to the game afresh in order (`seq`), because the engine's Lua copies
+  can otherwise expose a list in hash order.
+- `tpf3mp_native.replayed(token, ok, why)`: completes after every action's
+  report and `state:set`; missing reports or a failed script hold the world.
 - `tpf3mp_native.log(line)`: a line for `hook.log`, marked `mod:`.
 - `tpf3mp_native.poll()`: in the GUI, every frame: what the hook asks of
-  it, once, `{ save = name }` or `{ load = name }`, or `nil` ("The room's
-  world" below).
+  it, once, `{ replay = token }`, `{ save = name }` or `{ load = name }`,
+  or `nil` ("Actions in the game" and "The room's world" below).
 - `tpf3mp_native.saved(name, ok, why)`: the GUI's answer to a save.
 - `tpf3mp_native.world()`: a world's GUI started. Before the room begins
   a game, the step gate's next call tells the agent the latest such world
@@ -865,22 +865,38 @@ That is every game Steam started (D11).
 ### Actions in the game
 
 A player's action happens in no game until the room orders it, and then in
-every game in the same simulation update:
+every game between the same two simulation steps, including while paused:
 
 1. The mod hands the action to `tpf3mp_native.command`. The step gate
    sends it to the room.
-2. The room orders it as an event for a step `s`. The session ends a
-   batch before every step with events (`Session::batch`), so `s` is
-   always the first update of a batch; the driver hands that batch its
-   actions (`lua::begin_batch`), and runs it.
-3. The mod's game script asks the hook in every `update`
-   (`tpf3mp_native.take`); the first update of the batch gets the actions
-   and returns them, and its `postUpdate` applies them through `api.cmd`
-   (`mod/tpf3mp_1/content/scripts/tpf3mp/apply.lua`).
-4. After the batch, the driver checks the actions were taken
-   (`lua::end_batch`). If they were not, the world ran step `s` without
-   them: none of those steps is reported and the world stands still
-   (fail closed).
+2. The room orders it as an event for step `s`. After step `s - 1`,
+   `StepDriver` gives the ordered actions to `lua::request_replay` and
+   holds updates. This applies to running rooms too, so every replica uses
+   the same engine phase regardless of when the resume arrives.
+3. The GUI polls a `replay` token (Lua contract version 13) and sends only
+   that token in the existing `tpf3mp/command` scripting event (a string
+   token, rather than an action table, so older saves already subscribe).
+   `guard.wakeReplay` can bypass the GUI guard for this wake only; it cannot send an action. The
+   native command loop runs outside `GameSim::Step`'s update loop.
+4. In the engine's `handleEvent`, `takeReplay(token)` takes the hook's
+   actions, origins and seals exactly once. The script uses its existing
+   `postUpdate` action processing through `api.cmd` and saves the registry,
+   companies and progression state. No update, monthly charge, progression
+   sample or checkpoint is requested by the wake. The ordered step scopes
+   the RNG seed for this processing and nested script events.
+5. Each action is reported with `applied`, including normal refusals. Only
+   after `state:set` does `replayed(token, ok, why)` complete the replay.
+   The driver then allows later actions, a save, a load or step `s`. A
+   missing report, failed wake, script exception or 30-second timeout holds
+   the world (fail closed). A hold or closed world invalidates delayed
+   wakes; duplicates and stale tokens take nothing.
+
+The world still runs the game's paused path while waiting: neither room
+steps nor game time advance, and the paused-tick fix keeps `tickCount`
+unchanged. Construction costs are charged normally. Existing update and
+checkpoint processing remains in `update`/`postUpdate`. The engine event
+path requires two-game acceptance on the supported game build; stand-in
+tests alone do not establish that native callbacks are synchronous there.
 
 Measured on build 40408:
 
@@ -943,9 +959,12 @@ money, ran in the game script's `postUpdate`.
   remove, reputation lost) are logged and built through, as the tool
   builds once the player clicks (`ignoreErrors` true: with it false the
   game dropped such a build without a word, seen on build 40408);
-- `Loan`: the loan script's own event, `makeScriptingSendEventCmd("",
-  "Loan", "Obtain", { next, offer })` or `"Repay", { nil, loan }`, with the
-  tables the finance window sends;
+- `Loan`: for the room's first company, the loan script's own event,
+  `makeScriptingSendEventCmd("", "Loan", "Obtain", { next, offer })` or
+  `"Repay", { nil, loan }`, with the tables the finance window sends. For a
+  founded company, Take must match that company's saved active offer slot;
+  the room books it to that company and puts only its slot on cooldown;
+  Repay names one of its saved loans;
 - `Prospect`: the company script's own event,
   `makeScriptingSendEventCmd("", "Companies", "spawnIndustry", {
   companyEntity, townEntity, types, permitKey, cargoType })`, with the
@@ -1303,9 +1322,9 @@ reference of its own to either. Once linked, the GUI wraps every
   line took its stops one by one as in single player (build 40408). So
   far:
   - loans, the finance window's `makeScriptingSendEventCmd("", "Loan",
-    "Obtain" | "Repay", …)`, as a `Loan` action carrying the loans' terms,
-    which every game's game script replays through the loan script's own
-    event;
+    "Obtain" | "Repay", …)`, as a `Loan` action carrying the loans' terms.
+    The first company uses the loan script's event; founded-company offers
+    and loans are checked and booked by the room's companies module;
   - prospecting, the construction menu's `makeScriptingSendEventCmd("",
     "Companies", "spawnIndustry", …)`, as a `Prospect` action ("Prospecting"
     below);
@@ -1346,7 +1365,11 @@ reference of its own to either. Once linked, the GUI wraps every
     bought at the first depot. Every game refuses a purchase naming a depot
     the construction does not have, saying how many it has: an airfield or
     airport built without its hangar module has none, and a harbour never
-    has one, ships being bought at a ship depot. The consist part by part,
+    has one, ships being bought at a ship depot. With more than one company,
+    every game's replay also requires that the depot's `PLAYER_OWNED` is the
+    acting company; another company's depot and a depot with no readable owner
+    are refused. With one company, the game's native purchase behavior stays.
+    The consist part by part,
     as the store configured it), selling, putting on a line, and the vehicle window's stop, start,
     to the depot (kept: sell-on-arrival is refused because build 40408 crashes
     at arrival), reverse and depart; replacing
@@ -1464,32 +1487,58 @@ state, which the game saves with the world:
   ownership.
 - *Who acted.* The hook hands each ordered action to the game script with
   the player who sent it (the Lua link's version 10, `tpf3mp_native.version`:
-  `take()` answers the actions
-  and, second, each one's sender as 64 hex digits, and since version 12
+  `takeReplay(token)` answers the actions
+  and, second, each one's sender as 64 hex digits, and
   third, each one's seal; `status()` names each
   player's `id` and the local one's `me_id`). The game script books the
   action to that player's company: `apply.lua` puts the company's player
   entity where it put the save's player before (a build's `Context.player`
   and its constructions' and stops' `playerEntity`, `makeVehicleBuyCmd`'s
   and `makeLineCreateCmd`'s player, prospecting's `companyEntity`).
+- *What a company builds* is its own: after a construction (a station,
+  depot, airport, harbour) is built, every game hands the construction,
+  its depots, its stations, the station groups they alone make up and
+  its own (frozen) edges with what stands on them to the acting company
+  with `makeEntitySetPlayerCmd` wherever anyone else owns them, or no one,
+  as the game's missions hand one over (`setPlayerForConstruction`), and
+  hook.log names each (`the new <file> made the acting company's`). An
+  owner is read through the component's binding (`PLAYER_OWNED` is
+  userdata on build 40408; read as a table only, every owner came back
+  nil until 2026-10-02, so nothing counted as any company's). If the game
+  cannot find the built construction, read an owner, or complete an
+  ownership command, the action is reported as not applied with the failure.
+  The engine may already have built the construction before this check, so
+  a failed settlement can leave that partial result in this game.
 - *What another company owns* is refused, the same in every game, naming
   its owner: an edited, bulldozed or removed construction, road or track
   edge, or stop, and the vehicles and lines an action names, when their
   `PLAYER_OWNED` player is another company's. What no company owns (the
   towns' roads) stays everyone's.
 - *Loans.* The game's loan script (`::/game_mechanics/finance/loan.gs`)
-  keeps the save's own player's loans only. Another company borrows on the
-  terms the loan script offers (its `availableLoans`), and the room keeps
-  that loan: booked to the company as the game books one (a `LOAN` journal
-  entry, `makeJournalBookAssetCmd`, which raises the account's balance and
-  loan alike, seen on build 40408), and paid back each month of the game's
-  calendar as an annuity, the interest as `INTEREST` and the rest as
-  `LOAN`, or all at once. Each company pays its own loans only. Paying
-  one back names it by its id and amount: the game's finance window lists
-  the loan script's loans, the room's first company's, whose ids count
-  from 0 as the room's count from 1, so another company's Repay there is
-  refused unless the amount is its own loan's too. The game script books the months since the last
-  on the first update of a new month, in every game alike.
+  keeps the save's own player's loans only. Each founded company has its
+  own copy of the available loan slots in the room's saved roster. It starts
+  from the native offers, replacing a slot on the first company's cooldown
+  with a fresh offer of that kind. A Take must match the exact type, amount,
+  duration and rate in one of that company's active slots; forged terms and
+  reused or cooling-down offers are refused before any journal entry is
+  booked. On a valid Take, that slot enters its own 4-to-8-month cooldown,
+  as the native loan script does, and `loan_util` draws its replacement
+  when the cooldown expires. The room's update seed makes those draws the
+  same in every game. The native loan table is never changed for a founded
+  company's Take. The room books the money to that company as the game books
+  a loan (a `LOAN` journal entry, `makeJournalBookAssetCmd`, which raises the
+  account's balance and loan alike, seen on build 40408), and pays it back
+  each month of the game's calendar as an annuity, the interest as
+  `INTEREST` and the rest as `LOAN`, or all at once. Each company pays its
+  own loans only. Paying one back names it by its id and amount. A company
+  has four loans at most, as the loan script allows. In GUI states the
+  finance window shows a player of another company that company's persisted
+  offers and loans: `tpf3mp/follow.lua` answers its loan-script
+  `GAME_SCRIPT` component with `companies.loanTable`, so Obtain and Repay go
+  to the room as that company. The room's first company continues using the
+  native loan state and finance window. The game script books the months
+  since the last payment on the first update of a new month, in every game
+  alike.
 - *Subsidies.* The game's subsidy script
   (`::/game_mechanics/subventions/subventions.gs`, `subventions.script.tl`
   on build 40408) draws its offers in its `update`: once the last offer is
@@ -1850,7 +1899,7 @@ then in every game of the room, at the same step:
 ```
 prospecting for ::/cargos/coal/coal.cargo near town-3 (1234): coal_mine
 prospecting began: ::/cargos/coal/coal.cargo near town-3 at game time 5400000
-the game applied 1 action(s) the room ordered
+the game applied the room's actions between simulation updates
 ```
 
 and, one to six game months later, again in every game at the same step:
@@ -2395,6 +2444,23 @@ untouched: the change is to which lines a viewer draws. hook.log, once:
 line(s)) in place of player 372609's (view: LineViewer lines of the
 player/call)`.
 
+**The store's depot follows the company** (`view: findBestDepot depot owner
+test`, `view: findBestDepot owner test`, guiplayer.rs; 2026-10-02, build
+45b8ed5: the line window bought company #2's vehicles at depot 317114,
+owned by 214443, the first company's). Opened from a line, the store asks
+`api.engine.util.vehicle.findBestDepotForLine` (`line_util.tl`), and the
+line manager and the store `findBestLineAndDepotForVehicle`. Both reach
+`sub_2689fd0` and through it `sub_2689dd0`, which keep only what the
+`GameState`'s player owns: `mov reg,[GameState+0x20c]; cmp [rax],reg; jne`,
+rax the depot's (or line's) `PlayerOwned`. Nothing but those two bindings
+calls the four functions on the way (tpfre), and only the game's GUI scripts
+call the bindings on build 40408. Each test is spliced as the other owner
+tests are: an owner that is the player's company passes, the save's
+player's does not. Because a game script could call the bindings too,
+these two answer the company only on the GUI's thread (the menu's frame's,
+noted at each refresh) outside the simulation's step; anywhere else they
+answer as the game.
+
 **A purchase's depot**, in hook.log when the store buys (the GUI's
 capture, `capture.depotText`): `the store buys at depot entity 5001 (owned
 by 372426): depot 0 of ::/depots/road/road_depot/road_depot.con at (1360.7,
@@ -2486,17 +2552,40 @@ construction's window its edits:
   where it stands (a `ConstructionRef`, as a depot is named; entity ids are
   no name, docs/BUILDING.md), the new one's file, transform, parameters and
   name (the old one's, where the proposal leaves it out). Its street part
-  is the construction's own entrance, made again with it, and is not
-  carried; an edit that removes a street or track the old construction
-  does not own (its `frozenEdges`, `frozenNodes`) is refused, as is one
-  replacing a construction the room cannot name. Every game finds the old
+  is mostly the construction's own entrance, made again with it, and that
+  is not carried: what it removes of the old construction's own (its
+  `frozenEdges`, `frozenNodes`, and track ends only its frozen edges
+  touch) goes with the old construction. What it changes around it travels
+  as its connection, as a new construction's does, without those: a new
+  exit onto a road the station did not join splits that road through a new
+  junction (seen 2026-10-03, build 40408). One replacing a construction the
+  room cannot name is refused. Every game finds the old
   construction by file and place (within 2 m), then asks the game's
   verdict and builds, as the player's own build (`ignoreErrors`,
   `playerInitiated`), paid by the player and clearing town buildings in
   its way, one `SimpleProposal` that removes it (`constructionsToRemove`,
-  this game's own entity) and adds the new one, mapped old to new
+  this game's own entity), builds the connection as a new construction's
+  (its own entrances peeled off) and adds the new one, mapped old to new
   (`old2new = { [old] = 0 }`), as the game's own upgrade makes one
   (`mission_framework_util_entity.tl`, `upgradeConstruction`). The new
+  construction makes its entrances again unsnapped, as a scripted build
+  does, so every game then refreshes it as it refreshes a build's, free
+  and not as a click of the player's: the refresh snaps its entrances onto
+  the streets beside them (a road station edited by the street came loose
+  from it in both games, 2026-10-03). A refresh with no street change is
+  not sent; one the game refuses leaves the edit standing, unsnapped, the
+  same in every game, and is logged. A connection may not remove or split the old construction's
+  own edges, and no junction's settings may name them: a junction the
+  connection rebuilds next to the old entrance keeps no settings, which the
+  construction and its refresh give it, the game's own (logged `left to
+  the construction: the settings of N junction(s) at its old edges`),
+  only where the acting company may change every edge at it.
+  Every edge a construction's connection removes or splits, a new one's or
+  an edit's, must be the acting company's or no company's (D21), as a
+  bulldozed one. Seen in two games on 2026-10-03: a plain edit's refresh
+  (`snapping 72194 +e-2:-1>57114 -e71473`), and an edit adding an exit
+  onto another road, replayed with the road split and both entrances
+  snapped alike in both games (docs/BUILDING.md). The new
   construction stands where the old one stood, so the next edit, a depot
   bought at it or a line finds it by the same reference; what stood on it
   passes to it through `old2new`, and the registry binds, after the
@@ -2572,10 +2661,24 @@ construction's window its edits:
   (`module editor: click N queued …`, or `module editor: click N does not
   read: …`). The GUI's `guiUpdate`, handing on click N, asks
   `tpf3mp_native.built(N)` first, ahead of any preview another tool
-  showed: the proposal is made an action by `capture.construction`, as
+  showed: the proposal is made an action by `capture.moduleEdit`, as
   the construction tool's, and must replace a construction (else
   refused: `an edit that replaces no construction`); one that did not
-  read is refused with why. The click's apply is stopped as every
+  read is refused with why. The hook reads only how many nodes and edges
+  the street part adds, so an edit that changes the streets around its
+  construction (a new exit splitting a road) is asked of the game again:
+  `api.engine.util.proposal.createProposalReplaceConstruction(old,
+  params)` with the editor's parameters, as the construction menu asks
+  for a construction's new parameters (`gui/construction/construction.tl`),
+  proposed the editor's street part exactly in the game (2026-10-03, build
+  40408: the same three nodes and four edges added, the same node and two
+  edges removed). Its street part travels only if it is the same edit as
+  far as the hook read it: the same construction replaced by the same
+  file, standing where the editor put it (within 0.01), as many nodes and
+  edges added, the same nodes and edges removed (none twice), and no stop
+  or signal on either side; else it is refused with why (`a construction
+  edit the game proposes otherwise: …`). The construction itself (file,
+  parameters, matrix, name) is the one the hook read. The click's apply is stopped as every
   player's build is, and the room orders the edit for every game, which
   replaces the construction as above. `built` is optional in the bridge:
   a mod or hook without it keeps the module editor refused. Without the
